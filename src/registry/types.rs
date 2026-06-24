@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 pub mod media_types {
     pub const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
     pub const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
-    pub const DOCKER_MANIFEST_V2: &str =
-        "application/vnd.docker.distribution.manifest.v2+json";
+    pub const DOCKER_MANIFEST_V2: &str = "application/vnd.docker.distribution.manifest.v2+json";
     pub const DOCKER_MANIFEST_LIST: &str =
         "application/vnd.docker.distribution.manifest.list.v2+json";
 }

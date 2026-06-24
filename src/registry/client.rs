@@ -10,8 +10,8 @@ use crate::registry::{
     error::{RegistryError, Result},
     pagination::parse_next_link,
     types::{
-        BlobInfo, Catalog, ImageManifest, Manifest, ManifestIndex, ManifestResponse, TagList,
-        UploadLocation, MANIFEST_ACCEPT,
+        BlobInfo, Catalog, ImageManifest, MANIFEST_ACCEPT, Manifest, ManifestIndex,
+        ManifestResponse, TagList, UploadLocation,
     },
 };
 
@@ -342,10 +342,7 @@ impl RegistryClient {
             .send(
                 self.http
                     .put(url.clone())
-                    .header(
-                        reqwest::header::CONTENT_TYPE,
-                        "application/octet-stream",
-                    )
+                    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                     .body(data),
             )
             .await?;

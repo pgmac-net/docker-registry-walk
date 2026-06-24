@@ -9,6 +9,6 @@ mod types;
 pub use client::{Credentials, NoCredentials, RegistryClient};
 pub use error::{RegistryError, Result};
 pub use types::{
-    media_types, BlobInfo, Catalog, ImageManifest, Manifest, ManifestDescriptor, ManifestIndex,
-    ManifestResponse, TagList, UploadLocation,
+    BlobInfo, Catalog, ImageManifest, Manifest, ManifestDescriptor, ManifestIndex,
+    ManifestResponse, TagList, UploadLocation, media_types,
 };
