@@ -27,6 +27,14 @@ pub enum AppEvent {
         tag: String,
     },
     DeleteTagError(String),
+    CopyProgress {
+        done: usize,
+        total: usize,
+    },
+    CopySuccess {
+        dest: String,
+    },
+    CopyError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
