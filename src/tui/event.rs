@@ -10,6 +10,10 @@ pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
     Tick,
+    ReposPage(Vec<String>, bool),
+    ReposError(String),
+    TagsPage(String, Vec<String>, bool),
+    TagsError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
