@@ -6,8 +6,20 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: fmt
+        run: cargo fmt --check
+
+  full:
     name: CI (${{ matrix.os }})
+    if: github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.allow_failure }}
     strategy:
@@ -26,7 +38,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -42,9 +54,6 @@ jobs:
             libssl-dev \
             libdbus-1-dev \
             pkg-config
-
-      - name: fmt
-        run: cargo fmt --check
 
       - name: clippy
         run: cargo clippy -- -D warnings
