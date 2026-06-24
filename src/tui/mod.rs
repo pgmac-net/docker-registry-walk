@@ -162,11 +162,13 @@ fn handle_key(
     tx: &mpsc::Sender<AppEvent>,
 ) {
     // Modal takes highest priority.
-    if let Modal::Confirm { on_confirm, .. } = app.modal {
+    if matches!(app.modal, Modal::Confirm { .. }) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                handle_confirm(app, on_confirm, client, tx);
-                app.modal = Modal::None;
+                let modal = std::mem::replace(&mut app.modal, Modal::None);
+                if let Modal::Confirm { on_confirm, .. } = modal {
+                    handle_confirm(app, on_confirm, client, tx);
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 app.modal = Modal::None;
@@ -236,29 +238,26 @@ fn handle_copy(app: &mut App) {
 
 fn handle_delete(app: &mut App) {
     if app.focus == Focus::Tags
-        && let Some(tag) = app.selected_tag()
+        && let Some(tag) = app.selected_tag().map(str::to_owned)
+        && let Some(repo) = app.current_repo.clone()
     {
-        let msg = format!("Delete tag '{tag}'?");
+        let msg = format!("Delete '{repo}:{tag}'?");
         app.modal = Modal::Confirm {
             message: msg,
-            on_confirm: ConfirmAction::DeleteManifest,
+            on_confirm: ConfirmAction::DeleteManifest { repo, tag },
         };
     }
 }
 
 fn handle_confirm(
-    app: &mut App,
+    _app: &mut App,
     action: ConfirmAction,
     client: &RegistryClient,
     tx: &mpsc::Sender<AppEvent>,
 ) {
     match action {
-        ConfirmAction::DeleteManifest => {
-            if let Some(tag) = app.selected_tag().map(str::to_owned)
-                && let Some(repo) = app.current_repo.clone()
-            {
-                spawn_delete(client.clone(), repo, tag, tx.clone());
-            }
+        ConfirmAction::DeleteManifest { repo, tag } => {
+            spawn_delete(client.clone(), repo, tag, tx.clone());
         }
     }
 }

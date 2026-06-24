@@ -65,9 +65,9 @@ pub enum Modal {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ConfirmAction {
-    DeleteManifest,
+    DeleteManifest { repo: String, tag: String },
 }
 
 #[derive(Debug)]
