@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use reqwest::{Client, Response, StatusCode};
 use url::Url;
@@ -15,17 +16,22 @@ use crate::registry::{
     },
 };
 
-/// Provides an `Authorization` header value.  Implement this trait in the auth
-/// module (PGM-268); use `NoCredentials` until then.
+/// Provides an `Authorization` header value for each request.
+///
+/// Implementations may perform async work (e.g. bearer token exchange).
+/// Pass `http` so bearer auth can call the token endpoint without holding
+/// a second client.
+#[async_trait]
 pub trait Credentials: Send + Sync {
-    fn get_authorization(&self) -> Option<String>;
+    async fn get_authorization(&self, http: &Client) -> Option<String>;
 }
 
-/// No-op credentials — suitable for public registries or until PGM-268 lands.
+/// No-op credentials — suitable for public (unauthenticated) registries.
 pub struct NoCredentials;
 
+#[async_trait]
 impl Credentials for NoCredentials {
-    fn get_authorization(&self) -> Option<String> {
+    async fn get_authorization(&self, _http: &Client) -> Option<String> {
         None
     }
 }
@@ -61,7 +67,7 @@ impl RegistryClient {
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<Response> {
-        let builder = match self.creds.get_authorization() {
+        let builder = match self.creds.get_authorization(&self.http).await {
             Some(auth) => builder.header(reqwest::header::AUTHORIZATION, auth),
             None => builder,
         };
