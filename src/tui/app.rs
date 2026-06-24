@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::widgets::ListState;
 
+use super::detail::ImageDetail;
+
 const STATUS_TTL: Duration = Duration::from_secs(2);
 const LOAD_AHEAD: usize = 20;
 pub const SPINNER: [char; 6] = ['⠋', '⠙', '⠸', '⠴', '⠦', '⠇'];
@@ -12,13 +14,15 @@ pub const SPINNER: [char; 6] = ['⠋', '⠙', '⠸', '⠴', '⠦', '⠇'];
 pub enum Focus {
     Repos,
     Tags,
+    Detail,
 }
 
 impl Focus {
     pub fn toggle(self) -> Self {
         match self {
             Focus::Repos => Focus::Tags,
-            Focus::Tags => Focus::Repos,
+            Focus::Tags => Focus::Detail,
+            Focus::Detail => Focus::Repos,
         }
     }
 }
@@ -95,8 +99,13 @@ pub struct App {
     // Load state
     pub repo_load: LoadState,
     pub tag_load: LoadState,
+    pub detail_load: LoadState,
     // Sort
     pub tag_sort: SortOrder,
+    // Detail panel
+    pub detail: Option<ImageDetail>,
+    pub detail_scroll: usize,
+    pub current_tag: Option<String>,
     // Display
     pub registry_name: String,
     pub registry_url: String,
@@ -128,7 +137,11 @@ impl App {
             current_repo: None,
             repo_load: LoadState::Idle,
             tag_load: LoadState::Idle,
+            detail_load: LoadState::Idle,
             tag_sort: SortOrder::NameAsc,
+            detail: None,
+            detail_scroll: 0,
+            current_tag: None,
             registry_name,
             registry_url,
             modal: Modal::None,
@@ -175,6 +188,34 @@ impl App {
     // Tag loading lifecycle
     // ------------------------------------------------------------------
 
+    pub fn start_detail_load(&mut self, tag: String) {
+        self.current_tag = Some(tag);
+        self.detail = None;
+        self.detail_scroll = 0;
+        self.detail_load = LoadState::Loading;
+    }
+
+    pub fn on_detail_loaded(&mut self, repo: String, tag: String, detail: ImageDetail) {
+        if self.current_repo.as_deref() == Some(&repo) && self.current_tag.as_deref() == Some(&tag)
+        {
+            self.detail = Some(detail);
+            self.detail_load = LoadState::Idle;
+        }
+    }
+
+    pub fn on_detail_error(&mut self, msg: String) {
+        self.detail_load = LoadState::Error(msg.clone());
+        self.set_status(format!("Detail error: {msg}"));
+    }
+
+    pub fn scroll_detail(&mut self, delta: isize, max_scroll: usize) {
+        if delta < 0 {
+            self.detail_scroll = self.detail_scroll.saturating_sub((-delta) as usize);
+        } else {
+            self.detail_scroll = (self.detail_scroll + delta as usize).min(max_scroll);
+        }
+    }
+
     pub fn start_tags_load(&mut self, repo: String) {
         self.current_repo = Some(repo);
         self.tags_all.clear();
@@ -184,6 +225,10 @@ impl App {
         self.tags_has_more = false;
         self.tag_filter.clear();
         self.tag_load = LoadState::Loading;
+        // Clear detail when repo changes.
+        self.detail = None;
+        self.detail_load = LoadState::Idle;
+        self.current_tag = None;
     }
 
     // ------------------------------------------------------------------
@@ -220,7 +265,7 @@ impl App {
                 self.tag_filter.push(ch);
                 self.apply_tag_filter_sort();
             }
-            None => {}
+            Some(Focus::Detail) | None => {}
         }
     }
 
@@ -234,7 +279,7 @@ impl App {
                 self.tag_filter.pop();
                 self.apply_tag_filter_sort();
             }
-            None => {}
+            Some(Focus::Detail) | None => {}
         }
     }
 
@@ -248,7 +293,7 @@ impl App {
                 self.tag_filter.clear();
                 self.apply_tag_filter_sort();
             }
-            None => {}
+            Some(Focus::Detail) | None => {}
         }
         self.filter_mode = None;
     }
@@ -331,6 +376,9 @@ impl App {
                     self.tags_state.select(Some(i - 1));
                 }
             }
+            Focus::Detail => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
         }
     }
 
@@ -357,6 +405,9 @@ impl App {
                 if i + 1 < len {
                     self.tags_state.select(Some(i + 1));
                 }
+            }
+            Focus::Detail => {
+                self.detail_scroll = self.detail_scroll.saturating_add(1);
             }
         }
     }

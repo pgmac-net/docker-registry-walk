@@ -11,6 +11,6 @@ pub use auth::{BasicCredentials, BearerCredentials, KeyringStore, resolve_passwo
 pub use client::{Credentials, NoCredentials, RegistryClient};
 pub use error::{RegistryError, Result};
 pub use types::{
-    BlobInfo, Catalog, ImageManifest, Manifest, ManifestDescriptor, ManifestIndex,
-    ManifestResponse, TagList, UploadLocation, media_types,
+    BlobInfo, Catalog, ImageConfigBlob, ImageManifest, Manifest, ManifestDescriptor, ManifestIndex,
+    ManifestResponse, Platform, TagList, UploadLocation, media_types,
 };

@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use super::app::{App, Focus, LoadState, Modal, SPINNER};
+use super::detail;
 
 const HIGHLIGHT_STYLE: Style = Style::new()
     .fg(Color::Black)
@@ -147,32 +148,54 @@ fn draw_tags(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
-    let status = app.status_text().unwrap_or("");
-    let content = match (app.selected_repo(), app.selected_tag()) {
-        (Some(repo), Some(tag)) => format!("{repo}:{tag}"),
-        (Some(repo), None) => repo.to_owned(),
-        _ => String::new(),
+    let border_style = if app.focus == Focus::Detail {
+        ACTIVE_BORDER
+    } else {
+        INACTIVE_BORDER
     };
 
-    let text = if status.is_empty() {
-        content
-    } else {
-        format!("{content}  │  {status}")
+    let spinner_char = SPINNER[app.spinner_tick % SPINNER.len()];
+    let title = match &app.detail_load {
+        LoadState::Loading => format!(" Details {spinner_char} "),
+        LoadState::Error(_) => " Details ✗ ".to_owned(),
+        LoadState::Idle => " Details ".to_owned(),
     };
 
     let block = Block::default()
-        .title(" Details ")
+        .title(title)
         .borders(Borders::ALL)
-        .border_style(INACTIVE_BORDER);
+        .border_style(border_style);
 
-    let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(p, area);
+    let lines: Vec<Line> = match &app.detail {
+        Some(d) => detail::render_lines(d),
+        None => {
+            let msg = if let Some(s) = app.status_text() {
+                s.to_owned()
+            } else {
+                match &app.detail_load {
+                    LoadState::Loading => String::new(),
+                    LoadState::Error(e) => format!("Error: {e}"),
+                    LoadState::Idle => " Select a tag to view details".to_owned(),
+                }
+            };
+            vec![Line::raw(msg)]
+        }
+    };
+
+    let visible_h = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_h);
+    let scroll = app.detail_scroll.min(max_scroll);
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(visible_h).collect();
+
+    let p = Paragraph::new(visible);
+    frame.render_widget(p, inner);
 }
 
 fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
-    let in_filter = app.filter_mode.is_some();
-    let spans = if in_filter {
+    let spans = if app.filter_mode.is_some() {
         Line::from(vec![
             Span::styled(" Typing filter", Style::default().fg(Color::Yellow)),
             Span::raw("  "),
@@ -180,6 +203,15 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" clear  "),
             Span::styled("Enter", Style::default().fg(Color::Cyan)),
             Span::raw(" confirm "),
+        ])
+    } else if app.focus == Focus::Detail {
+        Line::from(vec![
+            Span::styled(" Tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" focus  "),
+            Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" scroll  "),
+            Span::styled("q", Style::default().fg(Color::Cyan)),
+            Span::raw(" quit "),
         ])
     } else {
         Line::from(vec![
