@@ -210,6 +210,8 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" focus  "),
             Span::styled("↑↓", Style::default().fg(Color::Cyan)),
             Span::raw(" scroll  "),
+            Span::styled("c", Style::default().fg(Color::Cyan)),
+            Span::raw(" copy  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
             Span::raw(" quit "),
         ])
@@ -223,6 +225,8 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" filter  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
             Span::raw(" sort  "),
+            Span::styled("c", Style::default().fg(Color::Cyan)),
+            Span::raw(" copy  "),
             Span::styled("d", Style::default().fg(Color::Red)),
             Span::raw(" delete  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),

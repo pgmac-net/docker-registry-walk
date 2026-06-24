@@ -201,6 +201,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             app.tag_sort = app.tag_sort.cycle();
             app.resort_tags();
         }
+        KeyCode::Char('c') => handle_copy(app),
         KeyCode::Char('d') => handle_delete(app),
         _ => {}
     }
@@ -212,6 +213,16 @@ fn handle_enter(app: &mut App) {
         if app.tags_state.selected().is_none() {
             // tags_state selection set by on_tags_page already
         }
+    }
+}
+
+fn handle_copy(app: &mut App) {
+    let Some(pull_url) = app.detail.as_ref().map(|d| d.pull_url.clone()) else {
+        return;
+    };
+    match crate::clipboard::copy_to_clipboard(&pull_url) {
+        Ok(()) => app.set_status(format!("✓ Copied: {pull_url}")),
+        Err(e) => app.set_status(format!("Clipboard error: {e}")),
     }
 }
 
