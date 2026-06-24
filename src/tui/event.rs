@@ -22,6 +22,11 @@ pub enum AppEvent {
         detail: Box<ImageDetail>,
     },
     DetailError(String),
+    DeleteTagSuccess {
+        repo: String,
+        tag: String,
+    },
+    DeleteTagError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.

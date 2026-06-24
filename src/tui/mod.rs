@@ -77,7 +77,7 @@ async fn event_loop(
         tokio::select! {
             biased;
             Some(ev) = rx.recv() => {
-                handle_event(&mut app, ev);
+                handle_event(&mut app, ev, &client, &tx);
             }
             _ = tick.tick() => {
                 app.tick();
@@ -131,13 +131,13 @@ async fn event_loop(
     Ok(())
 }
 
-fn handle_event(app: &mut App, ev: AppEvent) {
+fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc::Sender<AppEvent>) {
     match ev {
         AppEvent::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return;
             }
-            handle_key(app, key.code, key.modifiers);
+            handle_key(app, key.code, key.modifiers, client, tx);
         }
         AppEvent::Resize(_, _) => {}
         AppEvent::Tick => app.tick(),
@@ -149,16 +149,26 @@ fn handle_event(app: &mut App, ev: AppEvent) {
             app.on_detail_loaded(repo, tag, *detail);
         }
         AppEvent::DetailError(msg) => app.on_detail_error(msg),
+        AppEvent::DeleteTagSuccess { repo, tag } => app.on_delete_success(&repo, &tag),
+        AppEvent::DeleteTagError(msg) => app.on_delete_error(msg),
     }
 }
 
-fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    client: &RegistryClient,
+    tx: &mpsc::Sender<AppEvent>,
+) {
     // Modal takes highest priority.
-    if let Modal::Confirm { on_confirm, .. } = app.modal {
+    if matches!(app.modal, Modal::Confirm { .. }) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                handle_confirm(app, on_confirm);
-                app.modal = Modal::None;
+                let modal = std::mem::replace(&mut app.modal, Modal::None);
+                if let Modal::Confirm { on_confirm, .. } = modal {
+                    handle_confirm(app, on_confirm, client, tx);
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 app.modal = Modal::None;
@@ -228,20 +238,26 @@ fn handle_copy(app: &mut App) {
 
 fn handle_delete(app: &mut App) {
     if app.focus == Focus::Tags
-        && let Some(tag) = app.selected_tag()
+        && let Some(tag) = app.selected_tag().map(str::to_owned)
+        && let Some(repo) = app.current_repo.clone()
     {
-        let msg = format!("Delete tag '{tag}'?");
+        let msg = format!("Delete '{repo}:{tag}'?");
         app.modal = Modal::Confirm {
             message: msg,
-            on_confirm: ConfirmAction::DeleteManifest,
+            on_confirm: ConfirmAction::DeleteManifest { repo, tag },
         };
     }
 }
 
-fn handle_confirm(app: &mut App, action: ConfirmAction) {
+fn handle_confirm(
+    _app: &mut App,
+    action: ConfirmAction,
+    client: &RegistryClient,
+    tx: &mpsc::Sender<AppEvent>,
+) {
     match action {
-        ConfirmAction::DeleteManifest => {
-            app.set_status("Delete queued (not yet implemented)");
+        ConfirmAction::DeleteManifest { repo, tag } => {
+            spawn_delete(client.clone(), repo, tag, tx.clone());
         }
     }
 }
@@ -249,6 +265,19 @@ fn handle_confirm(app: &mut App, action: ConfirmAction) {
 // ------------------------------------------------------------------
 // Background task spawners
 // ------------------------------------------------------------------
+
+fn spawn_delete(client: RegistryClient, repo: String, tag: String, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        match crate::ops::delete::delete_tag(&client, &repo, &tag).await {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::DeleteTagSuccess { repo, tag }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::DeleteTagError(e.to_string())).await;
+            }
+        }
+    });
+}
 
 fn spawn_repos_fetch(client: RegistryClient, cursor: Option<String>, tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
