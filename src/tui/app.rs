@@ -441,6 +441,21 @@ impl App {
         self.status.as_ref().map(|s| s.text.as_str())
     }
 
+    pub fn on_delete_success(&mut self, repo: &str, tag: &str) {
+        self.tags_all.retain(|t| t != tag);
+        self.apply_tag_filter_sort();
+        if self.current_tag.as_deref() == Some(tag) {
+            self.detail = None;
+            self.detail_load = LoadState::Idle;
+            self.current_tag = None;
+        }
+        self.set_status(format!("✓ Deleted {repo}:{tag}"));
+    }
+
+    pub fn on_delete_error(&mut self, msg: String) {
+        self.set_status(format!("✗ Delete failed: {msg}"));
+    }
+
     pub fn resort_tags(&mut self) {
         self.apply_tag_filter_sort();
     }
