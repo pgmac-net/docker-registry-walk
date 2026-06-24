@@ -332,6 +332,29 @@ impl RegistryClient {
         Ok(UploadLocation { location })
     }
 
+    /// `POST /v2/<dst>/blobs/uploads/?from=<src>&mount=<digest>` — cross-repo blob mount.
+    ///
+    /// Returns `Ok(true)` if the registry mounted the blob (201 Created).
+    /// Returns `Ok(false)` if the registry declined and opened a regular upload session instead
+    /// (202 Accepted) — caller should fall back to GET+PUT.
+    pub async fn mount_blob(&self, dst_repo: &str, src_repo: &str, digest: &str) -> Result<bool> {
+        let path = format!("/v2/{dst_repo}/blobs/uploads/");
+        let mut url = self.url(&path)?;
+        url.query_pairs_mut()
+            .append_pair("from", src_repo)
+            .append_pair("mount", digest);
+
+        let resp = self.send(self.http.post(url.clone())).await?;
+        match resp.status() {
+            StatusCode::CREATED => Ok(true),
+            StatusCode::ACCEPTED => Ok(false),
+            s => Err(RegistryError::UnexpectedStatus {
+                status: s.as_u16(),
+                url: url.to_string(),
+            }),
+        }
+    }
+
     /// Complete a blob upload with a monolithic PUT.
     ///
     /// `upload_url` is the `Location` from `start_blob_upload`.

@@ -63,11 +63,21 @@ pub enum Modal {
         message: String,
         on_confirm: ConfirmAction,
     },
+    Input {
+        prompt: String,
+        value: String,
+        on_confirm: InputAction,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     DeleteManifest { repo: String, tag: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum InputAction {
+    CopyImage { src_repo: String, src_tag: String },
 }
 
 #[derive(Debug)]

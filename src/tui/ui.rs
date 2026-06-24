@@ -37,8 +37,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_details(frame, app, vertical[2]);
     draw_keybindings(frame, app, vertical[3]);
 
-    if let Modal::Confirm { message, .. } = &app.modal {
-        draw_modal(frame, message.clone(), area);
+    match &app.modal {
+        Modal::Confirm { message, .. } => draw_confirm_modal(frame, message.clone(), area),
+        Modal::Input { prompt, value, .. } => {
+            draw_input_modal(frame, prompt.clone(), value.clone(), area)
+        }
+        Modal::None => {}
     }
 }
 
@@ -227,6 +231,8 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" sort  "),
             Span::styled("c", Style::default().fg(Color::Cyan)),
             Span::raw(" copy  "),
+            Span::styled("C", Style::default().fg(Color::Cyan)),
+            Span::raw(" copy-to  "),
             Span::styled("d", Style::default().fg(Color::Red)),
             Span::raw(" delete  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
@@ -237,7 +243,7 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(p, area);
 }
 
-fn draw_modal(frame: &mut Frame, message: String, area: Rect) {
+fn draw_confirm_modal(frame: &mut Frame, message: String, area: Rect) {
     let width = 50u16.min(area.width.saturating_sub(4));
     let height = 5u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -252,6 +258,26 @@ fn draw_modal(frame: &mut Frame, message: String, area: Rect) {
         .border_style(Style::default().fg(Color::Yellow));
 
     let text = format!("{message}\n\n[y] Confirm  [n/Esc] Cancel");
+    let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+
+    frame.render_widget(p, modal_area);
+}
+
+fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, area: Rect) {
+    let width = 60u16.min(area.width.saturating_sub(4));
+    let height = 5u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(format!(" {prompt} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    let text = format!("{value}_\n\n[Enter] Confirm  [Esc] Cancel");
     let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
 
     frame.render_widget(p, modal_area);

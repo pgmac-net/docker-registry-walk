@@ -22,7 +22,7 @@ use url::Url;
 use self::detail::ImageDetail;
 use crate::registry::{ImageConfigBlob, Manifest, RegistryClient};
 
-use self::app::{ConfirmAction, Focus, LoadState, Modal};
+use self::app::{ConfirmAction, Focus, InputAction, LoadState, Modal};
 use self::event::{AppEvent, spawn_event_reader};
 
 const TICK_MS: u64 = 200;
@@ -151,6 +151,11 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::DetailError(msg) => app.on_detail_error(msg),
         AppEvent::DeleteTagSuccess { repo, tag } => app.on_delete_success(&repo, &tag),
         AppEvent::DeleteTagError(msg) => app.on_delete_error(msg),
+        AppEvent::CopyProgress { done, total } => {
+            app.set_status(format!("Copying… {done}/{total} blobs"));
+        }
+        AppEvent::CopySuccess { dest } => app.set_status(format!("✓ Copied to {dest}")),
+        AppEvent::CopyError(msg) => app.set_status(format!("✗ Copy failed: {msg}")),
     }
 }
 
@@ -173,6 +178,36 @@ fn handle_key(
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 app.modal = Modal::None;
                 app.set_status("Cancelled");
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::Input { .. }) {
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            KeyCode::Enter => {
+                let modal = std::mem::replace(&mut app.modal, Modal::None);
+                if let Modal::Input {
+                    value, on_confirm, ..
+                } = modal
+                {
+                    handle_input_confirm(value, on_confirm, client, tx);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Modal::Input { value, .. } = &mut app.modal {
+                    value.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Modal::Input { value, .. } = &mut app.modal {
+                    value.push(ch);
+                }
             }
             _ => {}
         }
@@ -212,6 +247,7 @@ fn handle_key(
             app.resort_tags();
         }
         KeyCode::Char('c') => handle_copy(app),
+        KeyCode::Char('C') => handle_copy_image(app),
         KeyCode::Char('d') => handle_delete(app),
         _ => {}
     }
@@ -234,6 +270,24 @@ fn handle_copy(app: &mut App) {
         Ok(()) => app.set_status(format!("✓ Copied: {pull_url}")),
         Err(e) => app.set_status(format!("Clipboard error: {e}")),
     }
+}
+
+fn handle_copy_image(app: &mut App) {
+    let Some(tag) = app.selected_tag().map(str::to_owned) else {
+        return;
+    };
+    let Some(repo) = app.current_repo.clone() else {
+        return;
+    };
+    let prefilled = format!("{repo}:{tag}");
+    app.modal = Modal::Input {
+        prompt: "Copy to (repo:tag):".to_owned(),
+        value: prefilled,
+        on_confirm: InputAction::CopyImage {
+            src_repo: repo,
+            src_tag: tag,
+        },
+    };
 }
 
 fn handle_delete(app: &mut App) {
@@ -265,6 +319,60 @@ fn handle_confirm(
 // ------------------------------------------------------------------
 // Background task spawners
 // ------------------------------------------------------------------
+
+fn handle_input_confirm(
+    value: String,
+    action: InputAction,
+    client: &RegistryClient,
+    tx: &mpsc::Sender<AppEvent>,
+) {
+    match action {
+        InputAction::CopyImage { src_repo, src_tag } => {
+            let src_tag_clone = src_tag.clone();
+            let (dst_repo, dst_tag) = crate::ops::copy::parse_destination(&value, &src_tag_clone);
+            spawn_copy(
+                client.clone(),
+                src_repo,
+                src_tag,
+                dst_repo.to_owned(),
+                dst_tag.to_owned(),
+                tx.clone(),
+            );
+        }
+    }
+}
+
+fn spawn_copy(
+    client: RegistryClient,
+    src_repo: String,
+    src_tag: String,
+    dst_repo: String,
+    dst_tag: String,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let dest = format!("{dst_repo}:{dst_tag}");
+        let result = crate::ops::copy::copy_image(
+            &client,
+            &src_repo,
+            &src_tag,
+            &dst_repo,
+            &dst_tag,
+            |done, total| {
+                let _ = tx.blocking_send(AppEvent::CopyProgress { done, total });
+            },
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::CopySuccess { dest }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::CopyError(e.to_string())).await;
+            }
+        }
+    });
+}
 
 fn spawn_delete(client: RegistryClient, repo: String, tag: String, tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
