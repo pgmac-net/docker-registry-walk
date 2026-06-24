@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-use super::app::{App, Focus, Modal};
+use super::app::{App, Focus, LoadState, Modal, SPINNER};
 
 const HIGHLIGHT_STYLE: Style = Style::new()
     .fg(Color::Black)
@@ -72,8 +72,24 @@ fn draw_repos(frame: &mut Frame, app: &mut App, area: Rect) {
         INACTIVE_BORDER
     };
 
+    let spinner_char = SPINNER[app.spinner_tick % SPINNER.len()];
+    let title = match &app.repo_load {
+        LoadState::Loading => format!(" Repositories {spinner_char} "),
+        LoadState::Error(_) => " Repositories ✗ ".to_owned(),
+        LoadState::Idle => {
+            let count = app.repos.len();
+            if app.filter_mode == Some(Focus::Repos) {
+                format!(" Repos / {} ", app.repo_filter)
+            } else if !app.repo_filter.is_empty() {
+                format!(" Repositories [{count}] (filtered) ")
+            } else {
+                format!(" Repositories ({count}) ")
+            }
+        }
+    };
+
     let block = Block::default()
-        .title(" Repositories ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -98,8 +114,25 @@ fn draw_tags(frame: &mut Frame, app: &mut App, area: Rect) {
         INACTIVE_BORDER
     };
 
+    let spinner_char = SPINNER[app.spinner_tick % SPINNER.len()];
+    let sort_label = app.tag_sort.label();
+    let title = match &app.tag_load {
+        LoadState::Loading => format!(" Tags {spinner_char} "),
+        LoadState::Error(_) => " Tags ✗ ".to_owned(),
+        LoadState::Idle => {
+            let count = app.tags.len();
+            if app.filter_mode == Some(Focus::Tags) {
+                format!(" Tags / {} ", app.tag_filter)
+            } else if !app.tag_filter.is_empty() {
+                format!(" Tags [{count}] (filtered) [{sort_label}] ")
+            } else {
+                format!(" Tags ({count}) [{sort_label}] ")
+            }
+        }
+    };
+
     let block = Block::default()
-        .title(" Tags ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -137,19 +170,33 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(p, area);
 }
 
-fn draw_keybindings(frame: &mut Frame, _app: &App, area: Rect) {
-    let spans = Line::from(vec![
-        Span::styled(" Tab", Style::default().fg(Color::Cyan)),
-        Span::raw(" focus  "),
-        Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-        Span::raw(" navigate  "),
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::raw(" select  "),
-        Span::styled("d", Style::default().fg(Color::Red)),
-        Span::raw(" delete  "),
-        Span::styled("q", Style::default().fg(Color::Cyan)),
-        Span::raw(" quit "),
-    ]);
+fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
+    let in_filter = app.filter_mode.is_some();
+    let spans = if in_filter {
+        Line::from(vec![
+            Span::styled(" Typing filter", Style::default().fg(Color::Yellow)),
+            Span::raw("  "),
+            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::raw(" clear  "),
+            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::raw(" confirm "),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" Tab", Style::default().fg(Color::Cyan)),
+            Span::raw(" focus  "),
+            Span::styled("↑↓", Style::default().fg(Color::Cyan)),
+            Span::raw(" navigate  "),
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::raw(" filter  "),
+            Span::styled("s", Style::default().fg(Color::Cyan)),
+            Span::raw(" sort  "),
+            Span::styled("d", Style::default().fg(Color::Red)),
+            Span::raw(" delete  "),
+            Span::styled("q", Style::default().fg(Color::Cyan)),
+            Span::raw(" quit "),
+        ])
+    };
     let p = Paragraph::new(spans).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(p, area);
 }
