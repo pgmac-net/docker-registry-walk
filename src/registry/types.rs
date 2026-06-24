@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub mod media_types {
@@ -32,11 +34,40 @@ pub struct TagList {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Platform {
+    pub os: String,
+    pub architecture: String,
+    #[serde(default)]
+    pub variant: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestDescriptor {
     pub media_type: String,
     pub size: i64,
     pub digest: String,
+    #[serde(default)]
+    pub platform: Option<Platform>,
+}
+
+/// Parsed image config blob (Docker v2 / OCI).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ImageConfigBlob {
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub os: Option<String>,
+    #[serde(default)]
+    pub created: Option<String>,
+    #[serde(default)]
+    pub config: ImageConfigSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ImageConfigSection {
+    #[serde(rename = "Labels", default)]
+    pub labels: Option<HashMap<String, String>>,
 }
 
 /// Single-arch image manifest (OCI v1 or Docker v2 schema 2).

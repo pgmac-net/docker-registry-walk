@@ -5,6 +5,8 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyEvent};
 use tokio::sync::mpsc;
 
+use super::detail::ImageDetail;
+
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
@@ -14,6 +16,12 @@ pub enum AppEvent {
     ReposError(String),
     TagsPage(String, Vec<String>, bool),
     TagsError(String),
+    DetailLoaded {
+        repo: String,
+        tag: String,
+        detail: Box<ImageDetail>,
+    },
+    DetailError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
