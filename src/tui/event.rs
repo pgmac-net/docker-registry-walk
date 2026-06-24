@@ -1,0 +1,42 @@
+#![allow(dead_code)]
+
+use std::time::Duration;
+
+use crossterm::event::{Event, KeyEvent};
+use tokio::sync::mpsc;
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Key(KeyEvent),
+    Resize(u16, u16),
+    Tick,
+}
+
+/// Spawn a blocking thread that forwards crossterm events to `tx`.
+///
+/// The thread exits automatically when `tx` is closed (i.e. when the app quits
+/// and the receiver is dropped).
+pub fn spawn_event_reader(tx: mpsc::Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        loop {
+            match crossterm::event::poll(Duration::from_millis(20)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(Event::Key(k)) => {
+                        if tx.blocking_send(AppEvent::Key(k)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Event::Resize(w, h))
+                        if tx.blocking_send(AppEvent::Resize(w, h)).is_err() =>
+                    {
+                        break;
+                    }
+                    Ok(Event::Resize(_, _)) => {}
+                    _ => {}
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
