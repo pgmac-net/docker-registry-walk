@@ -49,6 +49,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Modal::Inspect(m) => draw_inspect_modal(frame, &m.title, &m.lines, m.scroll, area),
         Modal::LayerDiff(m) => draw_layer_diff_modal(frame, m, area),
+        Modal::Help { scroll } => draw_help_modal(frame, *scroll, area),
         Modal::None => {}
     }
 }
@@ -275,6 +276,8 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             parts.push(Span::styled("R", Style::default().fg(Color::Magenta)));
             parts.push(Span::raw(" switch  "));
         }
+        parts.push(Span::styled("?", Style::default().fg(Color::Cyan)));
+        parts.push(Span::raw(" help  "));
         parts.push(Span::styled("q", Style::default().fg(Color::Cyan)));
         parts.push(Span::raw(" quit "));
         Line::from(parts)
@@ -501,6 +504,124 @@ fn draw_layer_diff_modal(frame: &mut Frame, m: &crate::tui::app::LayerDiffModal,
     let max_scroll = content.len().saturating_sub(visible_h);
     let scroll = m.scroll.min(max_scroll);
     let visible: Vec<Line> = content.into_iter().skip(scroll).take(visible_h).collect();
+
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
+    let width = 62u16.min(area.width.saturating_sub(4));
+    let height = 32u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(" Keybindings — ? or Esc to close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let key = |k: &'static str| {
+        Span::styled(
+            k,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let sep = || Span::raw("  ");
+    let desc = |d: &'static str| Span::raw(d);
+    let header = |h: &'static str| {
+        Line::from(vec![Span::styled(
+            h,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )])
+    };
+
+    let lines: Vec<Line> = vec![
+        header("Navigation"),
+        Line::from(vec![key("↑ / k"), sep(), desc("Move up")]),
+        Line::from(vec![key("↓ / j"), sep(), desc("Move down")]),
+        Line::from(vec![
+            key("Tab"),
+            sep(),
+            desc("Cycle panel (Repos → Tags → Detail)"),
+        ]),
+        Line::from(vec![
+            key("Enter"),
+            sep(),
+            desc("Move focus to Tags when in Repos"),
+        ]),
+        Line::from(vec![]),
+        header("Filter"),
+        Line::from(vec![key("/"), sep(), desc("Start filter in current panel")]),
+        Line::from(vec![key("Esc / Enter"), sep(), desc("Exit filter mode")]),
+        Line::from(vec![]),
+        header("Image operations  (require a tag selected)"),
+        Line::from(vec![key("c"), sep(), desc("Copy pull URL to clipboard")]),
+        Line::from(vec![
+            key("C"),
+            sep(),
+            desc("Copy image to another registry/repo"),
+        ]),
+        Line::from(vec![
+            key("r"),
+            sep(),
+            desc("Retag — push manifest under a new tag"),
+        ]),
+        Line::from(vec![
+            key("d"),
+            sep(),
+            desc("Delete tag (requires delete enabled)"),
+        ]),
+        Line::from(vec![
+            key("i"),
+            sep(),
+            desc("Inspect raw manifest & config JSON"),
+        ]),
+        Line::from(vec![
+            key("e"),
+            sep(),
+            desc("Export image as OCI tar archive"),
+        ]),
+        Line::from(vec![
+            key("D"),
+            sep(),
+            desc("Diff layers against another tag"),
+        ]),
+        Line::from(vec![]),
+        header("Repository operations  (require a repo selected)"),
+        Line::from(vec![
+            key("P"),
+            sep(),
+            desc("Prune digest-only (untagged) manifests"),
+        ]),
+        Line::from(vec![]),
+        header("Tags panel"),
+        Line::from(vec![
+            key("s"),
+            sep(),
+            desc("Cycle tag sort order (↑ / ↓ name)"),
+        ]),
+        Line::from(vec![]),
+        header("Registry"),
+        Line::from(vec![key("R"), sep(), desc("Switch registry (in-app)")]),
+        Line::from(vec![]),
+        header("General"),
+        Line::from(vec![key("?"), sep(), desc("This help screen")]),
+        Line::from(vec![key("q / Ctrl-C"), sep(), desc("Quit")]),
+    ];
+
+    let visible_h = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_h);
+    let clamped = scroll.min(max_scroll);
+    let visible: Vec<Line> = lines.into_iter().skip(clamped).take(visible_h).collect();
 
     frame.render_widget(Paragraph::new(visible), inner);
 }

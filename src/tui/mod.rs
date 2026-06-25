@@ -335,6 +335,26 @@ fn handle_key(
         return;
     }
 
+    if matches!(app.modal, Modal::Help { .. }) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                app.modal = Modal::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Modal::Help { scroll } = &mut app.modal {
+                    *scroll = scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Modal::Help { scroll } = &mut app.modal {
+                    *scroll = scroll.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if matches!(app.modal, Modal::RegistrySelect { .. }) {
         let n = app.profiles.len();
         match code {
@@ -407,6 +427,7 @@ fn handle_key(
         KeyCode::Char('P') => handle_prune(app, client, tx),
         KeyCode::Char('e') => handle_export(app),
         KeyCode::Char('D') => handle_diff(app),
+        KeyCode::Char('?') => app.modal = Modal::Help { scroll: 0 },
         _ => {}
     }
 }
