@@ -156,6 +156,8 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         }
         AppEvent::CopySuccess { dest } => app.set_status(format!("✓ Copied to {dest}")),
         AppEvent::CopyError(msg) => app.set_status(format!("✗ Copy failed: {msg}")),
+        AppEvent::RetagSuccess { new_tag } => app.on_retag_success(new_tag),
+        AppEvent::RetagError(msg) => app.on_retag_error(msg),
     }
 }
 
@@ -248,6 +250,7 @@ fn handle_key(
         }
         KeyCode::Char('c') => handle_copy(app),
         KeyCode::Char('C') => handle_copy_image(app),
+        KeyCode::Char('r') => handle_retag(app),
         KeyCode::Char('d') => handle_delete(app),
         _ => {}
     }
@@ -287,6 +290,20 @@ fn handle_copy_image(app: &mut App) {
             src_repo: repo,
             src_tag: tag,
         },
+    };
+}
+
+fn handle_retag(app: &mut App) {
+    let Some(tag) = app.selected_tag().map(str::to_owned) else {
+        return;
+    };
+    let Some(repo) = app.current_repo.clone() else {
+        return;
+    };
+    app.modal = Modal::Input {
+        prompt: format!("New tag for '{repo}:{tag}':"),
+        value: String::new(),
+        on_confirm: InputAction::Retag { repo, src_tag: tag },
     };
 }
 
@@ -339,6 +356,14 @@ fn handle_input_confirm(
                 tx.clone(),
             );
         }
+        InputAction::Retag { repo, src_tag } => {
+            if !crate::ops::retag::validate_tag(&value) {
+                let _ =
+                    tx.blocking_send(AppEvent::RetagError(format!("Invalid tag name '{value}'")));
+                return;
+            }
+            spawn_retag(client.clone(), repo, src_tag, value, tx.clone());
+        }
     }
 }
 
@@ -369,6 +394,25 @@ fn spawn_copy(
             }
             Err(e) => {
                 let _ = tx.send(AppEvent::CopyError(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn spawn_retag(
+    client: RegistryClient,
+    repo: String,
+    src_tag: String,
+    new_tag: String,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match crate::ops::retag::retag(&client, &repo, &src_tag, &new_tag).await {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::RetagSuccess { new_tag }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::RetagError(e.to_string())).await;
             }
         }
     });

@@ -78,6 +78,7 @@ pub enum ConfirmAction {
 #[derive(Debug, Clone)]
 pub enum InputAction {
     CopyImage { src_repo: String, src_tag: String },
+    Retag { repo: String, src_tag: String },
 }
 
 #[derive(Debug)]
@@ -464,6 +465,18 @@ impl App {
 
     pub fn on_delete_error(&mut self, msg: String) {
         self.set_status(format!("✗ Delete failed: {msg}"));
+    }
+
+    pub fn on_retag_success(&mut self, new_tag: String) {
+        if !self.tags_all.contains(&new_tag) {
+            self.tags_all.push(new_tag.clone());
+            self.apply_tag_filter_sort();
+        }
+        self.set_status(format!("✓ Tagged as {new_tag}"));
+    }
+
+    pub fn on_retag_error(&mut self, msg: String) {
+        self.set_status(format!("✗ Retag failed: {msg}"));
     }
 
     pub fn resort_tags(&mut self) {

@@ -35,6 +35,10 @@ pub enum AppEvent {
         dest: String,
     },
     CopyError(String),
+    RetagSuccess {
+        new_tag: String,
+    },
+    RetagError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
