@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use ratatui::widgets::ListState;
 
 use crate::config::RegistryProfile;
+use crate::ops::diff::DiffLayer;
 
 use super::detail::ImageDetail;
 
@@ -59,6 +60,22 @@ impl SortOrder {
 }
 
 #[derive(Debug)]
+pub struct InspectModal {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub scroll: usize,
+}
+
+#[derive(Debug)]
+pub struct LayerDiffModal {
+    pub repo: String,
+    pub tag_a: String,
+    pub tag_b: String,
+    pub layers: Vec<DiffLayer>,
+    pub scroll: usize,
+}
+
+#[derive(Debug)]
 pub enum Modal {
     None,
     Confirm {
@@ -73,17 +90,22 @@ pub enum Modal {
     RegistrySelect {
         selected_idx: usize,
     },
+    Inspect(Box<InspectModal>),
+    LayerDiff(Box<LayerDiffModal>),
 }
 
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
     DeleteManifest { repo: String, tag: String },
+    PruneDigestTags { repo: String, tags: Vec<String> },
 }
 
 #[derive(Debug, Clone)]
 pub enum InputAction {
     CopyImage { src_repo: String, src_tag: String },
     Retag { repo: String, src_tag: String },
+    Export { repo: String, tag: String },
+    DiffAgainst { repo: String, tag_a: String },
 }
 
 #[derive(Debug)]
