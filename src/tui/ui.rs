@@ -42,14 +42,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Modal::Input { prompt, value, .. } => {
             draw_input_modal(frame, prompt.clone(), value.clone(), area)
         }
+        Modal::RegistrySelect { selected_idx } => {
+            draw_registry_select_modal(frame, app, *selected_idx, area)
+        }
         Modal::None => {}
     }
 }
 
 fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
+    let switch_hint = if app.profiles.len() > 1 {
+        "  [R] switch"
+    } else {
+        ""
+    };
     let title = format!(
-        " docker-registry-walk  │  {}  │  {}",
-        app.registry_name, app.registry_url
+        " docker-registry-walk  │  [{}]  {}{}",
+        app.registry_name, app.registry_url, switch_hint
     );
     let p = Paragraph::new(title).style(
         Style::default()
@@ -220,7 +228,7 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" quit "),
         ])
     } else {
-        Line::from(vec![
+        let mut parts = vec![
             Span::styled(" Tab", Style::default().fg(Color::Cyan)),
             Span::raw(" focus  "),
             Span::styled("↑↓", Style::default().fg(Color::Cyan)),
@@ -237,9 +245,14 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" retag  "),
             Span::styled("d", Style::default().fg(Color::Red)),
             Span::raw(" delete  "),
-            Span::styled("q", Style::default().fg(Color::Cyan)),
-            Span::raw(" quit "),
-        ])
+        ];
+        if app.profiles.len() > 1 {
+            parts.push(Span::styled("R", Style::default().fg(Color::Magenta)));
+            parts.push(Span::raw(" switch  "));
+        }
+        parts.push(Span::styled("q", Style::default().fg(Color::Cyan)));
+        parts.push(Span::raw(" quit "));
+        Line::from(parts)
     };
     let p = Paragraph::new(spans).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(p, area);
@@ -283,4 +296,53 @@ fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, area: Rect
     let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
 
     frame.render_widget(p, modal_area);
+}
+
+fn draw_registry_select_modal(frame: &mut Frame, app: &App, selected_idx: usize, area: Rect) {
+    let n = app.profiles.len();
+    let height = (n as u16 + 4).min(area.height.saturating_sub(4));
+    let width = 60u16.min(area.width.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(" Switch Registry ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    if n <= 1 {
+        let text = "No other registries configured.\n\n[Esc] Cancel";
+        let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+        frame.render_widget(p, modal_area);
+        return;
+    }
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let items: Vec<ListItem> = app
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let active = if i == app.active_profile_idx {
+                "* "
+            } else {
+                "  "
+            };
+            ListItem::new(format!("{active}[{}]  {}", p.name, p.url))
+        })
+        .collect();
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(selected_idx));
+
+    let list = List::new(items)
+        .highlight_style(HIGHLIGHT_STYLE)
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, inner, &mut list_state);
 }

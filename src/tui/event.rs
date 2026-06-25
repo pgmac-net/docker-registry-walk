@@ -39,6 +39,9 @@ pub enum AppEvent {
         new_tag: String,
     },
     RetagError(String),
+    SwitchRegistry {
+        idx: usize,
+    },
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.

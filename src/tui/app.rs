@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::widgets::ListState;
 
+use crate::config::RegistryProfile;
+
 use super::detail::ImageDetail;
 
 const STATUS_TTL: Duration = Duration::from_secs(2);
@@ -68,6 +70,9 @@ pub enum Modal {
         value: String,
         on_confirm: InputAction,
     },
+    RegistrySelect {
+        selected_idx: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -124,12 +129,17 @@ pub struct App {
     pub should_quit: bool,
     pub spinner_tick: usize,
     status: Option<StatusMessage>,
+    // Registry switcher
+    pub profiles: Vec<RegistryProfile>,
+    pub active_profile_idx: usize,
 }
 
 impl App {
-    pub fn new(registry_name: String, registry_url: String) -> Self {
+    pub fn new(profiles: Vec<RegistryProfile>) -> Self {
         let mut repos_state = ListState::default();
         repos_state.select(Some(0));
+        let registry_name = profiles.first().map(|p| p.name.clone()).unwrap_or_default();
+        let registry_url = profiles.first().map(|p| p.url.clone()).unwrap_or_default();
         Self {
             focus: Focus::Repos,
             filter_mode: None,
@@ -159,6 +169,8 @@ impl App {
             should_quit: false,
             spinner_tick: 0,
             status: None,
+            profiles,
+            active_profile_idx: 0,
         }
     }
 
@@ -236,10 +248,41 @@ impl App {
         self.tags_has_more = false;
         self.tag_filter.clear();
         self.tag_load = LoadState::Loading;
-        // Clear detail when repo changes.
         self.detail = None;
         self.detail_load = LoadState::Idle;
         self.current_tag = None;
+    }
+
+    /// Clear all repo/tag/detail state when switching registries.
+    pub fn start_registry_switch(&mut self, idx: usize) {
+        self.active_profile_idx = idx;
+        let profile = &self.profiles[idx];
+        self.registry_name = profile.name.clone();
+        self.registry_url = profile.url.clone();
+
+        self.repos_all.clear();
+        self.repos.clear();
+        self.repos_state.select(Some(0));
+        self.repos_cursor = None;
+        self.repos_has_more = false;
+        self.repo_filter.clear();
+        self.repo_load = LoadState::Loading;
+
+        self.tags_all.clear();
+        self.tags.clear();
+        self.tags_state.select(None);
+        self.tags_cursor = None;
+        self.tags_has_more = false;
+        self.tag_filter.clear();
+        self.tag_load = LoadState::Idle;
+
+        self.current_repo = None;
+        self.current_tag = None;
+        self.detail = None;
+        self.detail_load = LoadState::Idle;
+        self.detail_scroll = 0;
+        self.focus = Focus::Repos;
+        self.filter_mode = None;
     }
 
     // ------------------------------------------------------------------
