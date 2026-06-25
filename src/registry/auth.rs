@@ -140,6 +140,42 @@ impl Credentials for BearerCredentials {
         // Slow path: fetch / refresh.
         self.refresh(http).await.map(|t| format!("Bearer {t}"))
     }
+
+    async fn get_authorization_for_challenge(
+        &self,
+        http: &Client,
+        www_auth: &str,
+    ) -> Option<String> {
+        // Exchange a fresh token using the scope from this specific 401 challenge.
+        // This handles registries (e.g. Docker Hub) that issue per-endpoint scoped tokens.
+        let challenge = parse_bearer_challenge(www_auth)?;
+
+        let mut token_url = Url::parse(&challenge.realm).ok()?;
+        {
+            let mut q = token_url.query_pairs_mut();
+            if let Some(svc) = &challenge.service {
+                q.append_pair("service", svc);
+            }
+            if let Some(scope) = &challenge.scope {
+                q.append_pair("scope", scope);
+            }
+        }
+
+        let token_resp = http
+            .get(token_url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .ok()?;
+
+        let body: serde_json::Value = token_resp.json().await.ok()?;
+        let token_str = body["token"]
+            .as_str()
+            .or_else(|| body["access_token"].as_str())?
+            .to_owned();
+
+        Some(format!("Bearer {token_str}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
