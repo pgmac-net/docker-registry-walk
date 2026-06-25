@@ -233,6 +233,8 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" copy  "),
             Span::styled("C", Style::default().fg(Color::Cyan)),
             Span::raw(" copy-to  "),
+            Span::styled("r", Style::default().fg(Color::Cyan)),
+            Span::raw(" retag  "),
             Span::styled("d", Style::default().fg(Color::Red)),
             Span::raw(" delete  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
