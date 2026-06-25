@@ -92,6 +92,9 @@ pub enum Modal {
     },
     Inspect(Box<InspectModal>),
     LayerDiff(Box<LayerDiffModal>),
+    Help {
+        scroll: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
