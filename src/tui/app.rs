@@ -157,11 +157,15 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(profiles: Vec<RegistryProfile>) -> Self {
+    pub fn new(profiles: Vec<RegistryProfile>, initial_idx: usize) -> Self {
         let mut repos_state = ListState::default();
         repos_state.select(Some(0));
-        let registry_name = profiles.first().map(|p| p.name.clone()).unwrap_or_default();
-        let registry_url = profiles.first().map(|p| p.url.clone()).unwrap_or_default();
+        let idx = initial_idx.min(profiles.len().saturating_sub(1));
+        let registry_name = profiles
+            .get(idx)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let registry_url = profiles.get(idx).map(|p| p.url.clone()).unwrap_or_default();
         Self {
             focus: Focus::Repos,
             filter_mode: None,
@@ -192,7 +196,7 @@ impl App {
             spinner_tick: 0,
             status: None,
             profiles,
-            active_profile_idx: 0,
+            active_profile_idx: idx,
         }
     }
 

@@ -110,11 +110,17 @@ fn draw_repos(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let items: Vec<ListItem> = app
-        .repos
-        .iter()
-        .map(|r| ListItem::new(r.as_str()))
-        .collect();
+    let items: Vec<ListItem> = if let LoadState::Error(msg) = &app.repo_load {
+        vec![
+            ListItem::new(format!("✗ {msg}"))
+                .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+        ]
+    } else {
+        app.repos
+            .iter()
+            .map(|r| ListItem::new(r.as_str()))
+            .collect()
+    };
 
     let list = List::new(items)
         .block(block)
@@ -153,7 +159,14 @@ fn draw_tags(frame: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    let items: Vec<ListItem> = app.tags.iter().map(|t| ListItem::new(t.as_str())).collect();
+    let items: Vec<ListItem> = if let LoadState::Error(msg) = &app.tag_load {
+        vec![
+            ListItem::new(format!("✗ {msg}"))
+                .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+        ]
+    } else {
+        app.tags.iter().map(|t| ListItem::new(t.as_str())).collect()
+    };
 
     let list = List::new(items)
         .block(block)

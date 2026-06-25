@@ -22,6 +22,7 @@ pub const MANIFEST_ACCEPT: &str = concat!(
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalog {
+    #[serde(default)]
     pub repositories: Vec<String>,
 }
 
