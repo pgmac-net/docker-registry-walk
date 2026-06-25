@@ -33,7 +33,7 @@ use self::event::{AppEvent, spawn_event_reader};
 const TICK_MS: u64 = 200;
 const PAGE_SIZE: u32 = 100;
 
-pub async fn run(mut profiles: Vec<RegistryProfile>) -> anyhow::Result<()> {
+pub async fn run(mut profiles: Vec<RegistryProfile>, initial_idx: usize) -> anyhow::Result<()> {
     if profiles.is_empty() {
         profiles.push(RegistryProfile {
             name: "local".to_owned(),
@@ -41,6 +41,7 @@ pub async fn run(mut profiles: Vec<RegistryProfile>) -> anyhow::Result<()> {
             username: None,
         });
     }
+    let initial_idx = initial_idx.min(profiles.len().saturating_sub(1));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -48,7 +49,7 @@ pub async fn run(mut profiles: Vec<RegistryProfile>) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, profiles).await;
+    let result = event_loop(&mut terminal, profiles, initial_idx).await;
 
     disable_raw_mode()?;
     execute!(
@@ -64,18 +65,19 @@ pub async fn run(mut profiles: Vec<RegistryProfile>) -> anyhow::Result<()> {
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     profiles: Vec<RegistryProfile>,
+    initial_idx: usize,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<AppEvent>(128);
     spawn_event_reader(tx.clone());
 
     let mut tick = interval(Duration::from_millis(TICK_MS));
-    let mut app = App::new(profiles.clone());
+    let mut app = App::new(profiles.clone(), initial_idx);
 
-    // Pre-build client for first profile.
+    // Pre-build client for the initial profile.
     let mut clients: HashMap<String, RegistryClient> = HashMap::new();
-    let first_client = make_client_for_profile(&profiles[0]);
-    clients.insert(profiles[0].name.clone(), first_client);
-    let mut active_name = profiles[0].name.clone();
+    let init_client = make_client_for_profile(&profiles[initial_idx]);
+    clients.insert(profiles[initial_idx].name.clone(), init_client);
+    let mut active_name = profiles[initial_idx].name.clone();
 
     // Kick off initial catalog load.
     app.repo_load = LoadState::Loading;
