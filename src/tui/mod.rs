@@ -24,7 +24,9 @@ use url::Url;
 use crate::config::RegistryProfile;
 use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient};
 
-use self::app::{ConfirmAction, Focus, InputAction, LoadState, Modal};
+use self::app::{
+    ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal, LoadState, Modal,
+};
 use self::detail::ImageDetail;
 use self::event::{AppEvent, spawn_event_reader};
 
@@ -190,6 +192,49 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::RetagError(msg) => app.on_retag_error(msg),
         // Handled directly in event_loop.
         AppEvent::SwitchRegistry { .. } => {}
+        AppEvent::InspectLoaded { title, lines } => {
+            app.modal = Modal::Inspect(Box::new(InspectModal {
+                title,
+                lines,
+                scroll: 0,
+            }));
+        }
+        AppEvent::InspectError(msg) => app.set_status(format!("✗ Inspect failed: {msg}")),
+        AppEvent::PruneFound { repo, tags } => {
+            if tags.is_empty() {
+                app.set_status(format!("No digest-tagged manifests found in {repo}"));
+            } else {
+                let count = tags.len();
+                app.modal = Modal::Confirm {
+                    message: format!("Delete {count} digest-tagged manifest(s) in '{repo}'?"),
+                    on_confirm: ConfirmAction::PruneDigestTags { repo, tags },
+                };
+            }
+        }
+        AppEvent::PruneComplete { repo, count } => {
+            app.set_status(format!("✓ Pruned {count} manifest(s) in {repo}"));
+        }
+        AppEvent::PruneError(msg) => app.set_status(format!("✗ Prune failed: {msg}")),
+        AppEvent::ExportProgress { done, total } => {
+            app.set_status(format!("Exporting… {done}/{total} blobs"));
+        }
+        AppEvent::ExportComplete { path } => app.set_status(format!("✓ Exported to {path}")),
+        AppEvent::ExportError(msg) => app.set_status(format!("✗ Export failed: {msg}")),
+        AppEvent::DiffLoaded {
+            repo,
+            tag_a,
+            tag_b,
+            layers,
+        } => {
+            app.modal = Modal::LayerDiff(Box::new(LayerDiffModal {
+                repo,
+                tag_a,
+                tag_b,
+                layers,
+                scroll: 0,
+            }));
+        }
+        AppEvent::DiffError(msg) => app.set_status(format!("✗ Diff failed: {msg}")),
     }
 }
 
@@ -241,6 +286,46 @@ fn handle_key(
             KeyCode::Char(ch) => {
                 if let Modal::Input { value, .. } = &mut app.modal {
                     value.push(ch);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::Inspect(_)) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.modal = Modal::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Modal::Inspect(m) = &mut app.modal {
+                    m.scroll = m.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Modal::Inspect(m) = &mut app.modal {
+                    m.scroll = m.scroll.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::LayerDiff(_)) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.modal = Modal::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Modal::LayerDiff(m) = &mut app.modal {
+                    m.scroll = m.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Modal::LayerDiff(m) = &mut app.modal {
+                    m.scroll = m.scroll.saturating_add(1);
                 }
             }
             _ => {}
@@ -316,6 +401,10 @@ fn handle_key(
         KeyCode::Char('r') => handle_retag(app),
         KeyCode::Char('R') => handle_registry_select(app),
         KeyCode::Char('d') => handle_delete(app),
+        KeyCode::Char('i') => handle_inspect(app, client, tx),
+        KeyCode::Char('P') => handle_prune(app, client, tx),
+        KeyCode::Char('e') => handle_export(app),
+        KeyCode::Char('D') => handle_diff(app),
         _ => {}
     }
 }
@@ -393,6 +482,9 @@ fn handle_confirm(action: ConfirmAction, client: &RegistryClient, tx: &mpsc::Sen
         ConfirmAction::DeleteManifest { repo, tag } => {
             spawn_delete(client.clone(), repo, tag, tx.clone());
         }
+        ConfirmAction::PruneDigestTags { repo, tags } => {
+            spawn_prune(client.clone(), repo, tags, tx.clone());
+        }
     }
 }
 
@@ -427,7 +519,59 @@ fn handle_input_confirm(
             }
             spawn_retag(client.clone(), repo, src_tag, value, tx.clone());
         }
+        InputAction::Export { repo, tag } => {
+            spawn_export(client.clone(), repo, tag, value, tx.clone());
+        }
+        InputAction::DiffAgainst { repo, tag_a } => {
+            spawn_diff(client.clone(), repo, tag_a, value, tx.clone());
+        }
     }
+}
+
+fn handle_inspect(app: &mut App, client: &RegistryClient, tx: &mpsc::Sender<AppEvent>) {
+    let Some(tag) = app.selected_tag().map(str::to_owned) else {
+        return;
+    };
+    let Some(repo) = app.current_repo.clone() else {
+        return;
+    };
+    spawn_inspect(client.clone(), repo, tag, tx.clone());
+}
+
+fn handle_prune(app: &mut App, client: &RegistryClient, tx: &mpsc::Sender<AppEvent>) {
+    let Some(repo) = app.current_repo.clone() else {
+        return;
+    };
+    spawn_prune_find(client.clone(), repo, tx.clone());
+}
+
+fn handle_export(app: &mut App) {
+    let Some(tag) = app.selected_tag().map(str::to_owned) else {
+        return;
+    };
+    let Some(repo) = app.current_repo.clone() else {
+        return;
+    };
+    let default_path = format!("{}-{}.tar", repo.replace('/', "-"), tag);
+    app.modal = Modal::Input {
+        prompt: "Export OCI tar to:".to_owned(),
+        value: default_path,
+        on_confirm: InputAction::Export { repo, tag },
+    };
+}
+
+fn handle_diff(app: &mut App) {
+    let Some(tag) = app.selected_tag().map(str::to_owned) else {
+        return;
+    };
+    let Some(repo) = app.current_repo.clone() else {
+        return;
+    };
+    app.modal = Modal::Input {
+        prompt: format!("Diff '{tag}' against tag:"),
+        value: String::new(),
+        on_confirm: InputAction::DiffAgainst { repo, tag_a: tag },
+    };
 }
 
 fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
@@ -506,6 +650,103 @@ fn spawn_delete(client: RegistryClient, repo: String, tag: String, tx: mpsc::Sen
             }
             Err(e) => {
                 let _ = tx.send(AppEvent::DeleteTagError(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn spawn_inspect(client: RegistryClient, repo: String, tag: String, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let title = format!("{repo}:{tag}");
+        match crate::ops::inspect::inspect(&client, &repo, &tag).await {
+            Ok(result) => {
+                let lines = crate::ops::inspect::build_lines(&result);
+                let _ = tx.send(AppEvent::InspectLoaded { title, lines }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::InspectError(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn spawn_prune_find(client: RegistryClient, repo: String, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        match crate::ops::prune::find_digest_tags(&client, &repo).await {
+            Ok(tags) => {
+                let _ = tx.send(AppEvent::PruneFound { repo, tags }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::PruneError(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn spawn_prune(
+    client: RegistryClient,
+    repo: String,
+    tags: Vec<String>,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match crate::ops::prune::prune_digest_tags(&client, &repo, &tags).await {
+            Ok(count) => {
+                let _ = tx.send(AppEvent::PruneComplete { repo, count }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::PruneError(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn spawn_export(
+    client: RegistryClient,
+    repo: String,
+    tag: String,
+    path: String,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let dest = std::path::PathBuf::from(&path);
+        let result =
+            crate::ops::export::export_image(&client, &repo, &tag, &dest, |done, total| {
+                let _ = tx.blocking_send(AppEvent::ExportProgress { done, total });
+            })
+            .await;
+        match result {
+            Ok(()) => {
+                let _ = tx.send(AppEvent::ExportComplete { path }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::ExportError(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn spawn_diff(
+    client: RegistryClient,
+    repo: String,
+    tag_a: String,
+    tag_b: String,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match crate::ops::diff::diff_tags(&client, &repo, &tag_a, &tag_b).await {
+            Ok(layers) => {
+                let _ = tx
+                    .send(AppEvent::DiffLoaded {
+                        repo,
+                        tag_a,
+                        tag_b,
+                        layers,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::DiffError(e.to_string())).await;
             }
         }
     });

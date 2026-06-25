@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
+use crate::ops::diff::DiffStatus;
+
 use super::app::{App, Focus, LoadState, Modal, SPINNER};
 use super::detail;
 
@@ -45,6 +47,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Modal::RegistrySelect { selected_idx } => {
             draw_registry_select_modal(frame, app, *selected_idx, area)
         }
+        Modal::Inspect(m) => draw_inspect_modal(frame, &m.title, &m.lines, m.scroll, area),
+        Modal::LayerDiff(m) => draw_layer_diff_modal(frame, m, area),
         Modal::None => {}
     }
 }
@@ -232,17 +236,25 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" Tab", Style::default().fg(Color::Cyan)),
             Span::raw(" focus  "),
             Span::styled("↑↓", Style::default().fg(Color::Cyan)),
-            Span::raw(" navigate  "),
+            Span::raw(" nav  "),
             Span::styled("/", Style::default().fg(Color::Cyan)),
             Span::raw(" filter  "),
             Span::styled("s", Style::default().fg(Color::Cyan)),
             Span::raw(" sort  "),
+            Span::styled("i", Style::default().fg(Color::Cyan)),
+            Span::raw(" inspect  "),
             Span::styled("c", Style::default().fg(Color::Cyan)),
             Span::raw(" copy  "),
             Span::styled("C", Style::default().fg(Color::Cyan)),
             Span::raw(" copy-to  "),
             Span::styled("r", Style::default().fg(Color::Cyan)),
             Span::raw(" retag  "),
+            Span::styled("D", Style::default().fg(Color::Cyan)),
+            Span::raw(" diff  "),
+            Span::styled("e", Style::default().fg(Color::Cyan)),
+            Span::raw(" export  "),
+            Span::styled("P", Style::default().fg(Color::Yellow)),
+            Span::raw(" prune  "),
             Span::styled("d", Style::default().fg(Color::Red)),
             Span::raw(" delete  "),
         ];
@@ -345,4 +357,137 @@ fn draw_registry_select_modal(frame: &mut Frame, app: &App, selected_idx: usize,
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, inner, &mut list_state);
+}
+
+fn draw_inspect_modal(frame: &mut Frame, title: &str, lines: &[String], scroll: usize, area: Rect) {
+    let width = area.width.saturating_sub(4);
+    let height = area.height.saturating_sub(4);
+    let x = area.x + 2;
+    let y = area.y + 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(format!(" Inspect: {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let visible_h = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_h);
+    let scroll = scroll.min(max_scroll);
+
+    let visible: Vec<Line> = lines
+        .iter()
+        .skip(scroll)
+        .take(visible_h)
+        .map(|l| colorize_json_line(l))
+        .collect();
+
+    frame.render_widget(Paragraph::new(visible), inner);
+
+    // Scroll indicator in bottom-right of border.
+    if lines.len() > visible_h {
+        let pct = (scroll * 100).checked_div(max_scroll).unwrap_or(100);
+        let indicator = format!(" {pct}% ");
+        let ind_x = modal_area.x + modal_area.width.saturating_sub(indicator.len() as u16 + 1);
+        let ind_y = modal_area.y + modal_area.height.saturating_sub(1);
+        if ind_x > modal_area.x && ind_y < modal_area.y + modal_area.height {
+            let ind_area = Rect::new(ind_x, ind_y, indicator.len() as u16, 1);
+            frame.render_widget(
+                Paragraph::new(indicator).style(Style::default().fg(Color::DarkGray)),
+                ind_area,
+            );
+        }
+    }
+}
+
+/// Heuristic line-by-line JSON syntax colouring.
+fn colorize_json_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+
+    // Key-value pair: "key": value
+    if let Some(colon_pos) = trimmed.find("\": ") {
+        let indent = &line[..line.len() - trimmed.len()];
+        let key_end = colon_pos + 1; // include closing quote
+        let key_part = format!("{indent}{}", &trimmed[..key_end]);
+        let rest = &trimmed[colon_pos + 3..]; // after ": "
+
+        let value_span = if rest.starts_with('"') {
+            Span::styled(rest.to_owned(), Style::default().fg(Color::Green))
+        } else if rest == "true" || rest == "false" || rest == "null" {
+            Span::styled(rest.to_owned(), Style::default().fg(Color::Magenta))
+        } else if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || c == '-')
+        {
+            Span::styled(rest.to_owned(), Style::default().fg(Color::Yellow))
+        } else {
+            Span::raw(rest.to_owned())
+        };
+
+        return Line::from(vec![
+            Span::styled(key_part, Style::default().fg(Color::Cyan)),
+            Span::raw(": "),
+            value_span,
+        ]);
+    }
+
+    // Section separator line.
+    if trimmed.starts_with("──") {
+        return Line::from(Span::styled(
+            line.to_owned(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    Line::raw(line.to_owned())
+}
+
+fn draw_layer_diff_modal(frame: &mut Frame, m: &crate::tui::app::LayerDiffModal, area: Rect) {
+    let width = area.width.saturating_sub(4);
+    let height = area.height.saturating_sub(4);
+    let x = area.x + 2;
+    let y = area.y + 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(format!(" Diff: {}  vs  {} ", m.tag_a, m.tag_b))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let legend = Line::from(vec![
+        Span::styled("+ added  ", Style::default().fg(Color::Green)),
+        Span::styled("- removed  ", Style::default().fg(Color::Red)),
+        Span::styled("= unchanged", Style::default().fg(Color::DarkGray)),
+    ]);
+
+    // Build content lines: legend + blank + layer rows.
+    let mut content: Vec<Line> = vec![legend, Line::raw("")];
+    for layer in &m.layers {
+        let (prefix, color) = match layer.status {
+            DiffStatus::Added => ("+", Color::Green),
+            DiffStatus::Removed => ("-", Color::Red),
+            DiffStatus::Unchanged => ("=", Color::DarkGray),
+        };
+        let size_kb = layer.size / 1024;
+        let line = format!("{prefix} {}  ({size_kb} KB)", layer.digest);
+        content.push(Line::from(Span::styled(line, Style::default().fg(color))));
+    }
+
+    let visible_h = inner.height as usize;
+    let max_scroll = content.len().saturating_sub(visible_h);
+    let scroll = m.scroll.min(max_scroll);
+    let visible: Vec<Line> = content.into_iter().skip(scroll).take(visible_h).collect();
+
+    frame.render_widget(Paragraph::new(visible), inner);
 }

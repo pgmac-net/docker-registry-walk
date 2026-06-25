@@ -5,6 +5,8 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyEvent};
 use tokio::sync::mpsc;
 
+use crate::ops::diff::DiffLayer;
+
 use super::detail::ImageDetail;
 
 #[derive(Debug)]
@@ -42,6 +44,35 @@ pub enum AppEvent {
     SwitchRegistry {
         idx: usize,
     },
+    InspectLoaded {
+        title: String,
+        lines: Vec<String>,
+    },
+    InspectError(String),
+    PruneFound {
+        repo: String,
+        tags: Vec<String>,
+    },
+    PruneComplete {
+        repo: String,
+        count: usize,
+    },
+    PruneError(String),
+    ExportProgress {
+        done: usize,
+        total: usize,
+    },
+    ExportComplete {
+        path: String,
+    },
+    ExportError(String),
+    DiffLoaded {
+        repo: String,
+        tag_a: String,
+        tag_b: String,
+        layers: Vec<DiffLayer>,
+    },
+    DiffError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
