@@ -24,6 +24,19 @@ use crate::registry::{
 #[async_trait]
 pub trait Credentials: Send + Sync {
     async fn get_authorization(&self, http: &Client) -> Option<String>;
+
+    /// Called when a request returns 401 with a `WWW-Authenticate` challenge.
+    ///
+    /// Implementations that support per-endpoint scoped tokens (e.g. Docker Hub)
+    /// should exchange a new token with the scope from the challenge and return it.
+    /// The default returns `None`, which lets the 401 propagate as Unauthorized.
+    async fn get_authorization_for_challenge(
+        &self,
+        _http: &Client,
+        _www_auth: &str,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// No-op credentials — suitable for public (unauthenticated) registries.
@@ -67,11 +80,33 @@ impl RegistryClient {
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<Response> {
+        // Clone before consuming so we can retry on 401 with a scoped token.
+        let retry = builder.try_clone();
+
         let builder = match self.creds.get_authorization(&self.http).await {
             Some(auth) => builder.header(reqwest::header::AUTHORIZATION, auth),
             None => builder,
         };
-        Ok(builder.send().await?)
+        let resp = builder.send().await?;
+
+        if resp.status() == StatusCode::UNAUTHORIZED
+            && let Some(rb) = retry
+            && let Some(www_auth) = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+            && let Some(auth) = self
+                .creds
+                .get_authorization_for_challenge(&self.http, www_auth)
+                .await
+        {
+            return Ok(rb
+                .header(reqwest::header::AUTHORIZATION, auth)
+                .send()
+                .await?);
+        }
+
+        Ok(resp)
     }
 
     // ------------------------------------------------------------------
