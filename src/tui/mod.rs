@@ -5,7 +5,9 @@ mod ui;
 
 pub use app::App;
 
+use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::{
@@ -19,18 +21,24 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use url::Url;
 
-use self::detail::ImageDetail;
-use crate::registry::{ImageConfigBlob, Manifest, RegistryClient};
+use crate::config::RegistryProfile;
+use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient};
 
 use self::app::{ConfirmAction, Focus, InputAction, LoadState, Modal};
+use self::detail::ImageDetail;
 use self::event::{AppEvent, spawn_event_reader};
 
 const TICK_MS: u64 = 200;
 const PAGE_SIZE: u32 = 100;
 
-pub async fn run(registry_name: String, registry_url: String) -> anyhow::Result<()> {
-    let url = Url::parse(&registry_url)?;
-    let client = RegistryClient::new(url);
+pub async fn run(mut profiles: Vec<RegistryProfile>) -> anyhow::Result<()> {
+    if profiles.is_empty() {
+        profiles.push(RegistryProfile {
+            name: "local".to_owned(),
+            url: "http://localhost:5000".to_owned(),
+            username: None,
+        });
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -38,7 +46,7 @@ pub async fn run(registry_name: String, registry_url: String) -> anyhow::Result<
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, client, registry_name, registry_url).await;
+    let result = event_loop(&mut terminal, profiles).await;
 
     disable_raw_mode()?;
     execute!(
@@ -53,19 +61,23 @@ pub async fn run(registry_name: String, registry_url: String) -> anyhow::Result<
 
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    client: RegistryClient,
-    registry_name: String,
-    registry_url: String,
+    profiles: Vec<RegistryProfile>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<AppEvent>(128);
     spawn_event_reader(tx.clone());
 
     let mut tick = interval(Duration::from_millis(TICK_MS));
-    let mut app = App::new(registry_name, registry_url);
+    let mut app = App::new(profiles.clone());
+
+    // Pre-build client for first profile.
+    let mut clients: HashMap<String, RegistryClient> = HashMap::new();
+    let first_client = make_client_for_profile(&profiles[0]);
+    clients.insert(profiles[0].name.clone(), first_client);
+    let mut active_name = profiles[0].name.clone();
 
     // Kick off initial catalog load.
     app.repo_load = LoadState::Loading;
-    spawn_repos_fetch(client.clone(), None, tx.clone());
+    spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
 
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
@@ -77,7 +89,16 @@ async fn event_loop(
         tokio::select! {
             biased;
             Some(ev) = rx.recv() => {
-                handle_event(&mut app, ev, &client, &tx);
+                if let AppEvent::SwitchRegistry { idx } = ev {
+                    let profile = &app.profiles[idx];
+                    let name = profile.name.clone();
+                    clients.entry(name.clone()).or_insert_with(|| make_client_for_profile(profile));
+                    active_name = name;
+                    app.start_registry_switch(idx);
+                    spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+                } else {
+                    handle_event(&mut app, ev, &clients[&active_name], &tx);
+                }
             }
             _ = tick.tick() => {
                 app.tick();
@@ -94,10 +115,9 @@ async fn event_loop(
             && let Some(repo) = new_repo
         {
             app.start_tags_load(repo.clone());
-            spawn_tags_fetch(client.clone(), repo, None, tx.clone());
+            spawn_tags_fetch(clients[&active_name].clone(), repo, None, tx.clone());
         }
 
-        // Background pagination: load more repos if user is near the end.
         // Detect tag selection change → reload detail.
         let new_tag = app.selected_tag().map(str::to_owned);
         if new_tag != prev_tag
@@ -106,7 +126,7 @@ async fn event_loop(
         {
             app.start_detail_load(tag.clone());
             spawn_detail_fetch(
-                client.clone(),
+                clients[&active_name].clone(),
                 repo,
                 tag,
                 app.registry_url.clone(),
@@ -114,9 +134,14 @@ async fn event_loop(
             );
         }
 
+        // Background pagination: load more repos if user is near the end.
         if app.should_load_more_repos() {
             app.repo_load = LoadState::Loading;
-            spawn_repos_fetch(client.clone(), app.repos_cursor.clone(), tx.clone());
+            spawn_repos_fetch(
+                clients[&active_name].clone(),
+                app.repos_cursor.clone(),
+                tx.clone(),
+            );
         }
 
         // Background pagination: load more tags if user is near the end.
@@ -124,7 +149,12 @@ async fn event_loop(
             && let Some(repo) = app.current_repo.clone()
         {
             app.tag_load = LoadState::Loading;
-            spawn_tags_fetch(client.clone(), repo, app.tags_cursor.clone(), tx.clone());
+            spawn_tags_fetch(
+                clients[&active_name].clone(),
+                repo,
+                app.tags_cursor.clone(),
+                tx.clone(),
+            );
         }
     }
 
@@ -158,6 +188,8 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::CopyError(msg) => app.set_status(format!("✗ Copy failed: {msg}")),
         AppEvent::RetagSuccess { new_tag } => app.on_retag_success(new_tag),
         AppEvent::RetagError(msg) => app.on_retag_error(msg),
+        // Handled directly in event_loop.
+        AppEvent::SwitchRegistry { .. } => {}
     }
 }
 
@@ -174,7 +206,7 @@ fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let modal = std::mem::replace(&mut app.modal, Modal::None);
                 if let Modal::Confirm { on_confirm, .. } = modal {
-                    handle_confirm(app, on_confirm, client, tx);
+                    handle_confirm(on_confirm, client, tx);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -209,6 +241,37 @@ fn handle_key(
             KeyCode::Char(ch) => {
                 if let Modal::Input { value, .. } = &mut app.modal {
                     value.push(ch);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::RegistrySelect { .. }) {
+        let n = app.profiles.len();
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Modal::RegistrySelect { selected_idx } = &mut app.modal
+                    && *selected_idx > 0
+                {
+                    *selected_idx -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Modal::RegistrySelect { selected_idx } = &mut app.modal
+                    && *selected_idx + 1 < n
+                {
+                    *selected_idx += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Modal::RegistrySelect { selected_idx } = app.modal {
+                    app.modal = Modal::None;
+                    let _ = tx.blocking_send(AppEvent::SwitchRegistry { idx: selected_idx });
                 }
             }
             _ => {}
@@ -251,6 +314,7 @@ fn handle_key(
         KeyCode::Char('c') => handle_copy(app),
         KeyCode::Char('C') => handle_copy_image(app),
         KeyCode::Char('r') => handle_retag(app),
+        KeyCode::Char('R') => handle_registry_select(app),
         KeyCode::Char('d') => handle_delete(app),
         _ => {}
     }
@@ -259,9 +323,6 @@ fn handle_key(
 fn handle_enter(app: &mut App) {
     if app.focus == Focus::Repos && !app.tags.is_empty() {
         app.focus = Focus::Tags;
-        if app.tags_state.selected().is_none() {
-            // tags_state selection set by on_tags_page already
-        }
     }
 }
 
@@ -307,6 +368,13 @@ fn handle_retag(app: &mut App) {
     };
 }
 
+fn handle_registry_select(app: &mut App) {
+    let current = app.active_profile_idx;
+    app.modal = Modal::RegistrySelect {
+        selected_idx: current,
+    };
+}
+
 fn handle_delete(app: &mut App) {
     if app.focus == Focus::Tags
         && let Some(tag) = app.selected_tag().map(str::to_owned)
@@ -320,12 +388,7 @@ fn handle_delete(app: &mut App) {
     }
 }
 
-fn handle_confirm(
-    _app: &mut App,
-    action: ConfirmAction,
-    client: &RegistryClient,
-    tx: &mpsc::Sender<AppEvent>,
-) {
+fn handle_confirm(action: ConfirmAction, client: &RegistryClient, tx: &mpsc::Sender<AppEvent>) {
     match action {
         ConfirmAction::DeleteManifest { repo, tag } => {
             spawn_delete(client.clone(), repo, tag, tx.clone());
@@ -365,6 +428,23 @@ fn handle_input_confirm(
             spawn_retag(client.clone(), repo, src_tag, value, tx.clone());
         }
     }
+}
+
+fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
+    let url = match Url::parse(&profile.url) {
+        Ok(u) => u,
+        Err(_) => return RegistryClient::new(Url::parse("http://localhost:5000").unwrap()),
+    };
+
+    if let Some(username) = &profile.username {
+        let store = KeyringStore::new(&profile.name);
+        if let Some(password) = store.get_password(username) {
+            let creds = BearerCredentials::new(&url, username.clone(), password);
+            return RegistryClient::new(url).with_credentials(Arc::new(creds));
+        }
+    }
+
+    RegistryClient::new(url)
 }
 
 fn spawn_copy(

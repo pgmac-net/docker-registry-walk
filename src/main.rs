@@ -18,5 +18,6 @@ async fn main() -> anyhow::Result<()> {
         orig_hook(info);
     }));
 
-    tui::run("local".to_owned(), "http://localhost:5000".to_owned()).await
+    let config = config::Config::load().unwrap_or_default();
+    tui::run(config.registry).await
 }
