@@ -68,6 +68,43 @@ impl BearerCredentials {
         }
     }
 
+    /// Exchange credentials for a token at the given realm with optional service/scope.
+    /// Returns the JSON body on success, or `None` on HTTP/network error.
+    async fn exchange_token(
+        &self,
+        http: &Client,
+        realm: &Url,
+        service: Option<&str>,
+        scope: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        let mut url = realm.clone();
+        {
+            let mut q = url.query_pairs_mut();
+            if let Some(svc) = service {
+                q.append_pair("service", svc);
+            }
+            if let Some(s) = scope {
+                q.append_pair("scope", s);
+            }
+        }
+        http.get(url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
+    /// Try to extract a token string from a token endpoint response body.
+    fn extract_token(body: &serde_json::Value) -> Option<String> {
+        body["token"]
+            .as_str()
+            .or_else(|| body["access_token"].as_str())
+            .map(|s| s.to_owned())
+    }
+
     async fn refresh(&self, http: &Client) -> Option<String> {
         // Probe /v2/ to get the Bearer challenge.
         let resp = http.get(self.probe_url.clone()).send().await.ok()?;
@@ -85,36 +122,28 @@ impl BearerCredentials {
 
         let challenge = parse_bearer_challenge(&www_auth)?;
 
-        let mut token_url = Url::parse(&challenge.realm).ok()?;
+        let token_url = Url::parse(&challenge.realm).ok()?;
 
         // Guard: only send credentials to a trusted realm host.
         if !is_trusted_realm(&token_url, &self.probe_url) {
             return None;
         }
 
-        {
-            let mut q = token_url.query_pairs_mut();
-            if let Some(svc) = &challenge.service {
-                q.append_pair("service", svc);
-            }
-            if let Some(scope) = &challenge.scope {
-                q.append_pair("scope", scope);
-            }
+        // Try with the scope from the challenge first.
+        let mut body = self
+            .exchange_token(http, &token_url, challenge.service.as_deref(), challenge.scope.as_deref())
+            .await;
+
+        // Some registries (e.g. Docker Hub) issue a scope in the `/v2/` 401 challenge
+        // that their own token endpoint rejects. Retry without scope.
+        if body.as_ref().and_then(Self::extract_token).is_none() {
+            body = self
+                .exchange_token(http, &token_url, challenge.service.as_deref(), None)
+                .await;
         }
 
-        let token_resp = http
-            .get(token_url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
-            .await
-            .ok()?;
-
-        let body: serde_json::Value = token_resp.json().await.ok()?;
-
-        let token_str = body["token"]
-            .as_str()
-            .or_else(|| body["access_token"].as_str())?
-            .to_owned();
+        let body = body?;
+        let token_str = Self::extract_token(&body)?;
 
         let expires_in = body["expires_in"].as_u64().unwrap_or(300);
         // Subtract 10 s to account for clock skew and latency.
@@ -156,35 +185,37 @@ impl Credentials for BearerCredentials {
         // This handles registries (e.g. Docker Hub) that issue per-endpoint scoped tokens.
         let challenge = parse_bearer_challenge(www_auth)?;
 
-        let mut token_url = Url::parse(&challenge.realm).ok()?;
+        let token_url = Url::parse(&challenge.realm).ok()?;
 
         // Guard: only send credentials to a trusted realm host.
         if !is_trusted_realm(&token_url, &self.probe_url) {
             return None;
         }
 
-        {
-            let mut q = token_url.query_pairs_mut();
-            if let Some(svc) = &challenge.service {
-                q.append_pair("service", svc);
-            }
-            if let Some(scope) = &challenge.scope {
-                q.append_pair("scope", scope);
-            }
+        // Try with the scope from the challenge first.
+        let mut body = self
+            .exchange_token(http, &token_url, challenge.service.as_deref(), challenge.scope.as_deref())
+            .await;
+
+        // Fall back to no scope if the token endpoint rejects the scope.
+        if body.as_ref().and_then(Self::extract_token).is_none() {
+            body = self
+                .exchange_token(http, &token_url, challenge.service.as_deref(), None)
+                .await;
         }
 
-        let token_resp = http
-            .get(token_url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
-            .await
-            .ok()?;
+        let body = body?;
+        let token_str = Self::extract_token(&body)?;
 
-        let body: serde_json::Value = token_resp.json().await.ok()?;
-        let token_str = body["token"]
-            .as_str()
-            .or_else(|| body["access_token"].as_str())?
-            .to_owned();
+        // Cache this (possibly scoped) token so subsequent calls to the same
+        // registry endpoint don't go through 401 → re-exchange on every request.
+        let expires_in = body["expires_in"].as_u64().unwrap_or(300);
+        let ttl = Duration::from_secs(expires_in.saturating_sub(10));
+        let mut guard = self.token.lock().await;
+        *guard = Some(CachedToken {
+            value: token_str.clone(),
+            expires_at: Instant::now() + ttl,
+        });
 
         Some(format!("Bearer {token_str}"))
     }

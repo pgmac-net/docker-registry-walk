@@ -7,6 +7,7 @@ mod tui;
 use clap::Parser;
 
 use config::{Config, RegistryProfile};
+use registry::{KeyringStore, resolve_password};
 
 #[derive(Parser)]
 #[command(about = "Browse Docker registries from the terminal")]
@@ -79,6 +80,17 @@ async fn main() -> anyhow::Result<()> {
             .or(cli.username.as_deref())
             .unwrap_or("default");
         keyring::Entry::new(&service, username)?.set_password(password)?;
+    }
+
+    // If the initial registry has a username but no password in the keyring,
+    // prompt interactively before entering the TUI.
+    if let Some(profile) = config.registry.get(initial_idx)
+        && let Some(username) = &profile.username
+    {
+        let store = KeyringStore::new(&profile.name);
+        if store.get_password(username).is_none() {
+            resolve_password(username, None, &store, true)?;
+        }
     }
 
     tui::run(config.registry, initial_idx).await

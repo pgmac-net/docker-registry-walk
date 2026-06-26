@@ -28,6 +28,14 @@ impl Focus {
             Focus::Detail => Focus::Repos,
         }
     }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Focus::Repos => Focus::Detail,
+            Focus::Tags => Focus::Repos,
+            Focus::Detail => Focus::Tags,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +117,8 @@ pub enum InputAction {
     Retag { repo: String, src_tag: String },
     Export { repo: String, tag: String },
     DiffAgainst { repo: String, tag_a: String },
+    /// User typed a repo name directly (e.g. after catalog failure).
+    BrowseRepo,
 }
 
 #[derive(Debug)]
@@ -218,17 +228,28 @@ impl App {
     pub fn on_repos_error(&mut self, msg: String) {
         self.repo_load = LoadState::Error(msg.clone());
         self.set_status(format!("Repos error: {msg}"));
+        if matches!(self.modal, Modal::None) {
+            self.modal = Modal::Input {
+                prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
+                value: String::new(),
+                on_confirm: InputAction::BrowseRepo,
+            };
+        }
     }
 
     pub fn on_tags_page(&mut self, repo: String, tags: Vec<String>, has_more: bool) {
         if self.current_repo.as_deref() != Some(&repo) {
             return;
         }
+        let was_empty = self.tags_all.is_empty();
         self.tags_has_more = has_more;
         self.tags_all.extend(tags);
         self.tags_cursor = self.tags_all.last().cloned();
         self.tag_load = LoadState::Idle;
         self.apply_tag_filter_sort();
+        if was_empty && !self.tags.is_empty() {
+            self.tags_state.select(Some(0));
+        }
     }
 
     pub fn on_tags_error(&mut self, msg: String) {

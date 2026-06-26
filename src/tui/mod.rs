@@ -177,6 +177,11 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::Tick => app.tick(),
         AppEvent::ReposPage(repos, has_more) => app.on_repos_page(repos, has_more),
         AppEvent::ReposError(msg) => app.on_repos_error(msg),
+        AppEvent::BrowseRepo(repo) => {
+            app.start_tags_load(repo.clone());
+            app.focus = Focus::Tags;
+            spawn_tags_fetch(client.clone(), repo, None, tx.clone());
+        }
         AppEvent::TagsPage(repo, tags, has_more) => app.on_tags_page(repo, tags, has_more),
         AppEvent::TagsError(msg) => app.on_tags_error(msg),
         AppEvent::DetailLoaded { repo, tag, detail } => {
@@ -407,10 +412,10 @@ fn handle_key(
             app.should_quit = true;
         }
         KeyCode::Tab => app.focus = app.focus.toggle(),
-        KeyCode::BackTab => app.focus = app.focus.toggle(),
+        KeyCode::BackTab => app.focus = app.focus.prev(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
-        KeyCode::Enter => handle_enter(app),
+        KeyCode::Enter => handle_enter(app, client, tx),
         KeyCode::Char('/') => {
             app.filter_mode = Some(app.focus);
         }
@@ -432,9 +437,11 @@ fn handle_key(
     }
 }
 
-fn handle_enter(app: &mut App) {
-    if app.focus == Focus::Repos && !app.tags.is_empty() {
-        app.focus = Focus::Tags;
+fn handle_enter(app: &mut App, client: &RegistryClient, tx: &mpsc::Sender<AppEvent>) {
+    match app.focus {
+        Focus::Repos if !app.tags.is_empty() => app.focus = Focus::Tags,
+        Focus::Tags => handle_inspect(app, client, tx),
+        _ => {}
     }
 }
 
@@ -537,7 +544,7 @@ fn handle_input_confirm(
         InputAction::Retag { repo, src_tag } => {
             if !crate::ops::retag::validate_tag(&value) {
                 let _ =
-                    tx.blocking_send(AppEvent::RetagError(format!("Invalid tag name '{value}'")));
+                    tx.try_send(AppEvent::RetagError(format!("Invalid tag name '{value}'")));
                 return;
             }
             spawn_retag(client.clone(), repo, src_tag, value, tx.clone());
@@ -547,6 +554,11 @@ fn handle_input_confirm(
         }
         InputAction::DiffAgainst { repo, tag_a } => {
             spawn_diff(client.clone(), repo, tag_a, value, tx.clone());
+        }
+        InputAction::BrowseRepo => {
+            if !value.is_empty() {
+                let _ = tx.try_send(AppEvent::BrowseRepo(value));
+            }
         }
     }
 }
