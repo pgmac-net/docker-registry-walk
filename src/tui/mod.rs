@@ -133,8 +133,8 @@ async fn event_loop(
                             clients.insert(profile_name.clone(), client);
                         }
                         if active_name == profile_name {
-                            app.catalog_retry_pending = true;
                             app.start_registry_switch(app.active_profile_idx);
+                            app.catalog_retry_pending = true;
                             spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
                         }
                     }
