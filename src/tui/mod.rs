@@ -383,7 +383,7 @@ fn handle_key(
             KeyCode::Enter => {
                 if let Modal::RegistrySelect { selected_idx } = app.modal {
                     app.modal = Modal::None;
-                    let _ = tx.blocking_send(AppEvent::SwitchRegistry { idx: selected_idx });
+                    let _ = tx.try_send(AppEvent::SwitchRegistry { idx: selected_idx });
                 }
             }
             _ => {}
