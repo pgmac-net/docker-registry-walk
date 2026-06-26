@@ -103,8 +103,14 @@ async fn event_loop(
                         spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
                     }
                     AppEvent::ReposError { msg, auth_failed } => {
-                        app.on_repos_error(msg, auth_failed);
-                        if auth_failed && matches!(app.modal, Modal::None) {
+                        // After a password-entry retry, a 401 means scope
+                        // rejection (not wrong credentials), so treat it the
+                        // same as an authz failure and offer BrowseRepo.
+                        let retry_pending = app.catalog_retry_pending;
+                        app.catalog_retry_pending = false;
+                        let show_browse = !auth_failed || retry_pending;
+                        app.on_repos_error(msg, show_browse);
+                        if auth_failed && !retry_pending && matches!(app.modal, Modal::None) {
                             let profile = &app.profiles[app.active_profile_idx];
                             if let Some(username) = profile.username.clone() {
                                 app.modal = Modal::Input {
@@ -127,6 +133,7 @@ async fn event_loop(
                             clients.insert(profile_name.clone(), client);
                         }
                         if active_name == profile_name {
+                            app.catalog_retry_pending = true;
                             app.start_registry_switch(app.active_profile_idx);
                             spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
                         }

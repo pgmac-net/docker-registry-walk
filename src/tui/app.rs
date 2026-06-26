@@ -181,6 +181,9 @@ pub struct App {
     pub modal: Modal,
     pub should_quit: bool,
     pub spinner_tick: usize,
+    /// Set when a password was just entered; causes the next catalog error
+    /// (even 401) to open BrowseRepo rather than the password modal again.
+    pub catalog_retry_pending: bool,
     status: Option<StatusMessage>,
     // Registry switcher
     pub profiles: Vec<RegistryProfile>,
@@ -225,6 +228,7 @@ impl App {
             modal: Modal::None,
             should_quit: false,
             spinner_tick: 0,
+            catalog_retry_pending: false,
             status: None,
             profiles,
             active_profile_idx: idx,
@@ -243,13 +247,10 @@ impl App {
         self.apply_repo_filter();
     }
 
-    pub fn on_repos_error(&mut self, msg: String, auth_failed: bool) {
+    pub fn on_repos_error(&mut self, msg: String, show_browse: bool) {
         self.repo_load = LoadState::Error(msg.clone());
         self.set_status(format!("Repos error: {msg}"));
-        // Only offer manual repo search when auth succeeded but catalog is
-        // unavailable/forbidden. If auth itself failed, the password modal
-        // is shown instead (handled in event_loop).
-        if !auth_failed && matches!(self.modal, Modal::None) {
+        if show_browse && matches!(self.modal, Modal::None) {
             self.modal = Modal::Input {
                 prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
                 value: String::new(),
@@ -355,6 +356,7 @@ impl App {
         self.detail_scroll = 0;
         self.focus = Focus::Repos;
         self.filter_mode = None;
+        self.catalog_retry_pending = false;
     }
 
     // ------------------------------------------------------------------
