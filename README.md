@@ -158,9 +158,5 @@ Press `?` inside the app for the full interactive reference. Summary:
 
 - Docker Registry API v2 (`/v2/` endpoint)
 - For **delete / prune**: `REGISTRY_STORAGE_DELETE_ENABLED=true`
-- Auth: anonymous, HTTP Basic, or Bearer token (automatic token exchange)
+- Auth: anonymous, HTTP Basic, or Bearer token (automatic token exchange with per-endpoint scope retry)
 - HTTPS strongly recommended; plain HTTP supported for local/internal registries
-
-## Known limitations
-
-- **Docker Hub** (`registry-1.docker.io`): the `/v2/_catalog` endpoint requires a `registry:catalog:*` token scope that Docker Hub issues per-endpoint. The current single-token-exchange implementation does not acquire that scope, so catalog browsing against Docker Hub does not work. Individual image operations (tags, manifests) are unaffected once a repo name is known.
