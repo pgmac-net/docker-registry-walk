@@ -53,6 +53,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Modal::Inspect(m) => draw_inspect_modal(frame, &m.title, &m.lines, m.scroll, area),
         Modal::LayerDiff(m) => draw_layer_diff_modal(frame, m, area),
         Modal::Help { scroll } => draw_help_modal(frame, *scroll, area),
+        Modal::SearchPicker {
+            value,
+            cursor,
+            results,
+            selected,
+            searching,
+        } => draw_search_picker_modal(frame, value, *cursor, results, *selected, *searching, area),
         Modal::None => {}
     }
 }
@@ -329,6 +336,86 @@ fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, cursor: us
     let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
 
     frame.render_widget(p, modal_area);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_search_picker_modal(
+    frame: &mut Frame,
+    value: &str,
+    cursor: usize,
+    results: &[String],
+    selected: usize,
+    searching: bool,
+    area: Rect,
+) {
+    let width = 70u16.min(area.width.saturating_sub(4));
+    let result_rows = (results.len() as u16).min(10);
+    let height = if results.is_empty() { 5 } else { result_rows + 5 };
+    let height = height.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let title = if searching {
+        " Docker Hub Search ⠸ "
+    } else {
+        " Docker Hub Search "
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(modal_area);
+
+    let split = value.char_indices().nth(cursor).map(|(i, _)| i).unwrap_or(value.len());
+    let display = format!("{}{}{}", &value[..split], '|', &value[split..]);
+    let input = Paragraph::new(display).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(input, chunks[0]);
+
+    if results.is_empty() {
+        if !searching && !value.is_empty() {
+            let msg = Paragraph::new(" No results").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+            frame.render_widget(msg, chunks[1]);
+        } else {
+            let hint = Paragraph::new(" [↑↓/jk] navigate  [Enter] open  [Esc] cancel").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
+            frame.render_widget(hint, chunks[1]);
+        }
+        return;
+    }
+
+    let items: Vec<ListItem> = results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if i == selected {
+                ListItem::new(format!(" ► {r}")).style(HIGHLIGHT_STYLE)
+            } else {
+                ListItem::new(format!("   {r}"))
+            }
+        })
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Results  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(list, chunks[1]);
 }
 
 fn draw_registry_select_modal(frame: &mut Frame, app: &App, selected_idx: usize, area: Rect) {

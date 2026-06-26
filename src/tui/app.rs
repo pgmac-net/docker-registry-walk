@@ -104,6 +104,14 @@ pub enum Modal {
     Help {
         scroll: usize,
     },
+    /// Docker Hub repository search with live results.
+    SearchPicker {
+        value: String,
+        cursor: usize,
+        results: Vec<String>,
+        selected: usize,
+        searching: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -251,12 +259,22 @@ impl App {
         self.repo_load = LoadState::Error(msg.clone());
         self.set_status(format!("Repos error: {msg}"));
         if show_browse && matches!(self.modal, Modal::None) {
-            self.modal = Modal::Input {
-                prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
-                value: String::new(),
-                cursor: 0,
-                on_confirm: InputAction::BrowseRepo,
-            };
+            if crate::registry::is_dockerhub_url(&self.registry_url) {
+                self.modal = Modal::SearchPicker {
+                    value: String::new(),
+                    cursor: 0,
+                    results: Vec::new(),
+                    selected: 0,
+                    searching: false,
+                };
+            } else {
+                self.modal = Modal::Input {
+                    prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
+                    value: String::new(),
+                    cursor: 0,
+                    on_confirm: InputAction::BrowseRepo,
+                };
+            }
         }
     }
 

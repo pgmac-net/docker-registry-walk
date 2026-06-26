@@ -22,7 +22,7 @@ use tokio::time::interval;
 use url::Url;
 
 use crate::config::RegistryProfile;
-use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError};
+use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError, search_dockerhub};
 
 use self::app::{
     ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal, LoadState, Modal,
@@ -138,6 +138,27 @@ async fn event_loop(
                             spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
                         }
                     }
+                    AppEvent::DockerHubSearch { query, results } => {
+                        if let Modal::SearchPicker {
+                            value,
+                            results: modal_results,
+                            selected,
+                            searching,
+                            ..
+                        } = &mut app.modal
+                        {
+                            if *value == query {
+                                *modal_results = results;
+                                *selected = 0;
+                                *searching = false;
+                            }
+                        }
+                    }
+                    AppEvent::DockerHubSearchError(_) => {
+                        if let Modal::SearchPicker { searching, .. } = &mut app.modal {
+                            *searching = false;
+                        }
+                    }
                     ev => handle_event(&mut app, ev, &clients[&active_name], &tx),
                 }
             }
@@ -214,7 +235,10 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::Tick => app.tick(),
         AppEvent::ReposPage(repos, has_more) => app.on_repos_page(repos, has_more),
         // Handled in event_loop; should not reach here.
-        AppEvent::ReposError { .. } | AppEvent::PasswordEntered { .. } => {}
+        AppEvent::ReposError { .. }
+        | AppEvent::PasswordEntered { .. }
+        | AppEvent::DockerHubSearch { .. }
+        | AppEvent::DockerHubSearchError(_) => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -357,6 +381,92 @@ fn handle_key(
                     let byte_pos = value.char_indices().nth(*cursor).map(|(i, _)| i).unwrap_or(value.len());
                     value.insert(byte_pos, ch);
                     *cursor += 1;
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::SearchPicker { .. }) {
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            KeyCode::Enter => {
+                let modal = std::mem::replace(&mut app.modal, Modal::None);
+                if let Modal::SearchPicker { value, results, selected, .. } = modal {
+                    let repo = results.into_iter().nth(selected).unwrap_or(value);
+                    let _ = tx.try_send(AppEvent::BrowseRepo(repo));
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Modal::SearchPicker { selected, .. } = &mut app.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Modal::SearchPicker { results, selected, .. } = &mut app.modal {
+                    if !results.is_empty() {
+                        *selected = (*selected + 1).min(results.len().saturating_sub(1));
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Modal::SearchPicker { cursor, .. } = &mut app.modal {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Modal::SearchPicker { value, cursor, .. } = &mut app.modal {
+                    *cursor = (*cursor + 1).min(value.chars().count());
+                }
+            }
+            KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::SearchPicker { cursor, .. } = &mut app.modal {
+                    *cursor = 0;
+                }
+            }
+            KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::SearchPicker { value, cursor, .. } = &mut app.modal {
+                    *cursor = value.chars().count();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Modal::SearchPicker { value, cursor, searching, results, selected, .. } =
+                    &mut app.modal
+                    && *cursor > 0
+                {
+                    let byte_pos =
+                        value.char_indices().nth(*cursor - 1).map(|(i, _)| i).unwrap_or(0);
+                    value.remove(byte_pos);
+                    *cursor -= 1;
+                    *results = Vec::new();
+                    *selected = 0;
+                    if value.trim().is_empty() {
+                        *searching = false;
+                    } else {
+                        *searching = true;
+                        spawn_dockerhub_search(value.clone(), tx.clone());
+                    }
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Modal::SearchPicker { value, cursor, searching, results, selected, .. } =
+                    &mut app.modal
+                {
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(value.len());
+                    value.insert(byte_pos, ch);
+                    *cursor += 1;
+                    *results = Vec::new();
+                    *selected = 0;
+                    *searching = true;
+                    spawn_dockerhub_search(value.clone(), tx.clone());
                 }
             }
             _ => {}
@@ -933,5 +1043,18 @@ fn spawn_detail_fetch(
                 detail: Box::new(d),
             })
             .await;
+    });
+}
+
+fn spawn_dockerhub_search(query: String, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        match search_dockerhub(&query).await {
+            Ok(results) => {
+                let _ = tx.send(AppEvent::DockerHubSearch { query, results }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::DockerHubSearchError(e.to_string())).await;
+            }
+        }
     });
 }

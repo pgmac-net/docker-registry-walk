@@ -84,6 +84,12 @@ pub enum AppEvent {
     DiffError(String),
     /// Jump directly to a repository (e.g. entered by the user after catalog failure).
     BrowseRepo(String),
+    /// Results from a Docker Hub search query.
+    DockerHubSearch {
+        query: String,
+        results: Vec<String>,
+    },
+    DockerHubSearchError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
