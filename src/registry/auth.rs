@@ -361,8 +361,18 @@ fn is_trusted_realm(realm: &Url, registry: &Url) -> bool {
         return true;
     }
 
+    // For IP-addressed registries, only exact match is trusted.
+    // The DNS-label heuristic below treats octets as labels, which would let
+    // a domain like "evil.0.1" appear to share the registered domain with
+    // a registry at "10.0.0.1".
+    match registry.host() {
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => return false,
+        _ => {}
+    }
+
     // Compare last two DNS labels (e.g. "docker" + "io").
     // rsplitn(3, '.') on "auth.docker.io" yields ["io", "docker", "auth"].
+    // Note: multi-label public suffixes (e.g. ".co.uk") are not handled.
     let r_parts: Vec<&str> = realm_host.rsplitn(3, '.').collect();
     let g_parts: Vec<&str> = registry_host.rsplitn(3, '.').collect();
 
@@ -467,6 +477,24 @@ mod tests {
         assert!(!is_trusted_realm(
             &u("https://attacker.com/token"),
             &u("https://registry.example.com/v2/")
+        ));
+    }
+
+    #[test]
+    fn untrusted_realm_different_host_for_ip_registry() {
+        // IP-addressed registries require exact host match; the DNS-label
+        // heuristic is disabled to avoid octet-spoofing attacks.
+        assert!(!is_trusted_realm(
+            &u("https://auth.example.com/token"),
+            &u("https://10.0.0.1:5000/v2/")
+        ));
+    }
+
+    #[test]
+    fn trusted_realm_exact_ip_match() {
+        assert!(is_trusted_realm(
+            &u("https://10.0.0.1:5001/token"),
+            &u("https://10.0.0.1:5000/v2/")
         ));
     }
 }
