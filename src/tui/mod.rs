@@ -543,8 +543,7 @@ fn handle_input_confirm(
         }
         InputAction::Retag { repo, src_tag } => {
             if !crate::ops::retag::validate_tag(&value) {
-                let _ =
-                    tx.try_send(AppEvent::RetagError(format!("Invalid tag name '{value}'")));
+                let _ = tx.try_send(AppEvent::RetagError(format!("Invalid tag name '{value}'")));
                 return;
             }
             spawn_retag(client.clone(), repo, src_tag, value, tx.clone());

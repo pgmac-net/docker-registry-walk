@@ -113,10 +113,22 @@ pub enum ConfirmAction {
 
 #[derive(Debug, Clone)]
 pub enum InputAction {
-    CopyImage { src_repo: String, src_tag: String },
-    Retag { repo: String, src_tag: String },
-    Export { repo: String, tag: String },
-    DiffAgainst { repo: String, tag_a: String },
+    CopyImage {
+        src_repo: String,
+        src_tag: String,
+    },
+    Retag {
+        repo: String,
+        src_tag: String,
+    },
+    Export {
+        repo: String,
+        tag: String,
+    },
+    DiffAgainst {
+        repo: String,
+        tag_a: String,
+    },
     /// User typed a repo name directly (e.g. after catalog failure).
     BrowseRepo,
 }

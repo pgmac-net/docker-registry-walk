@@ -131,7 +131,12 @@ impl BearerCredentials {
 
         // Try with the scope from the challenge first.
         let mut body = self
-            .exchange_token(http, &token_url, challenge.service.as_deref(), challenge.scope.as_deref())
+            .exchange_token(
+                http,
+                &token_url,
+                challenge.service.as_deref(),
+                challenge.scope.as_deref(),
+            )
             .await;
 
         // Some registries (e.g. Docker Hub) issue a scope in the `/v2/` 401 challenge
@@ -194,7 +199,12 @@ impl Credentials for BearerCredentials {
 
         // Try with the scope from the challenge first.
         let mut body = self
-            .exchange_token(http, &token_url, challenge.service.as_deref(), challenge.scope.as_deref())
+            .exchange_token(
+                http,
+                &token_url,
+                challenge.service.as_deref(),
+                challenge.scope.as_deref(),
+            )
             .await;
 
         // Fall back to no scope if the token endpoint rejects the scope.
