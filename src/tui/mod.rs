@@ -411,8 +411,8 @@ fn handle_key(
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
-        KeyCode::Tab => app.focus = app.focus.toggle(),
-        KeyCode::BackTab => app.focus = app.focus.prev(),
+        KeyCode::Tab | KeyCode::Right => app.focus = app.focus.toggle(),
+        KeyCode::BackTab | KeyCode::Left => app.focus = app.focus.prev(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
         KeyCode::Enter => handle_enter(app, client, tx),
