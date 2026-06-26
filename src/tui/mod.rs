@@ -285,14 +285,38 @@ fn handle_key(
                     handle_input_confirm(value, on_confirm, client, tx);
                 }
             }
+            KeyCode::Left => {
+                if let Modal::Input { cursor, .. } = &mut app.modal {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Modal::Input { value, cursor, .. } = &mut app.modal {
+                    *cursor = (*cursor + 1).min(value.len());
+                }
+            }
+            KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::Input { cursor, .. } = &mut app.modal {
+                    *cursor = 0;
+                }
+            }
+            KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::Input { value, cursor, .. } = &mut app.modal {
+                    *cursor = value.len();
+                }
+            }
             KeyCode::Backspace => {
-                if let Modal::Input { value, .. } = &mut app.modal {
-                    value.pop();
+                if let Modal::Input { value, cursor, .. } = &mut app.modal
+                    && *cursor > 0
+                {
+                    value.remove(*cursor - 1);
+                    *cursor -= 1;
                 }
             }
             KeyCode::Char(ch) => {
-                if let Modal::Input { value, .. } = &mut app.modal {
-                    value.push(ch);
+                if let Modal::Input { value, cursor, .. } = &mut app.modal {
+                    value.insert(*cursor, ch);
+                    *cursor += 1;
                 }
             }
             _ => {}
@@ -466,6 +490,7 @@ fn handle_copy_image(app: &mut App) {
     app.modal = Modal::Input {
         prompt: "Copy to (repo:tag):".to_owned(),
         value: prefilled,
+        cursor: 0,
         on_confirm: InputAction::CopyImage {
             src_repo: repo,
             src_tag: tag,
@@ -483,6 +508,7 @@ fn handle_retag(app: &mut App) {
     app.modal = Modal::Input {
         prompt: format!("New tag for '{repo}:{tag}':"),
         value: String::new(),
+        cursor: 0,
         on_confirm: InputAction::Retag { repo, src_tag: tag },
     };
 }
@@ -590,6 +616,7 @@ fn handle_export(app: &mut App) {
     app.modal = Modal::Input {
         prompt: "Export OCI tar to:".to_owned(),
         value: default_path,
+        cursor: 0,
         on_confirm: InputAction::Export { repo, tag },
     };
 }
@@ -604,6 +631,7 @@ fn handle_diff(app: &mut App) {
     app.modal = Modal::Input {
         prompt: format!("Diff '{tag}' against tag:"),
         value: String::new(),
+        cursor: 0,
         on_confirm: InputAction::DiffAgainst { repo, tag_a: tag },
     };
 }

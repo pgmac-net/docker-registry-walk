@@ -93,6 +93,7 @@ pub enum Modal {
     Input {
         prompt: String,
         value: String,
+        cursor: usize,
         on_confirm: InputAction,
     },
     RegistrySelect {
@@ -244,6 +245,7 @@ impl App {
             self.modal = Modal::Input {
                 prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
                 value: String::new(),
+                cursor: 0,
                 on_confirm: InputAction::BrowseRepo,
             };
         }
