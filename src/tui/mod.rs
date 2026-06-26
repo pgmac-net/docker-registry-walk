@@ -431,7 +431,7 @@ fn handle_key(
 
     // Normal mode.
     match code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
