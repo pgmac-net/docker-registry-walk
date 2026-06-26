@@ -15,7 +15,16 @@ pub enum AppEvent {
     Resize(u16, u16),
     Tick,
     ReposPage(Vec<String>, bool),
-    ReposError(String),
+    ReposError {
+        msg: String,
+        /// True when the error is a 401 Unauthorized — credentials wrong or absent.
+        auth_failed: bool,
+    },
+    PasswordEntered {
+        profile_name: String,
+        username: String,
+        password: String,
+    },
     TagsPage(String, Vec<String>, bool),
     TagsError(String),
     DetailLoaded {

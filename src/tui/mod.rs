@@ -22,7 +22,7 @@ use tokio::time::interval;
 use url::Url;
 
 use crate::config::RegistryProfile;
-use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient};
+use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError};
 
 use self::app::{
     ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal, LoadState, Modal,
@@ -93,15 +93,45 @@ async fn event_loop(
         tokio::select! {
             biased;
             Some(ev) = rx.recv() => {
-                if let AppEvent::SwitchRegistry { idx } = ev {
-                    let profile = &app.profiles[idx];
-                    let name = profile.name.clone();
-                    clients.entry(name.clone()).or_insert_with(|| make_client_for_profile(profile));
-                    active_name = name;
-                    app.start_registry_switch(idx);
-                    spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
-                } else {
-                    handle_event(&mut app, ev, &clients[&active_name], &tx);
+                match ev {
+                    AppEvent::SwitchRegistry { idx } => {
+                        let profile = &app.profiles[idx];
+                        let name = profile.name.clone();
+                        clients.entry(name.clone()).or_insert_with(|| make_client_for_profile(profile));
+                        active_name = name;
+                        app.start_registry_switch(idx);
+                        spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+                    }
+                    AppEvent::ReposError { msg, auth_failed } => {
+                        app.on_repos_error(msg, auth_failed);
+                        if auth_failed && matches!(app.modal, Modal::None) {
+                            let profile = &app.profiles[app.active_profile_idx];
+                            if let Some(username) = profile.username.clone() {
+                                app.modal = Modal::Input {
+                                    prompt: format!("Password for {username}:"),
+                                    value: String::new(),
+                                    cursor: 0,
+                                    on_confirm: InputAction::EnterPassword {
+                                        profile_name: profile.name.clone(),
+                                        username,
+                                    },
+                                };
+                            }
+                        }
+                    }
+                    AppEvent::PasswordEntered { profile_name, username, password } => {
+                        let store = KeyringStore::new(&profile_name);
+                        let _ = store.set_password(&username, &password);
+                        if let Some(profile) = app.profiles.iter().find(|p| p.name == profile_name).cloned() {
+                            let client = make_client_for_profile(&profile);
+                            clients.insert(profile_name.clone(), client);
+                        }
+                        if active_name == profile_name {
+                            app.start_registry_switch(app.active_profile_idx);
+                            spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+                        }
+                    }
+                    ev => handle_event(&mut app, ev, &clients[&active_name], &tx),
                 }
             }
             _ = tick.tick() => {
@@ -176,7 +206,8 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::Resize(_, _) => {}
         AppEvent::Tick => app.tick(),
         AppEvent::ReposPage(repos, has_more) => app.on_repos_page(repos, has_more),
-        AppEvent::ReposError(msg) => app.on_repos_error(msg),
+        // Handled in event_loop; should not reach here.
+        AppEvent::ReposError { .. } | AppEvent::PasswordEntered { .. } => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -292,7 +323,7 @@ fn handle_key(
             }
             KeyCode::Right => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    *cursor = (*cursor + 1).min(value.len());
+                    *cursor = (*cursor + 1).min(value.chars().count());
                 }
             }
             KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -302,20 +333,22 @@ fn handle_key(
             }
             KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    *cursor = value.len();
+                    *cursor = value.chars().count();
                 }
             }
             KeyCode::Backspace => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal
                     && *cursor > 0
                 {
-                    value.remove(*cursor - 1);
+                    let byte_pos = value.char_indices().nth(*cursor - 1).map(|(i, _)| i).unwrap_or(0);
+                    value.remove(byte_pos);
                     *cursor -= 1;
                 }
             }
             KeyCode::Char(ch) => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    value.insert(*cursor, ch);
+                    let byte_pos = value.char_indices().nth(*cursor).map(|(i, _)| i).unwrap_or(value.len());
+                    value.insert(byte_pos, ch);
                     *cursor += 1;
                 }
             }
@@ -585,6 +618,11 @@ fn handle_input_confirm(
                 let _ = tx.try_send(AppEvent::BrowseRepo(value));
             }
         }
+        InputAction::EnterPassword { profile_name, username } => {
+            if !value.is_empty() {
+                let _ = tx.try_send(AppEvent::PasswordEntered { profile_name, username, password: value });
+            }
+        }
     }
 }
 
@@ -823,7 +861,8 @@ fn spawn_repos_fetch(client: RegistryClient, cursor: Option<String>, tx: mpsc::S
                     .await;
             }
             Err(e) => {
-                let _ = tx.send(AppEvent::ReposError(e.to_string())).await;
+                let auth_failed = matches!(e, RegistryError::Unauthorized);
+                let _ = tx.send(AppEvent::ReposError { msg: e.to_string(), auth_failed }).await;
             }
         }
     });

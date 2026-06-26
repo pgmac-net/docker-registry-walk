@@ -323,11 +323,8 @@ fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, cursor: us
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
 
-    let display = if cursor < value.len() {
-        format!("{}{}{}", &value[..cursor], '|', &value[cursor..],)
-    } else {
-        format!("{}|", value)
-    };
+    let split = value.char_indices().nth(cursor).map(|(i, _)| i).unwrap_or(value.len());
+    let display = format!("{}{}{}", &value[..split], '|', &value[split..]);
     let text = format!("{display}\n\n[Enter] Confirm  [Esc] Cancel");
     let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
 

@@ -132,6 +132,11 @@ pub enum InputAction {
     },
     /// User typed a repo name directly (e.g. after catalog failure).
     BrowseRepo,
+    /// User entered a password after auth failure.
+    EnterPassword {
+        profile_name: String,
+        username: String,
+    },
 }
 
 #[derive(Debug)]
@@ -238,10 +243,13 @@ impl App {
         self.apply_repo_filter();
     }
 
-    pub fn on_repos_error(&mut self, msg: String) {
+    pub fn on_repos_error(&mut self, msg: String, auth_failed: bool) {
         self.repo_load = LoadState::Error(msg.clone());
         self.set_status(format!("Repos error: {msg}"));
-        if matches!(self.modal, Modal::None) {
+        // Only offer manual repo search when auth succeeded but catalog is
+        // unavailable/forbidden. If auth itself failed, the password modal
+        // is shown instead (handled in event_loop).
+        if !auth_failed && matches!(self.modal, Modal::None) {
             self.modal = Modal::Input {
                 prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
                 value: String::new(),

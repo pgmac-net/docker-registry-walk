@@ -217,16 +217,9 @@ impl Credentials for BearerCredentials {
         let body = body?;
         let token_str = Self::extract_token(&body)?;
 
-        // Cache this (possibly scoped) token so subsequent calls to the same
-        // registry endpoint don't go through 401 → re-exchange on every request.
-        let expires_in = body["expires_in"].as_u64().unwrap_or(300);
-        let ttl = Duration::from_secs(expires_in.saturating_sub(10));
-        let mut guard = self.token.lock().await;
-        *guard = Some(CachedToken {
-            value: token_str.clone(),
-            expires_at: Instant::now() + ttl,
-        });
-
+        // Don't cache: this token is scoped to one specific endpoint.  Caching
+        // it would cause the fast-path in get_authorization to serve the wrong
+        // (narrow) scope to other endpoints, triggering a cascade of 401s.
         Some(format!("Bearer {token_str}"))
     }
 }
