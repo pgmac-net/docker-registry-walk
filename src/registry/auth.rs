@@ -86,6 +86,12 @@ impl BearerCredentials {
         let challenge = parse_bearer_challenge(&www_auth)?;
 
         let mut token_url = Url::parse(&challenge.realm).ok()?;
+
+        // Guard: only send credentials to a trusted realm host.
+        if !is_trusted_realm(&token_url, &self.probe_url) {
+            return None;
+        }
+
         {
             let mut q = token_url.query_pairs_mut();
             if let Some(svc) = &challenge.service {
@@ -151,6 +157,12 @@ impl Credentials for BearerCredentials {
         let challenge = parse_bearer_challenge(www_auth)?;
 
         let mut token_url = Url::parse(&challenge.realm).ok()?;
+
+        // Guard: only send credentials to a trusted realm host.
+        if !is_trusted_realm(&token_url, &self.probe_url) {
+            return None;
+        }
+
         {
             let mut q = token_url.query_pairs_mut();
             if let Some(svc) = &challenge.service {
@@ -311,6 +323,63 @@ pub fn resolve_password(
 }
 
 // ---------------------------------------------------------------------------
+// Realm trust validation
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `realm` is a host we should send credentials to.
+///
+/// Rules:
+/// 1. Scheme must be `https`.  Plain `http` is allowed only for loopback
+///    addresses (localhost / 127.0.0.1 / ::1) so local dev registries work.
+/// 2. The realm host must either:
+///    a. Exactly match the registry host, OR
+///    b. Share the same registered domain (last two DNS labels, e.g. `docker.io`).
+///    This is a heuristic that covers the common pattern of a separate auth
+///    service under the same domain (e.g. `auth.docker.io` for `registry-1.docker.io`).
+///    It does not handle multi-label public suffixes (e.g. `.co.uk`).
+fn is_trusted_realm(realm: &Url, registry: &Url) -> bool {
+    let loopback = ["localhost", "127.0.0.1", "::1"];
+
+    match realm.scheme() {
+        "https" => {}
+        "http" => {
+            if !loopback.contains(&realm.host_str().unwrap_or("")) {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    let realm_host = realm.host_str().unwrap_or("");
+    let registry_host = registry.host_str().unwrap_or("");
+
+    if realm_host.is_empty() || registry_host.is_empty() {
+        return false;
+    }
+
+    if realm_host == registry_host {
+        return true;
+    }
+
+    // For IP-addressed registries, only exact match is trusted.
+    // The DNS-label heuristic below treats octets as labels, which would let
+    // a domain like "evil.0.1" appear to share the registered domain with
+    // a registry at "10.0.0.1".
+    match registry.host() {
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => return false,
+        _ => {}
+    }
+
+    // Compare last two DNS labels (e.g. "docker" + "io").
+    // rsplitn(3, '.') on "auth.docker.io" yields ["io", "docker", "auth"].
+    // Note: multi-label public suffixes (e.g. ".co.uk") are not handled.
+    let r_parts: Vec<&str> = realm_host.rsplitn(3, '.').collect();
+    let g_parts: Vec<&str> = registry_host.rsplitn(3, '.').collect();
+
+    r_parts.len() >= 2 && g_parts.len() >= 2 && r_parts[0] == g_parts[0] && r_parts[1] == g_parts[1]
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -351,5 +420,81 @@ mod tests {
     #[test]
     fn parse_bearer_challenge_returns_none_for_basic() {
         assert!(parse_bearer_challenge("Basic realm=\"registry\"").is_none());
+    }
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn trusted_realm_same_host() {
+        assert!(is_trusted_realm(
+            &u("https://registry.example.com/token"),
+            &u("https://registry.example.com/v2/")
+        ));
+    }
+
+    #[test]
+    fn trusted_realm_same_domain_different_subdomain() {
+        // auth.docker.io is trusted for registry-1.docker.io
+        assert!(is_trusted_realm(
+            &u("https://auth.docker.io/token"),
+            &u("https://registry-1.docker.io/v2/")
+        ));
+    }
+
+    #[test]
+    fn trusted_realm_loopback_http_allowed() {
+        assert!(is_trusted_realm(
+            &u("http://localhost:5001/token"),
+            &u("http://localhost:5000/v2/")
+        ));
+        assert!(is_trusted_realm(
+            &u("http://127.0.0.1:5001/token"),
+            &u("http://127.0.0.1:5000/v2/")
+        ));
+    }
+
+    #[test]
+    fn untrusted_realm_different_domain() {
+        assert!(!is_trusted_realm(
+            &u("https://attacker.com/steal"),
+            &u("https://registry.example.com/v2/")
+        ));
+    }
+
+    #[test]
+    fn untrusted_realm_http_non_loopback() {
+        assert!(!is_trusted_realm(
+            &u("http://auth.example.com/token"),
+            &u("https://registry.example.com/v2/")
+        ));
+    }
+
+    #[test]
+    fn untrusted_realm_subdomain_of_attacker_sharing_tld() {
+        // attacker.com must not pass even though both end in ".com"
+        assert!(!is_trusted_realm(
+            &u("https://attacker.com/token"),
+            &u("https://registry.example.com/v2/")
+        ));
+    }
+
+    #[test]
+    fn untrusted_realm_different_host_for_ip_registry() {
+        // IP-addressed registries require exact host match; the DNS-label
+        // heuristic is disabled to avoid octet-spoofing attacks.
+        assert!(!is_trusted_realm(
+            &u("https://auth.example.com/token"),
+            &u("https://10.0.0.1:5000/v2/")
+        ));
+    }
+
+    #[test]
+    fn trusted_realm_exact_ip_match() {
+        assert!(is_trusted_realm(
+            &u("https://10.0.0.1:5001/token"),
+            &u("https://10.0.0.1:5000/v2/")
+        ));
     }
 }
