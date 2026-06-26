@@ -41,9 +41,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match &app.modal {
         Modal::Confirm { message, .. } => draw_confirm_modal(frame, message.clone(), area),
-        Modal::Input { prompt, value, .. } => {
-            draw_input_modal(frame, prompt.clone(), value.clone(), area)
-        }
+        Modal::Input {
+            prompt,
+            value,
+            cursor,
+            ..
+        } => draw_input_modal(frame, prompt.clone(), value.clone(), *cursor, area),
         Modal::RegistrySelect { selected_idx } => {
             draw_registry_select_modal(frame, app, *selected_idx, area)
         }
@@ -306,7 +309,7 @@ fn draw_confirm_modal(frame: &mut Frame, message: String, area: Rect) {
     frame.render_widget(p, modal_area);
 }
 
-fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, area: Rect) {
+fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, cursor: usize, area: Rect) {
     let width = 60u16.min(area.width.saturating_sub(4));
     let height = 5u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -320,7 +323,12 @@ fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, area: Rect
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
 
-    let text = format!("{value}_\n\n[Enter] Confirm  [Esc] Cancel");
+    let display = if cursor < value.len() {
+        format!("{}{}{}", &value[..cursor], '|', &value[cursor..],)
+    } else {
+        format!("{}|", value)
+    };
+    let text = format!("{display}\n\n[Enter] Confirm  [Esc] Cancel");
     let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
 
     frame.render_widget(p, modal_area);

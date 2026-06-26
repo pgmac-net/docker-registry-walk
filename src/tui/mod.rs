@@ -177,6 +177,11 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::Tick => app.tick(),
         AppEvent::ReposPage(repos, has_more) => app.on_repos_page(repos, has_more),
         AppEvent::ReposError(msg) => app.on_repos_error(msg),
+        AppEvent::BrowseRepo(repo) => {
+            app.start_tags_load(repo.clone());
+            app.focus = Focus::Tags;
+            spawn_tags_fetch(client.clone(), repo, None, tx.clone());
+        }
         AppEvent::TagsPage(repo, tags, has_more) => app.on_tags_page(repo, tags, has_more),
         AppEvent::TagsError(msg) => app.on_tags_error(msg),
         AppEvent::DetailLoaded { repo, tag, detail } => {
@@ -280,14 +285,38 @@ fn handle_key(
                     handle_input_confirm(value, on_confirm, client, tx);
                 }
             }
+            KeyCode::Left => {
+                if let Modal::Input { cursor, .. } = &mut app.modal {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Modal::Input { value, cursor, .. } = &mut app.modal {
+                    *cursor = (*cursor + 1).min(value.len());
+                }
+            }
+            KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::Input { cursor, .. } = &mut app.modal {
+                    *cursor = 0;
+                }
+            }
+            KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::Input { value, cursor, .. } = &mut app.modal {
+                    *cursor = value.len();
+                }
+            }
             KeyCode::Backspace => {
-                if let Modal::Input { value, .. } = &mut app.modal {
-                    value.pop();
+                if let Modal::Input { value, cursor, .. } = &mut app.modal
+                    && *cursor > 0
+                {
+                    value.remove(*cursor - 1);
+                    *cursor -= 1;
                 }
             }
             KeyCode::Char(ch) => {
-                if let Modal::Input { value, .. } = &mut app.modal {
-                    value.push(ch);
+                if let Modal::Input { value, cursor, .. } = &mut app.modal {
+                    value.insert(*cursor, ch);
+                    *cursor += 1;
                 }
             }
             _ => {}
@@ -378,7 +407,7 @@ fn handle_key(
             KeyCode::Enter => {
                 if let Modal::RegistrySelect { selected_idx } = app.modal {
                     app.modal = Modal::None;
-                    let _ = tx.blocking_send(AppEvent::SwitchRegistry { idx: selected_idx });
+                    let _ = tx.try_send(AppEvent::SwitchRegistry { idx: selected_idx });
                 }
             }
             _ => {}
@@ -402,15 +431,15 @@ fn handle_key(
 
     // Normal mode.
     match code {
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
-        KeyCode::Tab => app.focus = app.focus.toggle(),
-        KeyCode::BackTab => app.focus = app.focus.toggle(),
+        KeyCode::Tab | KeyCode::Right => app.focus = app.focus.toggle(),
+        KeyCode::BackTab | KeyCode::Left => app.focus = app.focus.prev(),
         KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
         KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
-        KeyCode::Enter => handle_enter(app),
+        KeyCode::Enter => handle_enter(app, client, tx),
         KeyCode::Char('/') => {
             app.filter_mode = Some(app.focus);
         }
@@ -432,9 +461,11 @@ fn handle_key(
     }
 }
 
-fn handle_enter(app: &mut App) {
-    if app.focus == Focus::Repos && !app.tags.is_empty() {
-        app.focus = Focus::Tags;
+fn handle_enter(app: &mut App, client: &RegistryClient, tx: &mpsc::Sender<AppEvent>) {
+    match app.focus {
+        Focus::Repos if !app.tags.is_empty() => app.focus = Focus::Tags,
+        Focus::Tags => handle_inspect(app, client, tx),
+        _ => {}
     }
 }
 
@@ -459,6 +490,7 @@ fn handle_copy_image(app: &mut App) {
     app.modal = Modal::Input {
         prompt: "Copy to (repo:tag):".to_owned(),
         value: prefilled,
+        cursor: 0,
         on_confirm: InputAction::CopyImage {
             src_repo: repo,
             src_tag: tag,
@@ -476,6 +508,7 @@ fn handle_retag(app: &mut App) {
     app.modal = Modal::Input {
         prompt: format!("New tag for '{repo}:{tag}':"),
         value: String::new(),
+        cursor: 0,
         on_confirm: InputAction::Retag { repo, src_tag: tag },
     };
 }
@@ -536,8 +569,7 @@ fn handle_input_confirm(
         }
         InputAction::Retag { repo, src_tag } => {
             if !crate::ops::retag::validate_tag(&value) {
-                let _ =
-                    tx.blocking_send(AppEvent::RetagError(format!("Invalid tag name '{value}'")));
+                let _ = tx.try_send(AppEvent::RetagError(format!("Invalid tag name '{value}'")));
                 return;
             }
             spawn_retag(client.clone(), repo, src_tag, value, tx.clone());
@@ -547,6 +579,11 @@ fn handle_input_confirm(
         }
         InputAction::DiffAgainst { repo, tag_a } => {
             spawn_diff(client.clone(), repo, tag_a, value, tx.clone());
+        }
+        InputAction::BrowseRepo => {
+            if !value.is_empty() {
+                let _ = tx.try_send(AppEvent::BrowseRepo(value));
+            }
         }
     }
 }
@@ -579,6 +616,7 @@ fn handle_export(app: &mut App) {
     app.modal = Modal::Input {
         prompt: "Export OCI tar to:".to_owned(),
         value: default_path,
+        cursor: 0,
         on_confirm: InputAction::Export { repo, tag },
     };
 }
@@ -593,6 +631,7 @@ fn handle_diff(app: &mut App) {
     app.modal = Modal::Input {
         prompt: format!("Diff '{tag}' against tag:"),
         value: String::new(),
+        cursor: 0,
         on_confirm: InputAction::DiffAgainst { repo, tag_a: tag },
     };
 }

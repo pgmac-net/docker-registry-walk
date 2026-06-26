@@ -73,6 +73,8 @@ pub enum AppEvent {
         layers: Vec<DiffLayer>,
     },
     DiffError(String),
+    /// Jump directly to a repository (e.g. entered by the user after catalog failure).
+    BrowseRepo(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
