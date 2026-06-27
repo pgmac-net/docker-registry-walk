@@ -432,12 +432,12 @@ fn handle_key(
                     let _ = tx.try_send(AppEvent::BrowseRepo(repo));
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if let Modal::SearchPicker { selected, .. } = &mut app.modal {
                     *selected = selected.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Modal::SearchPicker {
                     results, selected, ..
                 } = &mut app.modal
