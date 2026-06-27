@@ -112,24 +112,17 @@ async fn event_loop(
                         // same as an authz failure and offer BrowseRepo.
                         let retry_pending = app.catalog_retry_pending;
                         app.catalog_retry_pending = false;
-                        let mut show_browse = !auth_failed || retry_pending;
-                        let mut prompt_password = false;
-                        if auth_failed && !retry_pending && matches!(app.modal, Modal::None) {
-                            let profile = &app.profiles[app.active_profile_idx];
-                            if let Some(username) = profile.username.clone() {
-                                // If the password was already loaded from keyring, the 401
-                                // is a scope rejection (Docker Hub /v2/_catalog), not a
-                                // missing credential — skip the prompt and show BrowseRepo.
-                                let store = KeyringStore::new(&profile.name);
-                                if store.get_password(&username).is_some() {
-                                    show_browse = true;
-                                } else {
-                                    prompt_password = true;
-                                }
-                            }
-                        }
+                        // Docker Hub never allows /v2/_catalog; a 401 there is
+                        // always a policy restriction, not wrong credentials.
+                        let is_dh = app
+                            .profiles
+                            .get(app.active_profile_idx)
+                            .is_some_and(|p| p.is_dockerhub());
+                        let show_browse = !auth_failed || retry_pending || is_dh;
                         app.on_repos_error(msg, show_browse);
-                        if prompt_password {
+                        if auth_failed && !retry_pending && !is_dh
+                            && matches!(app.modal, Modal::None)
+                        {
                             let profile = &app.profiles[app.active_profile_idx];
                             if let Some(username) = profile.username.clone() {
                                 app.modal = Modal::Input {
