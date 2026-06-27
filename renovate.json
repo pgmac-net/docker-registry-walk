@@ -7,7 +7,7 @@
   ],
   "labels": ["dependencies"],
   "schedule": ["before 9am on monday"],
-  "timezone": "Australia/Melbourne",
+  "timezone": "Australia/Brisbane",
   "packageRules": [
     {
       "description": "Group Rust crate dev-dependencies together",
