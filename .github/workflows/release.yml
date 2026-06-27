@@ -9,8 +9,32 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Check tag format
+        id: tag
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "✓ Release tag: $TAG"
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "✓ Pre-release tag: $TAG"
+          else
+            echo "✗ Invalid tag format: $TAG"
+            echo "  Expected: v<major>.<minor>.<patch>      (release, on main)"
+            echo "        or: v<major>.<minor>.<patch>-rc<N> (pre-release, on other branches)"
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.target }})
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -76,7 +100,7 @@ jobs:
 
   release:
     name: Create release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,3 +119,4 @@ jobs:
           files: |
             artifacts/*
           generate_release_notes: true
+          prerelease: ${{ needs.validate.outputs.prerelease }}
