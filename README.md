@@ -160,3 +160,7 @@ Press `?` inside the app for the full interactive reference. Summary:
 - For **delete / prune**: `REGISTRY_STORAGE_DELETE_ENABLED=true`
 - Auth: anonymous, HTTP Basic, or Bearer token (automatic token exchange with per-endpoint scope retry)
 - HTTPS strongly recommended; plain HTTP supported for local/internal registries
+
+## License
+
+MIT © 2026 [pgmac](https://github.com/pgmac). See [LICENSE](LICENSE).
