@@ -22,7 +22,10 @@ use tokio::time::interval;
 use url::Url;
 
 use crate::config::RegistryProfile;
-use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient};
+use crate::registry::{
+    BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError,
+    search_dockerhub,
+};
 
 use self::app::{
     ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal, LoadState, Modal,
@@ -93,15 +96,86 @@ async fn event_loop(
         tokio::select! {
             biased;
             Some(ev) = rx.recv() => {
-                if let AppEvent::SwitchRegistry { idx } = ev {
-                    let profile = &app.profiles[idx];
-                    let name = profile.name.clone();
-                    clients.entry(name.clone()).or_insert_with(|| make_client_for_profile(profile));
-                    active_name = name;
-                    app.start_registry_switch(idx);
-                    spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
-                } else {
-                    handle_event(&mut app, ev, &clients[&active_name], &tx);
+                match ev {
+                    AppEvent::SwitchRegistry { idx } => {
+                        let profile = &app.profiles[idx];
+                        let name = profile.name.clone();
+                        clients.entry(name.clone()).or_insert_with(|| make_client_for_profile(profile));
+                        active_name = name;
+                        app.start_registry_switch(idx);
+                        spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+                    }
+                    AppEvent::ReposError { msg, auth_failed } => {
+                        // After a password-entry retry, a 401 means scope
+                        // rejection (not wrong credentials), so treat it the
+                        // same as an authz failure and offer BrowseRepo.
+                        let retry_pending = app.catalog_retry_pending;
+                        app.catalog_retry_pending = false;
+                        let mut show_browse = !auth_failed || retry_pending;
+                        let mut prompt_password = false;
+                        if auth_failed && !retry_pending && matches!(app.modal, Modal::None) {
+                            let profile = &app.profiles[app.active_profile_idx];
+                            if let Some(username) = profile.username.clone() {
+                                // If the password was already loaded from keyring, the 401
+                                // is a scope rejection (Docker Hub /v2/_catalog), not a
+                                // missing credential — skip the prompt and show BrowseRepo.
+                                let store = KeyringStore::new(&profile.name);
+                                if store.get_password(&username).is_some() {
+                                    show_browse = true;
+                                } else {
+                                    prompt_password = true;
+                                }
+                            }
+                        }
+                        app.on_repos_error(msg, show_browse);
+                        if prompt_password {
+                            let profile = &app.profiles[app.active_profile_idx];
+                            if let Some(username) = profile.username.clone() {
+                                app.modal = Modal::Input {
+                                    prompt: format!("Password for {username}:"),
+                                    value: String::new(),
+                                    cursor: 0,
+                                    on_confirm: InputAction::EnterPassword {
+                                        profile_name: profile.name.clone(),
+                                        username,
+                                    },
+                                };
+                            }
+                        }
+                    }
+                    AppEvent::PasswordEntered { profile_name, username, password } => {
+                        let store = KeyringStore::new(&profile_name);
+                        let _ = store.set_password(&username, &password);
+                        if let Some(profile) = app.profiles.iter().find(|p| p.name == profile_name).cloned() {
+                            let client = make_client_for_profile(&profile);
+                            clients.insert(profile_name.clone(), client);
+                        }
+                        if active_name == profile_name {
+                            app.start_registry_switch(app.active_profile_idx);
+                            app.catalog_retry_pending = true;
+                            spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+                        }
+                    }
+                    AppEvent::DockerHubSearch { query, results } => {
+                        if let Modal::SearchPicker {
+                            value,
+                            results: modal_results,
+                            selected,
+                            searching,
+                            ..
+                        } = &mut app.modal
+                            && *value == query {
+                                *modal_results = results;
+                                *selected = 0;
+                                *searching = false;
+                            }
+                    }
+                    AppEvent::DockerHubSearchError(_) => {
+                        if let Modal::SearchPicker { searching, .. } = &mut app.modal {
+                            *searching = false;
+                        }
+                    }
+                    ev => handle_event(&mut app, ev, &clients[&active_name], &tx),
                 }
             }
             _ = tick.tick() => {
@@ -176,7 +250,11 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::Resize(_, _) => {}
         AppEvent::Tick => app.tick(),
         AppEvent::ReposPage(repos, has_more) => app.on_repos_page(repos, has_more),
-        AppEvent::ReposError(msg) => app.on_repos_error(msg),
+        // Handled in event_loop; should not reach here.
+        AppEvent::ReposError { .. }
+        | AppEvent::PasswordEntered { .. }
+        | AppEvent::DockerHubSearch { .. }
+        | AppEvent::DockerHubSearchError(_) => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -292,7 +370,7 @@ fn handle_key(
             }
             KeyCode::Right => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    *cursor = (*cursor + 1).min(value.len());
+                    *cursor = (*cursor + 1).min(value.chars().count());
                 }
             }
             KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -302,21 +380,140 @@ fn handle_key(
             }
             KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    *cursor = value.len();
+                    *cursor = value.chars().count();
                 }
             }
             KeyCode::Backspace => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal
                     && *cursor > 0
                 {
-                    value.remove(*cursor - 1);
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    value.remove(byte_pos);
                     *cursor -= 1;
                 }
             }
             KeyCode::Char(ch) => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    value.insert(*cursor, ch);
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(value.len());
+                    value.insert(byte_pos, ch);
                     *cursor += 1;
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::SearchPicker { .. }) {
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            KeyCode::Enter => {
+                let modal = std::mem::replace(&mut app.modal, Modal::None);
+                if let Modal::SearchPicker {
+                    value,
+                    results,
+                    selected,
+                    ..
+                } = modal
+                {
+                    let repo = results.into_iter().nth(selected).unwrap_or(value);
+                    let _ = tx.try_send(AppEvent::BrowseRepo(repo));
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Modal::SearchPicker { selected, .. } = &mut app.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Modal::SearchPicker {
+                    results, selected, ..
+                } = &mut app.modal
+                    && !results.is_empty()
+                {
+                    *selected = (*selected + 1).min(results.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Left => {
+                if let Modal::SearchPicker { cursor, .. } = &mut app.modal {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Modal::SearchPicker { value, cursor, .. } = &mut app.modal {
+                    *cursor = (*cursor + 1).min(value.chars().count());
+                }
+            }
+            KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::SearchPicker { cursor, .. } = &mut app.modal {
+                    *cursor = 0;
+                }
+            }
+            KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Modal::SearchPicker { value, cursor, .. } = &mut app.modal {
+                    *cursor = value.chars().count();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Modal::SearchPicker {
+                    value,
+                    cursor,
+                    searching,
+                    results,
+                    selected,
+                    ..
+                } = &mut app.modal
+                    && *cursor > 0
+                {
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    value.remove(byte_pos);
+                    *cursor -= 1;
+                    *results = Vec::new();
+                    *selected = 0;
+                    if value.trim().is_empty() {
+                        *searching = false;
+                    } else {
+                        *searching = true;
+                        spawn_dockerhub_search(value.clone(), tx.clone());
+                    }
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Modal::SearchPicker {
+                    value,
+                    cursor,
+                    searching,
+                    results,
+                    selected,
+                    ..
+                } = &mut app.modal
+                {
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(value.len());
+                    value.insert(byte_pos, ch);
+                    *cursor += 1;
+                    *results = Vec::new();
+                    *selected = 0;
+                    *searching = true;
+                    spawn_dockerhub_search(value.clone(), tx.clone());
                 }
             }
             _ => {}
@@ -585,6 +782,18 @@ fn handle_input_confirm(
                 let _ = tx.try_send(AppEvent::BrowseRepo(value));
             }
         }
+        InputAction::EnterPassword {
+            profile_name,
+            username,
+        } => {
+            if !value.is_empty() {
+                let _ = tx.try_send(AppEvent::PasswordEntered {
+                    profile_name,
+                    username,
+                    password: value,
+                });
+            }
+        }
     }
 }
 
@@ -823,7 +1032,13 @@ fn spawn_repos_fetch(client: RegistryClient, cursor: Option<String>, tx: mpsc::S
                     .await;
             }
             Err(e) => {
-                let _ = tx.send(AppEvent::ReposError(e.to_string())).await;
+                let auth_failed = matches!(e, RegistryError::Unauthorized);
+                let _ = tx
+                    .send(AppEvent::ReposError {
+                        msg: e.to_string(),
+                        auth_failed,
+                    })
+                    .await;
             }
         }
     });
@@ -887,5 +1102,18 @@ fn spawn_detail_fetch(
                 detail: Box::new(d),
             })
             .await;
+    });
+}
+
+fn spawn_dockerhub_search(query: String, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        match search_dockerhub(&query).await {
+            Ok(results) => {
+                let _ = tx.send(AppEvent::DockerHubSearch { query, results }).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::DockerHubSearchError(e.to_string())).await;
+            }
+        }
     });
 }

@@ -15,7 +15,16 @@ pub enum AppEvent {
     Resize(u16, u16),
     Tick,
     ReposPage(Vec<String>, bool),
-    ReposError(String),
+    ReposError {
+        msg: String,
+        /// True when the error is a 401 Unauthorized — credentials wrong or absent.
+        auth_failed: bool,
+    },
+    PasswordEntered {
+        profile_name: String,
+        username: String,
+        password: String,
+    },
     TagsPage(String, Vec<String>, bool),
     TagsError(String),
     DetailLoaded {
@@ -75,6 +84,12 @@ pub enum AppEvent {
     DiffError(String),
     /// Jump directly to a repository (e.g. entered by the user after catalog failure).
     BrowseRepo(String),
+    /// Results from a Docker Hub search query.
+    DockerHubSearch {
+        query: String,
+        results: Vec<String>,
+    },
+    DockerHubSearchError(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.

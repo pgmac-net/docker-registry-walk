@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -217,16 +218,9 @@ impl Credentials for BearerCredentials {
         let body = body?;
         let token_str = Self::extract_token(&body)?;
 
-        // Cache this (possibly scoped) token so subsequent calls to the same
-        // registry endpoint don't go through 401 → re-exchange on every request.
-        let expires_in = body["expires_in"].as_u64().unwrap_or(300);
-        let ttl = Duration::from_secs(expires_in.saturating_sub(10));
-        let mut guard = self.token.lock().await;
-        *guard = Some(CachedToken {
-            value: token_str.clone(),
-            expires_at: Instant::now() + ttl,
-        });
-
+        // Don't cache: this token is scoped to one specific endpoint.  Caching
+        // it would cause the fast-path in get_authorization to serve the wrong
+        // (narrow) scope to other endpoints, triggering a cascade of 401s.
         Some(format!("Bearer {token_str}"))
     }
 }
@@ -305,21 +299,101 @@ impl KeyringStore {
 
     /// Retrieve the stored password for `username`, if any.
     pub fn get_password(&self, username: &str) -> Option<String> {
-        keyring::Entry::new(&self.service, username)
-            .ok()
-            .and_then(|e| e.get_password().ok())
+        self.get_password_keyring(username)
+            .or_else(|| self.get_password_secret_tool(username))
+    }
+
+    fn get_password_keyring(&self, username: &str) -> Option<String> {
+        let entry = keyring::Entry::new(&self.service, username);
+        match entry {
+            Ok(e) => match e.get_password() {
+                Ok(p) => Some(p),
+                Err(err) => {
+                    eprintln!("[keyring] get_password error: {err}");
+                    None
+                }
+            },
+            Err(err) => {
+                eprintln!("[keyring] Entry::new error: {err}");
+                None
+            }
+        }
+    }
+
+    fn get_password_secret_tool(&self, username: &str) -> Option<String> {
+        let output = Command::new("secret-tool")
+            .args(["lookup", "service", &self.service, "username", username])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let s = String::from_utf8(output.stdout).ok()?;
+            let s = s.trim().to_owned();
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        }
     }
 
     /// Store `password` for `username` in the OS keychain.
     pub fn set_password(&self, username: &str, password: &str) -> anyhow::Result<()> {
+        self.set_password_keyring(username, password)
+            .or_else(|_| self.set_password_secret_tool(username, password))
+    }
+
+    fn set_password_keyring(&self, username: &str, password: &str) -> anyhow::Result<()> {
         keyring::Entry::new(&self.service, username)?.set_password(password)?;
         Ok(())
     }
 
+    fn set_password_secret_tool(&self, username: &str, password: &str) -> anyhow::Result<()> {
+        let label = format!("keyring:{}@{}", username, self.service);
+        let mut child = Command::new("secret-tool")
+            .args([
+                "store",
+                "--label",
+                &label,
+                "service",
+                &self.service,
+                "username",
+                username,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(password.as_bytes())?;
+        }
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!("secret-tool store failed with status: {status}")
+        }
+    }
+
     /// Remove the stored credential for `username`.
     pub fn delete_password(&self, username: &str) -> anyhow::Result<()> {
+        self.delete_password_keyring(username)
+            .or_else(|_| self.delete_password_secret_tool(username))
+    }
+
+    fn delete_password_keyring(&self, username: &str) -> anyhow::Result<()> {
         keyring::Entry::new(&self.service, username)?.delete_credential()?;
         Ok(())
+    }
+
+    fn delete_password_secret_tool(&self, username: &str) -> anyhow::Result<()> {
+        let output = Command::new("secret-tool")
+            .args(["clear", "service", &self.service, "username", username])
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("secret-tool clear failed: {stderr}")
+        }
     }
 }
 

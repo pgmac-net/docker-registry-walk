@@ -104,6 +104,14 @@ pub enum Modal {
     Help {
         scroll: usize,
     },
+    /// Docker Hub repository search with live results.
+    SearchPicker {
+        value: String,
+        cursor: usize,
+        results: Vec<String>,
+        selected: usize,
+        searching: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +140,11 @@ pub enum InputAction {
     },
     /// User typed a repo name directly (e.g. after catalog failure).
     BrowseRepo,
+    /// User entered a password after auth failure.
+    EnterPassword {
+        profile_name: String,
+        username: String,
+    },
 }
 
 #[derive(Debug)]
@@ -176,6 +189,9 @@ pub struct App {
     pub modal: Modal,
     pub should_quit: bool,
     pub spinner_tick: usize,
+    /// Set when a password was just entered; causes the next catalog error
+    /// (even 401) to open BrowseRepo rather than the password modal again.
+    pub catalog_retry_pending: bool,
     status: Option<StatusMessage>,
     // Registry switcher
     pub profiles: Vec<RegistryProfile>,
@@ -220,6 +236,7 @@ impl App {
             modal: Modal::None,
             should_quit: false,
             spinner_tick: 0,
+            catalog_retry_pending: false,
             status: None,
             profiles,
             active_profile_idx: idx,
@@ -238,16 +255,26 @@ impl App {
         self.apply_repo_filter();
     }
 
-    pub fn on_repos_error(&mut self, msg: String) {
+    pub fn on_repos_error(&mut self, msg: String, show_browse: bool) {
         self.repo_load = LoadState::Error(msg.clone());
         self.set_status(format!("Repos error: {msg}"));
-        if matches!(self.modal, Modal::None) {
-            self.modal = Modal::Input {
-                prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
-                value: String::new(),
-                cursor: 0,
-                on_confirm: InputAction::BrowseRepo,
-            };
+        if show_browse && matches!(self.modal, Modal::None) {
+            if crate::registry::is_dockerhub_url(&self.registry_url) {
+                self.modal = Modal::SearchPicker {
+                    value: String::new(),
+                    cursor: 0,
+                    results: Vec::new(),
+                    selected: 0,
+                    searching: false,
+                };
+            } else {
+                self.modal = Modal::Input {
+                    prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
+                    value: String::new(),
+                    cursor: 0,
+                    on_confirm: InputAction::BrowseRepo,
+                };
+            }
         }
     }
 
@@ -347,6 +374,7 @@ impl App {
         self.detail_scroll = 0;
         self.focus = Focus::Repos;
         self.filter_mode = None;
+        self.catalog_retry_pending = false;
     }
 
     // ------------------------------------------------------------------
