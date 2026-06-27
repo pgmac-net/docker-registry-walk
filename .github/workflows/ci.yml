@@ -5,6 +5,11 @@ on:
     branches: ["**"]
   pull_request:
 
+env:
+  CARGO_NET_RETRY: 5
+  CARGO_HTTP_TIMEOUT: 120
+  CARGO_HTTP_MULTIPLEX: false
+
 jobs:
   fmt:
     name: fmt

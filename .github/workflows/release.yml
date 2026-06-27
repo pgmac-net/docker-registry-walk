@@ -5,6 +5,11 @@ on:
     tags:
       - "v*"
 
+env:
+  CARGO_NET_RETRY: 5
+  CARGO_HTTP_TIMEOUT: 120
+  CARGO_HTTP_MULTIPLEX: false
+
 permissions:
   contents: write
 
