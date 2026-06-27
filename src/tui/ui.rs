@@ -717,9 +717,19 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
         header("Registry"),
         Line::from(vec![key("R"), sep(), desc("Switch registry (in-app)")]),
         Line::from(vec![]),
+        header("Docker Hub Search  (opens automatically on Docker Hub)"),
+        Line::from(vec![
+            key("↑ / ↓"),
+            sep(),
+            desc("Select result (j/k not available — they insert text)"),
+        ]),
+        Line::from(vec![key("Enter"), sep(), desc("Browse selected repo")]),
+        Line::from(vec![key("Esc"), sep(), desc("Close without searching")]),
+        Line::from(vec![]),
         header("General"),
         Line::from(vec![key("?"), sep(), desc("This help screen")]),
-        Line::from(vec![key("q / Ctrl-C"), sep(), desc("Quit")]),
+        Line::from(vec![key("q / Esc"), sep(), desc("Quit")]),
+        Line::from(vec![key("Ctrl-C"), sep(), desc("Force quit")]),
     ];
 
     let visible_h = inner.height as usize;

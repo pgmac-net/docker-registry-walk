@@ -42,6 +42,7 @@ pub async fn run(mut profiles: Vec<RegistryProfile>, initial_idx: usize) -> anyh
             name: "local".to_owned(),
             url: "http://localhost:5000".to_owned(),
             username: None,
+            registry_type: Default::default(),
         });
     }
     let initial_idx = initial_idx.min(profiles.len().saturating_sub(1));
@@ -431,12 +432,12 @@ fn handle_key(
                     let _ = tx.try_send(AppEvent::BrowseRepo(repo));
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if let Modal::SearchPicker { selected, .. } = &mut app.modal {
                     *selected = selected.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Modal::SearchPicker {
                     results, selected, ..
                 } = &mut app.modal
