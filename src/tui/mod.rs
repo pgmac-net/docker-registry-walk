@@ -42,6 +42,7 @@ pub async fn run(mut profiles: Vec<RegistryProfile>, initial_idx: usize) -> anyh
             name: "local".to_owned(),
             url: "http://localhost:5000".to_owned(),
             username: None,
+            registry_type: Default::default(),
         });
     }
     let initial_idx = initial_idx.min(profiles.len().saturating_sub(1));

@@ -26,16 +26,3 @@ pub async fn search_dockerhub(query: &str) -> anyhow::Result<Vec<String>> {
     let body: SearchResponse = resp.json().await?;
     Ok(body.results.into_iter().map(|r| r.repo_name).collect())
 }
-
-pub fn is_dockerhub_url(url: &str) -> bool {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .map(|h| {
-            matches!(
-                h.as_str(),
-                "registry-1.docker.io" | "docker.io" | "index.docker.io"
-            )
-        })
-        .unwrap_or(false)
-}

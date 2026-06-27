@@ -256,10 +256,19 @@ impl App {
     }
 
     pub fn on_repos_error(&mut self, msg: String, show_browse: bool) {
-        self.repo_load = LoadState::Error(msg.clone());
+        let is_dh = self
+            .profiles
+            .get(self.active_profile_idx)
+            .is_some_and(|p| p.is_dockerhub());
+        let display = if is_dh {
+            "We can't show you these, please search for an image".to_owned()
+        } else {
+            msg.clone()
+        };
+        self.repo_load = LoadState::Error(display);
         self.set_status(format!("Repos error: {msg}"));
         if show_browse && matches!(self.modal, Modal::None) {
-            if crate::registry::is_dockerhub_url(&self.registry_url) {
+            if is_dh {
                 self.modal = Modal::SearchPicker {
                     value: String::new(),
                     cursor: 0,

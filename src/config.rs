@@ -18,7 +18,20 @@ const EXAMPLE_CONFIG: &str = r#"# docker-registry-walk configuration
 name = "local"
 url = "http://localhost:5000"
 # username = "admin"
+# type = "standard"
 "#;
+
+/// What kind of registry this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistryType {
+    /// A standard Docker Registry v2 endpoint.
+    #[default]
+    Standard,
+    /// Docker Hub (hub.docker.com).  The catalog endpoint is not supported,
+    /// so the TUI falls back to the hub search API to find repos.
+    DockerHub,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryProfile {
@@ -26,6 +39,33 @@ pub struct RegistryProfile {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Registry flavour.  Controls how the UI interacts with it
+    /// (e.g. Docker Hub uses the hub search API instead of /v2/_catalog).
+    #[serde(rename = "type", default)]
+    pub registry_type: RegistryType,
+}
+
+impl RegistryProfile {
+    /// Returns `true` when the registry is Docker Hub (either explicitly
+    /// configured or detected from the URL).
+    pub fn is_dockerhub(&self) -> bool {
+        match self.registry_type {
+            RegistryType::DockerHub => true,
+            RegistryType::Standard => {
+                // Fall back to URL-based detection for backward compatibility.
+                let Ok(u) = url::Url::parse(&self.url) else {
+                    return false;
+                };
+                let Some(host) = u.host_str() else {
+                    return false;
+                };
+                matches!(
+                    host,
+                    "registry-1.docker.io" | "docker.io" | "index.docker.io"
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -135,6 +175,7 @@ mod tests {
             name: name.to_owned(),
             url: url.to_owned(),
             username: None,
+            registry_type: RegistryType::Standard,
         }
     }
 
@@ -157,6 +198,7 @@ mod tests {
                     name: "prod".to_owned(),
                     url: "https://registry.example.com".to_owned(),
                     username: Some("admin".to_owned()),
+                    registry_type: RegistryType::Standard,
                 },
             ],
         };

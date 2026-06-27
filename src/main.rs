@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
             name: "cli".to_owned(),
             url,
             username: cli.username.clone(),
+            registry_type: Default::default(),
         };
         config.registry.insert(0, profile);
         0
