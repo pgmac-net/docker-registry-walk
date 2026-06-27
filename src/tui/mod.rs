@@ -22,7 +22,10 @@ use tokio::time::interval;
 use url::Url;
 
 use crate::config::RegistryProfile;
-use crate::registry::{BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError, search_dockerhub};
+use crate::registry::{
+    BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError,
+    search_dockerhub,
+};
 
 use self::app::{
     ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal, LoadState, Modal,
@@ -108,9 +111,24 @@ async fn event_loop(
                         // same as an authz failure and offer BrowseRepo.
                         let retry_pending = app.catalog_retry_pending;
                         app.catalog_retry_pending = false;
-                        let show_browse = !auth_failed || retry_pending;
-                        app.on_repos_error(msg, show_browse);
+                        let mut show_browse = !auth_failed || retry_pending;
+                        let mut prompt_password = false;
                         if auth_failed && !retry_pending && matches!(app.modal, Modal::None) {
+                            let profile = &app.profiles[app.active_profile_idx];
+                            if let Some(username) = profile.username.clone() {
+                                // If the password was already loaded from keyring, the 401
+                                // is a scope rejection (Docker Hub /v2/_catalog), not a
+                                // missing credential — skip the prompt and show BrowseRepo.
+                                let store = KeyringStore::new(&profile.name);
+                                if store.get_password(&username).is_some() {
+                                    show_browse = true;
+                                } else {
+                                    prompt_password = true;
+                                }
+                            }
+                        }
+                        app.on_repos_error(msg, show_browse);
+                        if prompt_password {
                             let profile = &app.profiles[app.active_profile_idx];
                             if let Some(username) = profile.username.clone() {
                                 app.modal = Modal::Input {
@@ -146,13 +164,11 @@ async fn event_loop(
                             searching,
                             ..
                         } = &mut app.modal
-                        {
-                            if *value == query {
+                            && *value == query {
                                 *modal_results = results;
                                 *selected = 0;
                                 *searching = false;
                             }
-                        }
                     }
                     AppEvent::DockerHubSearchError(_) => {
                         if let Modal::SearchPicker { searching, .. } = &mut app.modal {
@@ -371,14 +387,22 @@ fn handle_key(
                 if let Modal::Input { value, cursor, .. } = &mut app.modal
                     && *cursor > 0
                 {
-                    let byte_pos = value.char_indices().nth(*cursor - 1).map(|(i, _)| i).unwrap_or(0);
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                     value.remove(byte_pos);
                     *cursor -= 1;
                 }
             }
             KeyCode::Char(ch) => {
                 if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    let byte_pos = value.char_indices().nth(*cursor).map(|(i, _)| i).unwrap_or(value.len());
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(value.len());
                     value.insert(byte_pos, ch);
                     *cursor += 1;
                 }
@@ -396,7 +420,13 @@ fn handle_key(
             }
             KeyCode::Enter => {
                 let modal = std::mem::replace(&mut app.modal, Modal::None);
-                if let Modal::SearchPicker { value, results, selected, .. } = modal {
+                if let Modal::SearchPicker {
+                    value,
+                    results,
+                    selected,
+                    ..
+                } = modal
+                {
                     let repo = results.into_iter().nth(selected).unwrap_or(value);
                     let _ = tx.try_send(AppEvent::BrowseRepo(repo));
                 }
@@ -407,10 +437,12 @@ fn handle_key(
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Modal::SearchPicker { results, selected, .. } = &mut app.modal {
-                    if !results.is_empty() {
-                        *selected = (*selected + 1).min(results.len().saturating_sub(1));
-                    }
+                if let Modal::SearchPicker {
+                    results, selected, ..
+                } = &mut app.modal
+                    && !results.is_empty()
+                {
+                    *selected = (*selected + 1).min(results.len().saturating_sub(1));
                 }
             }
             KeyCode::Left => {
@@ -434,12 +466,21 @@ fn handle_key(
                 }
             }
             KeyCode::Backspace => {
-                if let Modal::SearchPicker { value, cursor, searching, results, selected, .. } =
-                    &mut app.modal
+                if let Modal::SearchPicker {
+                    value,
+                    cursor,
+                    searching,
+                    results,
+                    selected,
+                    ..
+                } = &mut app.modal
                     && *cursor > 0
                 {
-                    let byte_pos =
-                        value.char_indices().nth(*cursor - 1).map(|(i, _)| i).unwrap_or(0);
+                    let byte_pos = value
+                        .char_indices()
+                        .nth(*cursor - 1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
                     value.remove(byte_pos);
                     *cursor -= 1;
                     *results = Vec::new();
@@ -453,8 +494,14 @@ fn handle_key(
                 }
             }
             KeyCode::Char(ch) => {
-                if let Modal::SearchPicker { value, cursor, searching, results, selected, .. } =
-                    &mut app.modal
+                if let Modal::SearchPicker {
+                    value,
+                    cursor,
+                    searching,
+                    results,
+                    selected,
+                    ..
+                } = &mut app.modal
                 {
                     let byte_pos = value
                         .char_indices()
@@ -735,9 +782,16 @@ fn handle_input_confirm(
                 let _ = tx.try_send(AppEvent::BrowseRepo(value));
             }
         }
-        InputAction::EnterPassword { profile_name, username } => {
+        InputAction::EnterPassword {
+            profile_name,
+            username,
+        } => {
             if !value.is_empty() {
-                let _ = tx.try_send(AppEvent::PasswordEntered { profile_name, username, password: value });
+                let _ = tx.try_send(AppEvent::PasswordEntered {
+                    profile_name,
+                    username,
+                    password: value,
+                });
             }
         }
     }
@@ -979,7 +1033,12 @@ fn spawn_repos_fetch(client: RegistryClient, cursor: Option<String>, tx: mpsc::S
             }
             Err(e) => {
                 let auth_failed = matches!(e, RegistryError::Unauthorized);
-                let _ = tx.send(AppEvent::ReposError { msg: e.to_string(), auth_failed }).await;
+                let _ = tx
+                    .send(AppEvent::ReposError {
+                        msg: e.to_string(),
+                        auth_failed,
+                    })
+                    .await;
             }
         }
     });

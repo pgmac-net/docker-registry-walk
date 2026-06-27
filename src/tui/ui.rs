@@ -330,7 +330,11 @@ fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, cursor: us
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
 
-    let split = value.char_indices().nth(cursor).map(|(i, _)| i).unwrap_or(value.len());
+    let split = value
+        .char_indices()
+        .nth(cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(value.len());
     let display = format!("{}{}{}", &value[..split], '|', &value[split..]);
     let text = format!("{display}\n\n[Enter] Confirm  [Esc] Cancel");
     let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
@@ -350,7 +354,11 @@ fn draw_search_picker_modal(
 ) {
     let width = 70u16.min(area.width.saturating_sub(4));
     let result_rows = (results.len() as u16).min(10);
-    let height = if results.is_empty() { 5 } else { result_rows + 5 };
+    let height = if results.is_empty() {
+        5
+    } else {
+        result_rows + 5
+    };
     let height = height.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -369,7 +377,11 @@ fn draw_search_picker_modal(
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(modal_area);
 
-    let split = value.char_indices().nth(cursor).map(|(i, _)| i).unwrap_or(value.len());
+    let split = value
+        .char_indices()
+        .nth(cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(value.len());
     let display = format!("{}{}{}", &value[..split], '|', &value[split..]);
     let input = Paragraph::new(display).block(
         Block::default()
