@@ -65,3 +65,8 @@ One file per image operation (`copy`, `delete`, `diff`, `export`, `inspect`, `pr
 - Stable release: push a tag matching `v<major>.<minor>.<patch>` — triggers `.github/workflows/release.yml`, builds four platform binaries, creates a GitHub release.
 - Pre-release: tag `v<major>.<minor>.<patch>-rc<N>` — same flow, marked as pre-release.
 - CI on PRs: runs `clippy`, `cargo test`, and `cargo build --release` across Linux, macOS, and Windows (Windows is `allow_failure: true`).
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+<!-- SPECKIT END -->
