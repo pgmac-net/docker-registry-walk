@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":disableDependencyDashboard",
+    ":semanticCommitsDisabled"
+  ],
+  "labels": ["dependencies"],
+  "schedule": ["before 9am on monday"],
+  "timezone": "Australia/Brisbane",
+  "packageRules": [
+    {
+      "description": "Group Rust crate dev-dependencies together",
+      "matchManagers": ["cargo"],
+      "matchDepTypes": ["dev-dependencies"],
+      "groupName": "Rust dev dependencies"
+    },
+    {
+      "description": "Group Tokio ecosystem updates",
+      "matchPackagePrefixes": ["tokio"],
+      "groupName": "Tokio"
+    },
+    {
+      "description": "Auto-merge patch and minor Rust crate updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": true
+    }
+  ]
+}
