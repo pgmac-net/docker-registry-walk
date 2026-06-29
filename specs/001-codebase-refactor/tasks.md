@@ -32,7 +32,7 @@ All source under `src/tui/`. No new directories.
 
 **Purpose**: Confirm baseline is green before any changes.
 
-- [ ] T001 Verify baseline passes all gates: `cargo build && cargo clippy -- -D warnings && cargo test && cargo fmt --check`
+- [X] T001 Verify baseline passes all gates: `cargo build && cargo clippy -- -D warnings && cargo test && cargo fmt --check`
 
 **Checkpoint**: All four commands exit 0. Do not proceed if any fail.
 
@@ -47,14 +47,14 @@ unit tests (Phase 3) and the event loop move (Phase 4).
 
 **⚠️ CRITICAL**: No Phase 3 or Phase 4 work can begin until this phase is complete.
 
-- [ ] T002 [P] Add `App::copy_pull_url(&mut self)` to `src/tui/app.rs` — move logic from `handle_copy()` in `src/tui/mod.rs` (calls `crate::clipboard::copy_to_clipboard`, sets status)
-- [ ] T003 [P] Add `App::start_copy_image(&mut self)` to `src/tui/app.rs` — move logic from `handle_copy_image()` in `src/tui/mod.rs` (sets `Modal::Input` for copy destination)
-- [ ] T004 [P] Add `App::start_retag(&mut self)` to `src/tui/app.rs` — move logic from `handle_retag()` in `src/tui/mod.rs` (sets `Modal::Input` for new tag name)
-- [ ] T005 [P] Add `App::start_registry_select(&mut self)` to `src/tui/app.rs` — move logic from `handle_registry_select()` in `src/tui/mod.rs` (sets `Modal::RegistrySelect`)
-- [ ] T006 [P] Add `App::start_delete(&mut self)` to `src/tui/app.rs` — move logic from `handle_delete()` in `src/tui/mod.rs` (sets `Modal::Confirm` for manifest deletion)
-- [ ] T007 [P] Add `App::start_export(&mut self)` to `src/tui/app.rs` — move logic from `handle_export()` in `src/tui/mod.rs` (sets `Modal::Input` for export path)
-- [ ] T008 [P] Add `App::start_diff(&mut self)` to `src/tui/app.rs` — move logic from `handle_diff()` in `src/tui/mod.rs` (sets `Modal::Input` for diff target tag)
-- [ ] T009 Update `handle_key()` in `src/tui/mod.rs` to call the new App methods (`app.start_copy_image()`, `app.start_retag()`, `app.start_registry_select()`, `app.start_delete()`, `app.start_export()`, `app.start_diff()`, `app.copy_pull_url()`) — remove the original free functions once call sites are updated (depends on T002–T008)
+- [X] T002 [P] Add `App::copy_pull_url(&mut self)` to `src/tui/app.rs` — move logic from `handle_copy()` in `src/tui/mod.rs` (calls `crate::clipboard::copy_to_clipboard`, sets status)
+- [X] T003 [P] Add `App::start_copy_image(&mut self)` to `src/tui/app.rs` — move logic from `handle_copy_image()` in `src/tui/mod.rs` (sets `Modal::Input` for copy destination)
+- [X] T004 [P] Add `App::start_retag(&mut self)` to `src/tui/app.rs` — move logic from `handle_retag()` in `src/tui/mod.rs` (sets `Modal::Input` for new tag name)
+- [X] T005 [P] Add `App::start_registry_select(&mut self)` to `src/tui/app.rs` — move logic from `handle_registry_select()` in `src/tui/mod.rs` (sets `Modal::RegistrySelect`)
+- [X] T006 [P] Add `App::start_delete(&mut self)` to `src/tui/app.rs` — move logic from `handle_delete()` in `src/tui/mod.rs` (sets `Modal::Confirm` for manifest deletion)
+- [X] T007 [P] Add `App::start_export(&mut self)` to `src/tui/app.rs` — move logic from `handle_export()` in `src/tui/mod.rs` (sets `Modal::Input` for export path)
+- [X] T008 [P] Add `App::start_diff(&mut self)` to `src/tui/app.rs` — move logic from `handle_diff()` in `src/tui/mod.rs` (sets `Modal::Input` for diff target tag)
+- [X] T009 Update `handle_key()` in `src/tui/mod.rs` to call the new App methods (`app.start_copy_image()`, `app.start_retag()`, `app.start_registry_select()`, `app.start_delete()`, `app.start_export()`, `app.start_diff()`, `app.copy_pull_url()`) — remove the original free functions once call sites are updated (depends on T002–T008)
 
 **Checkpoint**: `cargo build && cargo clippy -- -D warnings && cargo test` all pass.
 `grep "fn handle_copy\|fn handle_retag\|fn handle_delete\|fn handle_export\|fn handle_diff\|fn handle_registry" src/tui/mod.rs` returns no matches.
@@ -73,19 +73,19 @@ loop migration. They must be green before any code moves to `event.rs`.
 **Independent Test**: `cargo test tui::app` passes in < 1 second with no external
 dependencies.
 
-- [ ] T010 [P] [US3] Add `#[cfg(test)]` block to `src/tui/app.rs` with helper `fn make_app()` that builds a minimal `App` with one dummy profile
-- [ ] T011 [P] [US3] Add test `new_initial_state` in `src/tui/app.rs` — asserts `focus == Focus::Repos`, `repos` empty, `modal == Modal::None`, `should_quit == false`
-- [ ] T012 [P] [US3] Add test `scroll_down_up_repos` in `src/tui/app.rs` — populates `repos`, calls `scroll_down()`, asserts selection moves; calls `scroll_up()`, asserts returns to 0
-- [ ] T013 [P] [US3] Add test `filter_push_pop_clear` in `src/tui/app.rs` — sets `filter_mode`, calls `push_filter_char('a')`, asserts `repo_filter == "a"`; calls `pop_filter_char()`, asserts empty; calls `clear_active_filter()`, asserts `filter_mode == None`
-- [ ] T014 [P] [US3] Add test `on_repos_page_appends` in `src/tui/app.rs` — calls `on_repos_page(vec!["r1","r2"], false)`, asserts `repos == ["r1","r2"]`, `repo_load == LoadState::Idle`
-- [ ] T015 [P] [US3] Add test `on_repos_page_twice_appends` in `src/tui/app.rs` — calls `on_repos_page` twice, asserts repos accumulate across pages
-- [ ] T016 [P] [US3] Add test `on_tags_page_ignores_stale_repo` in `src/tui/app.rs` — sets `current_repo = Some("r1")`, calls `on_tags_page("r2", ...)`, asserts tags remain empty
-- [ ] T017 [P] [US3] Add test `start_tags_load_resets_state` in `src/tui/app.rs` — pre-populate tags, call `start_tags_load("repo")`, assert `tags` empty, `tag_load == LoadState::Loading`, `current_repo == Some("repo")`
-- [ ] T018 [P] [US3] Add test `start_registry_switch_resets_all` in `src/tui/app.rs` — pre-populate repos+tags, call `start_registry_switch(0)`, assert repos/tags/detail all cleared, `focus == Focus::Repos`
-- [ ] T019 [P] [US3] Add test `tick_increments_spinner` in `src/tui/app.rs` — call `tick()`, assert `spinner_tick == 1`; call `tick()` again, assert `spinner_tick == 2`
-- [ ] T020 [P] [US3] Add test `start_copy_image_sets_modal` in `src/tui/app.rs` — set `current_repo` and select a tag, call `start_copy_image()`, assert `modal` is `Modal::Input` with `on_confirm == InputAction::CopyImage {..}`
-- [ ] T021 [P] [US3] Add test `start_retag_sets_modal` in `src/tui/app.rs` — set `current_repo` and select a tag, call `start_retag()`, assert `modal` is `Modal::Input` with `on_confirm == InputAction::Retag {..}`
-- [ ] T022 [P] [US3] Add test `start_delete_sets_confirm_modal` in `src/tui/app.rs` — set `focus = Focus::Tags`, select a tag, call `start_delete()`, assert `modal` is `Modal::Confirm { on_confirm: ConfirmAction::DeleteManifest {..} }`
+- [X] T010 [P] [US3] Add `#[cfg(test)]` block to `src/tui/app.rs` with helper `fn make_app()` that builds a minimal `App` with one dummy profile
+- [X] T011 [P] [US3] Add test `new_initial_state` in `src/tui/app.rs` — asserts `focus == Focus::Repos`, `repos` empty, `modal == Modal::None`, `should_quit == false`
+- [X] T012 [P] [US3] Add test `scroll_down_up_repos` in `src/tui/app.rs` — populates `repos`, calls `scroll_down()`, asserts selection moves; calls `scroll_up()`, asserts returns to 0
+- [X] T013 [P] [US3] Add test `filter_push_pop_clear` in `src/tui/app.rs` — sets `filter_mode`, calls `push_filter_char('a')`, asserts `repo_filter == "a"`; calls `pop_filter_char()`, asserts empty; calls `clear_active_filter()`, asserts `filter_mode == None`
+- [X] T014 [P] [US3] Add test `on_repos_page_appends` in `src/tui/app.rs` — calls `on_repos_page(vec!["r1","r2"], false)`, asserts `repos == ["r1","r2"]`, `repo_load == LoadState::Idle`
+- [X] T015 [P] [US3] Add test `on_repos_page_twice_appends` in `src/tui/app.rs` — calls `on_repos_page` twice, asserts repos accumulate across pages
+- [X] T016 [P] [US3] Add test `on_tags_page_ignores_stale_repo` in `src/tui/app.rs` — sets `current_repo = Some("r1")`, calls `on_tags_page("r2", ...)`, asserts tags remain empty
+- [X] T017 [P] [US3] Add test `start_tags_load_resets_state` in `src/tui/app.rs` — pre-populate tags, call `start_tags_load("repo")`, assert `tags` empty, `tag_load == LoadState::Loading`, `current_repo == Some("repo")`
+- [X] T018 [P] [US3] Add test `start_registry_switch_resets_all` in `src/tui/app.rs` — pre-populate repos+tags, call `start_registry_switch(0)`, assert repos/tags/detail all cleared, `focus == Focus::Repos`
+- [X] T019 [P] [US3] Add test `tick_increments_spinner` in `src/tui/app.rs` — call `tick()`, assert `spinner_tick == 1`; call `tick()` again, assert `spinner_tick == 2`
+- [X] T020 [P] [US3] Add test `start_copy_image_sets_modal` in `src/tui/app.rs` — set `current_repo` and select a tag, call `start_copy_image()`, assert `modal` is `Modal::Input` with `on_confirm == InputAction::CopyImage {..}`
+- [X] T021 [P] [US3] Add test `start_retag_sets_modal` in `src/tui/app.rs` — set `current_repo` and select a tag, call `start_retag()`, assert `modal` is `Modal::Input` with `on_confirm == InputAction::Retag {..}`
+- [X] T022 [P] [US3] Add test `start_delete_sets_confirm_modal` in `src/tui/app.rs` — set `focus = Focus::Tags`, select a tag, call `start_delete()`, assert `modal` is `Modal::Confirm { on_confirm: ConfirmAction::DeleteManifest {..} }`
 
 **Checkpoint**: `cargo test tui::app` shows ≥ 12 tests, all pass. No terminal opened.
 
@@ -100,16 +100,16 @@ dependencies.
 
 **Prerequisites**: Phase 2 complete, Phase 3 green.
 
-- [ ] T023 Move constants `TICK_MS` and `PAGE_SIZE` from `src/tui/mod.rs` to top of `src/tui/event.rs`; move `make_client_for_profile()` from `src/tui/mod.rs` to `src/tui/event.rs` as a private `fn`
-- [ ] T024 [US1] Move `event_loop()` from `src/tui/mod.rs` to `src/tui/event.rs` as `pub(super) async fn event_loop(...)` — update `src/tui/mod.rs` `run()` to call `event::event_loop(...)`
-- [ ] T025 [US1] Move `handle_event()` from `src/tui/mod.rs` to `src/tui/event.rs` as a private `fn` (update imports as needed)
-- [ ] T026 [US1] Move `handle_key()` from `src/tui/mod.rs` to `src/tui/event.rs` as a private `fn`
-- [ ] T027 [P] [US1] Move `handle_enter()`, `handle_inspect()`, `handle_prune()` from `src/tui/mod.rs` to `src/tui/event.rs` as private `fn`s
-- [ ] T028 [P] [US1] Move `handle_confirm()`, `handle_input_confirm()` from `src/tui/mod.rs` to `src/tui/event.rs` as private `fn`s
-- [ ] T029 [P] [US1] Move `spawn_copy()`, `spawn_retag()`, `spawn_delete()`, `spawn_inspect()` from `src/tui/mod.rs` to `src/tui/event.rs`
-- [ ] T030 [P] [US1] Move `spawn_prune_find()`, `spawn_prune()`, `spawn_export()`, `spawn_diff()` from `src/tui/mod.rs` to `src/tui/event.rs`
-- [ ] T031 [P] [US1] Move `spawn_repos_fetch()`, `spawn_tags_fetch()`, `spawn_detail_fetch()`, `spawn_dockerhub_search()` from `src/tui/mod.rs` to `src/tui/event.rs`
-- [ ] T032 [US1] Remove all moved code and now-unused imports from `src/tui/mod.rs`; verify line count ≤ 80
+- [X] T023 Move constants `TICK_MS` and `PAGE_SIZE` from `src/tui/mod.rs` to top of `src/tui/event.rs`; move `make_client_for_profile()` from `src/tui/mod.rs` to `src/tui/event.rs` as a private `fn`
+- [X] T024 [US1] Move `event_loop()` from `src/tui/mod.rs` to `src/tui/event.rs` as `pub(super) async fn event_loop(...)` — update `src/tui/mod.rs` `run()` to call `event::event_loop(...)`
+- [X] T025 [US1] Move `handle_event()` from `src/tui/mod.rs` to `src/tui/event.rs` as a private `fn` (update imports as needed)
+- [X] T026 [US1] Move `handle_key()` from `src/tui/mod.rs` to `src/tui/event.rs` as a private `fn`
+- [X] T027 [P] [US1] Move `handle_enter()`, `handle_inspect()`, `handle_prune()` from `src/tui/mod.rs` to `src/tui/event.rs` as private `fn`s
+- [X] T028 [P] [US1] Move `handle_confirm()`, `handle_input_confirm()` from `src/tui/mod.rs` to `src/tui/event.rs` as private `fn`s
+- [X] T029 [P] [US1] Move `spawn_copy()`, `spawn_retag()`, `spawn_delete()`, `spawn_inspect()` from `src/tui/mod.rs` to `src/tui/event.rs`
+- [X] T030 [P] [US1] Move `spawn_prune_find()`, `spawn_prune()`, `spawn_export()`, `spawn_diff()` from `src/tui/mod.rs` to `src/tui/event.rs`
+- [X] T031 [P] [US1] Move `spawn_repos_fetch()`, `spawn_tags_fetch()`, `spawn_detail_fetch()`, `spawn_dockerhub_search()` from `src/tui/mod.rs` to `src/tui/event.rs`
+- [X] T032 [US1] Remove all moved code and now-unused imports from `src/tui/mod.rs`; verify line count ≤ 80
 
 **Checkpoint**: `wc -l src/tui/mod.rs` ≤ 80. `grep -c "tokio::spawn" src/tui/mod.rs` = 0. `cargo build && cargo clippy -- -D warnings && cargo test` all pass.
 
@@ -124,8 +124,8 @@ and makes the extension pattern explicit.
 **Independent Test**: A developer can locate where to wire a new op in `src/tui/event.rs`
 within 2 minutes of reading the file.
 
-- [ ] T033 [P] [US2] Add a section comment `// — Operation dispatch —` in `src/tui/event.rs` immediately before the block in `handle_event()` where op result events (`CopySuccess`, `RetagSuccess`, `DeleteTagSuccess`, etc.) are handled
-- [ ] T034 [P] [US2] Add a section comment `// — Async task spawners —` in `src/tui/event.rs` immediately before the first `spawn_*` function — marks the canonical location for wiring new operations
+- [X] T033 [P] [US2] Add a section comment `// — Operation dispatch —` in `src/tui/event.rs` immediately before the block in `handle_event()` where op result events (`CopySuccess`, `RetagSuccess`, `DeleteTagSuccess`, etc.) are handled
+- [X] T034 [P] [US2] Add a section comment `// — Async task spawners —` in `src/tui/event.rs` immediately before the first `spawn_*` function — marks the canonical location for wiring new operations
 
 **Checkpoint**: `grep "Operation dispatch\|Async task spawners" src/tui/event.rs` shows both markers. Adding a new op requires: one new file in `src/ops/`, one line in `src/ops/mod.rs`, one match arm in `handle_event()`, one `spawn_*` function — all in ≤ 3 files.
 
@@ -136,10 +136,10 @@ within 2 minutes of reading the file.
 **Purpose**: Remove the dead code suppressors now that all methods have callers and
 tests. Final gate validation.
 
-- [ ] T035 Remove `#![allow(dead_code)]` from `src/tui/app.rs`
-- [ ] T036 Remove `#![allow(dead_code)]` from `src/tui/event.rs`
-- [ ] T037 Fix any warnings revealed by suppressor removal (unused imports, unreachable variants) in `src/tui/app.rs` and `src/tui/event.rs`
-- [ ] T038 [P] Run full gate validation per `specs/001-codebase-refactor/quickstart.md`: `cargo build && cargo clippy -- -D warnings && cargo test && cargo fmt --check`
+- [X] T035 Remove `#![allow(dead_code)]` from `src/tui/app.rs`
+- [X] T036 Remove `#![allow(dead_code)]` from `src/tui/event.rs`
+- [X] T037 Fix any warnings revealed by suppressor removal (unused imports, unreachable variants) in `src/tui/app.rs` and `src/tui/event.rs`
+- [X] T038 [P] Run full gate validation per `specs/001-codebase-refactor/quickstart.md`: `cargo build && cargo clippy -- -D warnings && cargo test && cargo fmt --check`
 - [ ] T039 [P] Manual smoke test per `specs/001-codebase-refactor/quickstart.md` — exercise all 13 key flows listed there
 
 **Checkpoint**: All four commands pass. Manual test shows no functional regressions.
