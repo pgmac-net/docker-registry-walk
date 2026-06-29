@@ -1,9 +1,8 @@
-#![allow(dead_code)]
-
 use std::time::{Duration, Instant};
 
 use ratatui::widgets::ListState;
 
+use crate::clipboard;
 use crate::config::RegistryProfile;
 use crate::ops::diff::DiffLayer;
 
@@ -76,7 +75,6 @@ pub struct InspectModal {
 
 #[derive(Debug)]
 pub struct LayerDiffModal {
-    pub repo: String,
     pub tag_a: String,
     pub tag_b: String,
     pub layers: Vec<DiffLayer>,
@@ -329,14 +327,6 @@ impl App {
     pub fn on_detail_error(&mut self, msg: String) {
         self.detail_load = LoadState::Error(msg.clone());
         self.set_status(format!("Detail error: {msg}"));
-    }
-
-    pub fn scroll_detail(&mut self, delta: isize, max_scroll: usize) {
-        if delta < 0 {
-            self.detail_scroll = self.detail_scroll.saturating_sub((-delta) as usize);
-        } else {
-            self.detail_scroll = (self.detail_scroll + delta as usize).min(max_scroll);
-        }
     }
 
     pub fn start_tags_load(&mut self, repo: String) {
@@ -634,5 +624,357 @@ impl App {
         {
             self.status = None;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Modal-setup handlers (pure state, no async dependencies)
+    // ------------------------------------------------------------------
+
+    pub fn copy_pull_url(&mut self) {
+        let Some(pull_url) = self.detail.as_ref().map(|d| d.pull_url.clone()) else {
+            return;
+        };
+        match clipboard::copy_to_clipboard(&pull_url) {
+            Ok(()) => self.set_status(format!("✓ Copied: {pull_url}")),
+            Err(e) => self.set_status(format!("Clipboard error: {e}")),
+        }
+    }
+
+    pub fn start_copy_image(&mut self) {
+        let Some(tag) = self.selected_tag().map(str::to_owned) else {
+            return;
+        };
+        let Some(repo) = self.current_repo.clone() else {
+            return;
+        };
+        let prefilled = format!("{repo}:{tag}");
+        self.modal = Modal::Input {
+            prompt: "Copy to (repo:tag):".to_owned(),
+            value: prefilled,
+            cursor: 0,
+            on_confirm: InputAction::CopyImage {
+                src_repo: repo,
+                src_tag: tag,
+            },
+        };
+    }
+
+    pub fn start_retag(&mut self) {
+        let Some(tag) = self.selected_tag().map(str::to_owned) else {
+            return;
+        };
+        let Some(repo) = self.current_repo.clone() else {
+            return;
+        };
+        self.modal = Modal::Input {
+            prompt: format!("New tag for '{repo}:{tag}':"),
+            value: String::new(),
+            cursor: 0,
+            on_confirm: InputAction::Retag { repo, src_tag: tag },
+        };
+    }
+
+    pub fn start_registry_select(&mut self) {
+        let current = self.active_profile_idx;
+        self.modal = Modal::RegistrySelect {
+            selected_idx: current,
+        };
+    }
+
+    pub fn start_delete(&mut self) {
+        if self.focus == Focus::Tags
+            && let Some(tag) = self.selected_tag().map(str::to_owned)
+            && let Some(repo) = self.current_repo.clone()
+        {
+            let msg = format!("Delete '{repo}:{tag}'?");
+            self.modal = Modal::Confirm {
+                message: msg,
+                on_confirm: ConfirmAction::DeleteManifest { repo, tag },
+            };
+        }
+    }
+
+    pub fn start_export(&mut self) {
+        let Some(tag) = self.selected_tag().map(str::to_owned) else {
+            return;
+        };
+        let Some(repo) = self.current_repo.clone() else {
+            return;
+        };
+        let default_path = format!("{}-{}.tar", repo.replace('/', "-"), tag);
+        self.modal = Modal::Input {
+            prompt: "Export OCI tar to:".to_owned(),
+            value: default_path,
+            cursor: 0,
+            on_confirm: InputAction::Export { repo, tag },
+        };
+    }
+
+    pub fn start_diff(&mut self) {
+        let Some(tag) = self.selected_tag().map(str::to_owned) else {
+            return;
+        };
+        let Some(repo) = self.current_repo.clone() else {
+            return;
+        };
+        self.modal = Modal::Input {
+            prompt: format!("Diff '{tag}' against tag:"),
+            value: String::new(),
+            cursor: 0,
+            on_confirm: InputAction::DiffAgainst { repo, tag_a: tag },
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{RegistryProfile, RegistryType};
+
+    fn make_app() -> App {
+        let profile = RegistryProfile {
+            name: "test".to_owned(),
+            url: "http://localhost:5000".to_owned(),
+            username: None,
+            registry_type: RegistryType::Standard,
+        };
+        App::new(vec![profile], 0)
+    }
+
+    fn make_app_with_repos(repos: Vec<&str>) -> App {
+        let mut app = make_app();
+        app.on_repos_page(repos.into_iter().map(str::to_owned).collect(), false);
+        app
+    }
+
+    fn make_app_with_tags(repo: &str, tags: Vec<&str>) -> App {
+        let mut app = make_app();
+        app.start_tags_load(repo.to_owned());
+        app.on_tags_page(
+            repo.to_owned(),
+            tags.into_iter().map(str::to_owned).collect(),
+            false,
+        );
+        app
+    }
+
+    #[test]
+    fn new_initial_state() {
+        let app = make_app();
+        assert_eq!(app.focus, Focus::Repos);
+        assert!(!app.should_quit);
+        assert!(app.repos.is_empty());
+        assert!(app.tags.is_empty());
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.repo_load, LoadState::Idle);
+        assert_eq!(app.tag_load, LoadState::Idle);
+        assert_eq!(app.spinner_tick, 0);
+        assert!(app.current_repo.is_none());
+    }
+
+    #[test]
+    fn scroll_down_up_repos() {
+        let mut app = make_app_with_repos(vec!["a", "b", "c"]);
+        assert_eq!(app.repos_state.selected(), Some(0));
+        app.scroll_down();
+        assert_eq!(app.repos_state.selected(), Some(1));
+        app.scroll_up();
+        assert_eq!(app.repos_state.selected(), Some(0));
+        // scroll_up at top stays at 0
+        app.scroll_up();
+        assert_eq!(app.repos_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn filter_push_pop_clear() {
+        // "crow" contains no 'a', so only alpha+aleph match
+        let mut app = make_app_with_repos(vec!["alpha", "crow", "aleph"]);
+        app.filter_mode = Some(Focus::Repos);
+
+        app.push_filter_char('a');
+        assert_eq!(app.repo_filter, "a");
+        assert_eq!(app.repos.len(), 2); // alpha, aleph
+
+        app.push_filter_char('l');
+        assert_eq!(app.repo_filter, "al");
+        assert_eq!(app.repos.len(), 2); // alpha, aleph
+
+        app.pop_filter_char();
+        assert_eq!(app.repo_filter, "a");
+
+        app.clear_active_filter();
+        assert_eq!(app.repo_filter, "");
+        assert!(app.filter_mode.is_none());
+        assert_eq!(app.repos.len(), 3);
+    }
+
+    #[test]
+    fn on_repos_page_populates_list() {
+        let mut app = make_app();
+        app.on_repos_page(vec!["r1".to_owned(), "r2".to_owned()], false);
+        assert_eq!(app.repos, vec!["r1", "r2"]);
+        assert_eq!(app.repo_load, LoadState::Idle);
+        assert!(!app.repos_has_more);
+    }
+
+    #[test]
+    fn on_repos_page_twice_accumulates() {
+        let mut app = make_app();
+        app.on_repos_page(vec!["r1".to_owned()], true);
+        app.on_repos_page(vec!["r2".to_owned()], false);
+        assert_eq!(app.repos, vec!["r1", "r2"]);
+        assert!(!app.repos_has_more);
+    }
+
+    #[test]
+    fn on_tags_page_ignores_stale_repo() {
+        let mut app = make_app();
+        app.start_tags_load("r1".to_owned());
+        app.on_tags_page("r2".to_owned(), vec!["latest".to_owned()], false);
+        assert!(app.tags.is_empty());
+        assert_eq!(app.tag_load, LoadState::Loading);
+    }
+
+    #[test]
+    fn start_tags_load_resets_state() {
+        let mut app = make_app_with_tags("old", vec!["v1"]);
+        assert!(!app.tags.is_empty());
+
+        app.start_tags_load("new".to_owned());
+        assert!(app.tags.is_empty());
+        assert_eq!(app.tag_load, LoadState::Loading);
+        assert_eq!(app.current_repo.as_deref(), Some("new"));
+        assert!(app.detail.is_none());
+    }
+
+    #[test]
+    fn start_registry_switch_resets_all() {
+        let profile_a = RegistryProfile {
+            name: "a".to_owned(),
+            url: "http://a:5000".to_owned(),
+            username: None,
+            registry_type: RegistryType::Standard,
+        };
+        let profile_b = RegistryProfile {
+            name: "b".to_owned(),
+            url: "http://b:5000".to_owned(),
+            username: None,
+            registry_type: RegistryType::Standard,
+        };
+        let mut app = App::new(vec![profile_a, profile_b], 0);
+        app.on_repos_page(vec!["r1".to_owned()], false);
+        app.start_tags_load("r1".to_owned());
+        app.on_tags_page("r1".to_owned(), vec!["v1".to_owned()], false);
+
+        app.start_registry_switch(1);
+
+        assert!(app.repos.is_empty());
+        assert!(app.tags.is_empty());
+        assert!(app.current_repo.is_none());
+        assert_eq!(app.focus, Focus::Repos);
+        assert_eq!(app.active_profile_idx, 1);
+        assert_eq!(app.registry_name, "b");
+    }
+
+    #[test]
+    fn tick_increments_spinner() {
+        let mut app = make_app();
+        assert_eq!(app.spinner_tick, 0);
+        app.tick();
+        assert_eq!(app.spinner_tick, 1);
+        app.tick();
+        assert_eq!(app.spinner_tick, 2);
+    }
+
+    #[test]
+    fn tick_expires_status() {
+        use std::time::{Duration, Instant};
+        let mut app = make_app();
+        app.status = Some(StatusMessage {
+            text: "hello".to_owned(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        });
+        app.tick();
+        assert!(app.status_text().is_none());
+    }
+
+    #[test]
+    fn start_copy_image_sets_modal() {
+        let mut app = make_app_with_tags("myrepo", vec!["v1"]);
+        app.start_copy_image();
+        assert!(matches!(
+            app.modal,
+            Modal::Input {
+                ref on_confirm,
+                ..
+            } if matches!(on_confirm, InputAction::CopyImage { src_repo, src_tag }
+                if src_repo == "myrepo" && src_tag == "v1")
+        ));
+    }
+
+    #[test]
+    fn start_copy_image_noop_without_tag() {
+        let mut app = make_app();
+        app.start_copy_image();
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn start_retag_sets_modal() {
+        let mut app = make_app_with_tags("myrepo", vec!["v1"]);
+        app.start_retag();
+        assert!(matches!(
+            app.modal,
+            Modal::Input {
+                ref on_confirm,
+                ..
+            } if matches!(on_confirm, InputAction::Retag { repo, src_tag }
+                if repo == "myrepo" && src_tag == "v1")
+        ));
+    }
+
+    #[test]
+    fn start_delete_sets_confirm_modal() {
+        let mut app = make_app_with_tags("myrepo", vec!["v1"]);
+        app.focus = Focus::Tags;
+        app.start_delete();
+        assert!(matches!(
+            app.modal,
+            Modal::Confirm {
+                ref on_confirm,
+                ..
+            } if matches!(on_confirm, ConfirmAction::DeleteManifest { repo, tag }
+                if repo == "myrepo" && tag == "v1")
+        ));
+    }
+
+    #[test]
+    fn start_delete_noop_when_not_tags_focus() {
+        let mut app = make_app_with_tags("myrepo", vec!["v1"]);
+        app.focus = Focus::Repos;
+        app.start_delete();
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn should_load_more_repos_when_has_more() {
+        let mut app = make_app();
+        app.on_repos_page(vec!["r1".to_owned()], true);
+        // selected=0, repos.len()=1, LOAD_AHEAD=20 → 0+20 >= 1 → true
+        assert!(app.should_load_more_repos());
+    }
+
+    #[test]
+    fn should_load_more_repos_false_when_no_more() {
+        let mut app = make_app();
+        app.on_repos_page(vec!["r1".to_owned()], false);
+        assert!(!app.should_load_more_repos());
+    }
+
+    #[test]
+    fn should_load_more_tags_when_has_more() {
+        let mut app = make_app_with_tags("r", vec!["v1"]);
+        app.tags_has_more = true;
+        assert!(app.should_load_more_tags());
     }
 }

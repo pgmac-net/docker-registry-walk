@@ -24,3 +24,8 @@ target
 # Added by cargo
 
 /target
+
+# Env files, logs, IDE dirs
+.env*
+*.log
+.idea/
