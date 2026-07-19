@@ -23,9 +23,11 @@ struct Cli {
     #[arg(long)]
     username: Option<String>,
 
-    /// Password for the registry. Written to the OS keyring — never to the config file.
+    /// Prompt for the registry password (masked) and store it in the OS
+    /// keyring. Takes no value — pass just `--password`, never
+    /// `--password=<secret>`, so the secret never lands in shell history.
     #[arg(long)]
-    password: Option<String>,
+    password: bool,
 }
 
 #[tokio::main]
@@ -65,21 +67,23 @@ async fn main() -> anyhow::Result<()> {
         config.default_idx()
     };
 
-    // Save password to keyring — never to config file.
-    if let Some(password) = &cli.password {
+    // Prompt for the password (masked) and save it to the keyring — never
+    // to the config file, and never passed as a CLI argument.
+    if cli.password {
         let profile_name = config
             .registry
             .get(initial_idx)
             .map(|p| p.name.as_str())
             .unwrap_or("cli");
-        let service = format!("docker-registry-walk/{profile_name}");
         let username = config
             .registry
             .get(initial_idx)
             .and_then(|p| p.username.as_deref())
             .or(cli.username.as_deref())
-            .unwrap_or("default");
-        keyring::Entry::new(&service, username)?.set_password(password)?;
+            .unwrap_or("default")
+            .to_owned();
+        let password = registry::prompt_password(&username)?;
+        registry::KeyringStore::new(profile_name).set_password(&username, &password)?;
     }
 
     tui::run(config.registry, initial_idx).await

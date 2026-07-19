@@ -11,8 +11,8 @@ use crate::registry::{
     error::{RegistryError, Result},
     pagination::parse_next_link,
     types::{
-        BlobInfo, Catalog, ImageManifest, MANIFEST_ACCEPT, Manifest, ManifestIndex,
-        ManifestResponse, TagList, UploadLocation,
+        ArtifactoryRepo, BlobInfo, Catalog, ImageManifest, MANIFEST_ACCEPT, Manifest,
+        ManifestIndex, ManifestResponse, TagList, UploadLocation,
     },
 };
 
@@ -61,7 +61,7 @@ impl RegistryClient {
     pub fn new(base_url: Url) -> Self {
         Self {
             http: Client::new(),
-            base_url,
+            base_url: normalize_base(base_url),
             creds: Arc::new(NoCredentials),
         }
     }
@@ -71,12 +71,33 @@ impl RegistryClient {
         self
     }
 
+    /// The registry's base URL (normalized with a trailing `/` path).
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    /// A client scoped to `<base>/api/docker/<repo_key>/`, sharing this
+    /// client's HTTP client and credentials.
+    ///
+    /// Used to browse a single Docker repository hosted on a JFrog
+    /// Artifactory instance (the "Repository Path Method"), where
+    /// `self.base_url` points at the Artifactory server root rather than a
+    /// `/v2/` root.
+    pub fn for_artifactory_repo(&self, repo_key: &str) -> Result<RegistryClient> {
+        let scoped = join_path(&self.base_url, &format!("api/docker/{repo_key}/"))?;
+        Ok(RegistryClient {
+            http: self.http.clone(),
+            base_url: normalize_base(scoped),
+            creds: self.creds.clone(),
+        })
+    }
+
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
 
     fn url(&self, path: &str) -> Result<Url> {
-        self.base_url.join(path).map_err(RegistryError::InvalidUrl)
+        join_path(&self.base_url, path)
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<Response> {
@@ -173,6 +194,25 @@ impl RegistryClient {
             }
         }
         Ok(all)
+    }
+
+    /// `GET /api/repositories?packageType=docker` — list Docker repo-keys
+    /// hosted on a JFrog Artifactory instance.
+    ///
+    /// `self.base_url` must be the Artifactory server root (see
+    /// `RegistryType::Artifactory`), not a `/v2/` root.
+    pub async fn artifactory_repositories(&self) -> Result<Vec<ArtifactoryRepo>> {
+        let mut url = self.url("api/repositories")?;
+        url.query_pairs_mut().append_pair("packageType", "docker");
+
+        let resp = self.send(self.http.get(url.clone())).await?;
+        require_success(&resp, &url)?;
+
+        let repos = resp.json::<Vec<ArtifactoryRepo>>().await?;
+        Ok(repos
+            .into_iter()
+            .filter(|r| r.package_type.eq_ignore_ascii_case("docker"))
+            .collect())
     }
 
     /// `GET /v2/<name>/tags/list` — one page of tags for a repository.
@@ -425,6 +465,31 @@ impl RegistryClient {
 // Internal helpers
 // ------------------------------------------------------------------
 
+/// Ensure `base`'s path ends with `/` so `join_path` appends rather than
+/// replaces it (see `join_path`).
+fn normalize_base(mut base: Url) -> Url {
+    if !base.path().ends_with('/') {
+        let path = format!("{}/", base.path());
+        base.set_path(&path);
+    }
+    base
+}
+
+/// Join a request `path` (conventionally written with a leading `/`, e.g.
+/// `"/v2/_catalog"`) onto `base`.
+///
+/// `Url::join` treats a leading-`/` path as an absolute-path reference
+/// (RFC 3986 §5.3), which *replaces* `base`'s path entirely instead of
+/// appending to it. That breaks registries mounted under a URL prefix (e.g.
+/// JFrog Artifactory's `https://host/artifactory/api/docker/<repo>/v2/...`
+/// layout) — the prefix would be silently dropped. Stripping the leading
+/// `/` makes the join relative, so it appends onto `base`'s (trailing-`/`
+/// normalized) path instead.
+fn join_path(base: &Url, path: &str) -> Result<Url> {
+    base.join(path.trim_start_matches('/'))
+        .map_err(RegistryError::InvalidUrl)
+}
+
 fn require_success(resp: &Response, url: &Url) -> Result<()> {
     match resp.status() {
         s if s.is_success() => Ok(()),
@@ -453,5 +518,84 @@ fn parse_manifest(content_type: &str, raw: &[u8]) -> Result<Manifest> {
             })?;
             Ok(Manifest::Image(manifest))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn normalize_base_adds_trailing_slash() {
+        assert_eq!(
+            normalize_base(u("https://registry.example.com")).as_str(),
+            "https://registry.example.com/"
+        );
+        assert_eq!(
+            normalize_base(u("https://host/artifactory/api/docker/myrepo")).as_str(),
+            "https://host/artifactory/api/docker/myrepo/"
+        );
+    }
+
+    #[test]
+    fn normalize_base_leaves_existing_trailing_slash() {
+        assert_eq!(
+            normalize_base(u("https://registry.example.com/")).as_str(),
+            "https://registry.example.com/"
+        );
+    }
+
+    #[test]
+    fn join_path_root_mounted_registry_unaffected() {
+        let base = normalize_base(u("https://registry.example.com"));
+        let joined = join_path(&base, "/v2/_catalog").unwrap();
+        assert_eq!(joined.as_str(), "https://registry.example.com/v2/_catalog");
+    }
+
+    #[test]
+    fn join_path_preserves_url_prefix() {
+        let base = normalize_base(u("https://host/artifactory/api/docker/myrepo"));
+        let joined = join_path(&base, "/v2/_catalog").unwrap();
+        assert_eq!(
+            joined.as_str(),
+            "https://host/artifactory/api/docker/myrepo/v2/_catalog"
+        );
+    }
+
+    #[test]
+    fn join_path_preserves_url_prefix_for_nested_repo_path() {
+        let base = normalize_base(u("https://host/artifactory/api/docker/myrepo"));
+        let joined = join_path(&base, "/v2/library/nginx/tags/list").unwrap();
+        assert_eq!(
+            joined.as_str(),
+            "https://host/artifactory/api/docker/myrepo/v2/library/nginx/tags/list"
+        );
+    }
+
+    #[test]
+    fn registry_client_new_normalizes_base_url() {
+        let client = RegistryClient::new(u("https://host/artifactory/api/docker/myrepo"));
+        assert_eq!(
+            client.base_url().as_str(),
+            "https://host/artifactory/api/docker/myrepo/"
+        );
+    }
+
+    #[test]
+    fn for_artifactory_repo_scopes_base_url() {
+        let client = RegistryClient::new(u("https://artifactory.example.com/artifactory"));
+        let scoped = client.for_artifactory_repo("docker-local").unwrap();
+        assert_eq!(
+            scoped.base_url().as_str(),
+            "https://artifactory.example.com/artifactory/api/docker/docker-local/"
+        );
     }
 }
