@@ -9,8 +9,16 @@ use clap::Parser;
 use config::{Config, RegistryProfile};
 
 #[derive(Parser)]
-#[command(about = "Browse Docker registries from the terminal")]
+#[command(
+    about = "Browse Docker registries from the terminal",
+    version,
+    disable_version_flag = true
+)]
 struct Cli {
+    /// Print version and exit.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    version: (),
+
     /// Registry name from config to open on startup.
     #[arg(long)]
     registry: Option<String>,
