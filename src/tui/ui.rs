@@ -825,6 +825,7 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
         Line::from(vec![key("?"), sep(), desc("This help screen")]),
         Line::from(vec![key("q / Esc"), sep(), desc("Quit")]),
         Line::from(vec![key("Ctrl-C"), sep(), desc("Force quit")]),
+        Line::from(vec![]),
         Line::from(vec![
             Span::styled(
                 "Version",
