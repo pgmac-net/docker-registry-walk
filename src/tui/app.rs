@@ -5,6 +5,7 @@ use ratatui::widgets::ListState;
 use crate::clipboard;
 use crate::config::RegistryProfile;
 use crate::ops::diff::DiffLayer;
+use crate::registry::ArtifactoryRepo;
 
 use super::detail::ImageDetail;
 use super::input::InputState;
@@ -108,6 +109,16 @@ pub enum Modal {
         results: Vec<String>,
         selected: usize,
         searching: bool,
+    },
+    /// Pick which Docker repo-key to browse on a JFrog Artifactory
+    /// instance. `repos` is fetched once (via `/api/repositories`) and
+    /// filtered locally as the user types, unlike `SearchPicker`'s
+    /// incremental server-side search.
+    ArtifactoryPicker {
+        filter: InputState,
+        repos: Vec<ArtifactoryRepo>,
+        selected: usize,
+        loading: bool,
     },
 }
 
@@ -340,20 +351,15 @@ impl App {
         self.current_tag = None;
     }
 
-    /// Clear all repo/tag/detail state when switching registries.
-    pub fn start_registry_switch(&mut self, idx: usize) {
-        self.active_profile_idx = idx;
-        let profile = &self.profiles[idx];
-        self.registry_name = profile.name.clone();
-        self.registry_url = profile.url.clone();
-
+    /// Clear all repo/tag/detail state, keeping neither list nor selection
+    /// from the previous registry (or Artifactory repo-key).
+    fn reset_for_new_registry(&mut self) {
         self.repos_all.clear();
         self.repos.clear();
         self.repos_state.select(Some(0));
         self.repos_cursor = None;
         self.repos_has_more = false;
         self.repo_filter.clear();
-        self.repo_load = LoadState::Loading;
 
         self.tags_all.clear();
         self.tags.clear();
@@ -371,6 +377,85 @@ impl App {
         self.focus = Focus::Repos;
         self.filter_mode = None;
         self.catalog_retry_pending = false;
+    }
+
+    /// Clear all repo/tag/detail state when switching registries.
+    pub fn start_registry_switch(&mut self, idx: usize) {
+        self.active_profile_idx = idx;
+        let profile = &self.profiles[idx];
+        self.registry_name = profile.name.clone();
+        self.registry_url = profile.url.clone();
+        self.reset_for_new_registry();
+        self.repo_load = LoadState::Loading;
+    }
+
+    /// Switch to a JFrog Artifactory profile: clear repo/tag/detail state
+    /// and open the repo-key picker instead of fetching a catalog directly
+    /// (an Artifactory instance's base URL isn't itself a `/v2/` root).
+    pub fn start_artifactory_switch(&mut self, idx: usize) {
+        self.active_profile_idx = idx;
+        let profile = &self.profiles[idx];
+        self.registry_name = profile.name.clone();
+        self.registry_url = profile.url.clone();
+        self.reset_for_new_registry();
+        self.repo_load = LoadState::Idle;
+        self.modal = Modal::ArtifactoryPicker {
+            filter: InputState::default(),
+            repos: Vec::new(),
+            selected: 0,
+            loading: true,
+        };
+    }
+
+    /// Fill in the repo-key list once `/api/repositories` returns.
+    pub fn on_artifactory_repos(&mut self, repos: Vec<ArtifactoryRepo>) {
+        if let Modal::ArtifactoryPicker {
+            repos: r,
+            selected,
+            loading,
+            ..
+        } = &mut self.modal
+        {
+            *r = repos;
+            *selected = 0;
+            *loading = false;
+        }
+    }
+
+    pub fn on_artifactory_repos_error(&mut self, msg: String) {
+        if let Modal::ArtifactoryPicker { loading, .. } = &mut self.modal {
+            *loading = false;
+        }
+        self.set_status(format!("Artifactory repos error: {msg}"));
+    }
+
+    /// The picker's repo list filtered by its current filter buffer
+    /// (substring match on repo-key, case-insensitive).
+    pub fn artifactory_filtered_repos(&self) -> Vec<&ArtifactoryRepo> {
+        let Modal::ArtifactoryPicker { filter, repos, .. } = &self.modal else {
+            return Vec::new();
+        };
+        let f = filter.buffer.to_lowercase();
+        if f.is_empty() {
+            repos.iter().collect()
+        } else {
+            repos
+                .iter()
+                .filter(|r| r.key.to_lowercase().contains(&f))
+                .collect()
+        }
+    }
+
+    /// Descend into a chosen Artifactory repo-key: from here on it behaves
+    /// exactly like any other registry (`scoped_url` is its `/v2/` root's
+    /// non-`/v2/` base, used for display and pull-URL construction).
+    pub fn enter_artifactory_repo(&mut self, repo_key: &str, scoped_url: String) {
+        let profile_name = self.profiles[self.active_profile_idx].name.clone();
+        self.registry_name = format!("{profile_name}/{repo_key}");
+        self.registry_url = scoped_url;
+        self.modal = Modal::None;
+        self.reset_for_new_registry();
+        self.repo_load = LoadState::Loading;
     }
 
     // ------------------------------------------------------------------
@@ -871,6 +956,100 @@ mod tests {
         assert_eq!(app.focus, Focus::Repos);
         assert_eq!(app.active_profile_idx, 1);
         assert_eq!(app.registry_name, "b");
+    }
+
+    fn artifactory_repo(key: &str) -> ArtifactoryRepo {
+        ArtifactoryRepo {
+            key: key.to_owned(),
+            repo_type: "LOCAL".to_owned(),
+            url: format!("https://artifactory.example.com/artifactory/{key}"),
+            package_type: "Docker".to_owned(),
+        }
+    }
+
+    #[test]
+    fn start_artifactory_switch_opens_loading_picker() {
+        let profile = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: None,
+            registry_type: RegistryType::Artifactory,
+        };
+        let mut app = App::new(vec![profile], 0);
+        app.start_artifactory_switch(0);
+        assert!(matches!(
+            app.modal,
+            Modal::ArtifactoryPicker { loading: true, .. }
+        ));
+        assert_eq!(app.repo_load, LoadState::Idle);
+    }
+
+    #[test]
+    fn on_artifactory_repos_fills_picker_and_clears_loading() {
+        let profile = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: None,
+            registry_type: RegistryType::Artifactory,
+        };
+        let mut app = App::new(vec![profile], 0);
+        app.start_artifactory_switch(0);
+        app.on_artifactory_repos(vec![
+            artifactory_repo("docker-local"),
+            artifactory_repo("docker-remote"),
+        ]);
+        assert!(matches!(
+            app.modal,
+            Modal::ArtifactoryPicker { loading: false, ref repos, .. } if repos.len() == 2
+        ));
+    }
+
+    #[test]
+    fn artifactory_filtered_repos_matches_substring_case_insensitive() {
+        let profile = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: None,
+            registry_type: RegistryType::Artifactory,
+        };
+        let mut app = App::new(vec![profile], 0);
+        app.start_artifactory_switch(0);
+        app.on_artifactory_repos(vec![
+            artifactory_repo("docker-local"),
+            artifactory_repo("maven-local"),
+        ]);
+
+        assert_eq!(app.artifactory_filtered_repos().len(), 2);
+
+        if let Modal::ArtifactoryPicker { filter, .. } = &mut app.modal {
+            filter.start("DOCKER");
+        }
+        let filtered = app.artifactory_filtered_repos();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].key, "docker-local");
+    }
+
+    #[test]
+    fn enter_artifactory_repo_closes_modal_and_resets_state() {
+        let profile = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: None,
+            registry_type: RegistryType::Artifactory,
+        };
+        let mut app = App::new(vec![profile], 0);
+        app.start_artifactory_switch(0);
+        app.on_artifactory_repos(vec![artifactory_repo("docker-local")]);
+
+        let scoped_url =
+            "https://artifactory.example.com/artifactory/api/docker/docker-local/".to_owned();
+        app.enter_artifactory_repo("docker-local", scoped_url.clone());
+
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.registry_name, "art/docker-local");
+        assert_eq!(app.registry_url, scoped_url);
+        assert_eq!(app.repo_load, LoadState::Loading);
+        assert!(app.repos.is_empty());
     }
 
     #[test]

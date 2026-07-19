@@ -16,6 +16,7 @@ An interactive TUI browser for Docker registries, written in Rust.
   - **Export** — save image as an OCI-layout tar archive (skopeo-compatible)
   - **Diff** — compare layer sets between two tags
 - Multi-registry support with in-app switching (`R`)
+- JFrog Artifactory support: browse the Docker repo-keys hosted on an Artifactory instance via a picker, with credentials sent as HTTP Basic (username + API key/identity token)
 - Per-registry credentials stored in the OS keychain — never in the config file
 - Live filter and sort within repos/tags panels
 - In-app keybindings reference (`?`)
@@ -68,25 +69,35 @@ url = "https://registry.example.com"
 name = "staging"
 url = "https://staging-registry.example.com"
 username = "ci"
+
+# JFrog Artifactory: one instance can host many Docker repo-keys, each its
+# own browsable registry. `url` is the Artifactory server base (not a /v2/
+# root) — after switching to this registry (`R`), pick which repo-key to
+# browse from the picker that opens automatically.
+[[registry]]
+name = "artifactory"
+url = "https://artifactory.example.com/artifactory"
+username = "ci"
+type = "artifactory"
 ```
 
 ### Credentials / keyring
 
 Passwords are **never** written to the config file. They are stored in the OS keychain (macOS Keychain, GNOME Secret Service, Windows Credential Manager) under the key `docker-registry-walk/<registry-name>`.
 
-Store a password on first use:
+Store a password on first use — `--password` takes no value; it prompts interactively with masked input, so the password never appears in your shell history or process list:
 
 ```sh
-docker-registry-walk --registry local --password mysecretpassword
+docker-registry-walk --registry local --password
 ```
 
 Or add a registry on the fly without a config entry:
 
 ```sh
-docker-registry-walk --url https://registry.example.com --username admin --password mysecretpassword
+docker-registry-walk --url https://registry.example.com --username admin --password
 ```
 
-The `--password` flag writes to the keychain and exits; subsequent runs read from there automatically.
+The prompted password is written to the keychain; subsequent runs read from there automatically.
 
 ## CLI options
 
@@ -95,7 +106,7 @@ The `--password` flag writes to the keychain and exits; subsequent runs read fro
 | `--registry <name>` | Open this named profile from the config on startup |
 | `--url <url>` | Ad-hoc registry URL (creates a temporary "cli" profile) |
 | `--username <user>` | Username for the ad-hoc registry |
-| `--password <pass>` | Store password in OS keychain (never to config file) |
+| `--password` | Prompt (masked) for the password and store it in the OS keychain — never to the config file, never as a CLI argument |
 
 ## Keybindings
 

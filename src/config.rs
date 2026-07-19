@@ -19,6 +19,15 @@ name = "local"
 url = "http://localhost:5000"
 # username = "admin"
 # type = "standard"
+
+# Artifactory instances host many Docker repo-keys under one server; `url`
+# is the Artifactory base (not a /v2/ root) and the TUI lets you pick which
+# repo-key to browse after switching to this registry.
+# [[registry]]
+# name = "artifactory"
+# url = "https://artifactory.example.com/artifactory"
+# username = "ci"
+# type = "artifactory"
 "#;
 
 /// What kind of registry this is.
@@ -31,6 +40,15 @@ pub enum RegistryType {
     /// Docker Hub (hub.docker.com).  The catalog endpoint is not supported,
     /// so the TUI falls back to the hub search API to find repos.
     DockerHub,
+    /// A JFrog Artifactory instance hosting one or more Docker repositories.
+    ///
+    /// Unlike `Standard`, `url` here is the **Artifactory server base**
+    /// (e.g. `https://artifactory.example.com/artifactory`), not a `/v2/`
+    /// root — a single instance can host many independently-browsable
+    /// Docker repo-keys. The TUI lists them via Artifactory's
+    /// `/api/repositories` REST endpoint and lets the user pick one before
+    /// browsing it as a normal registry.
+    Artifactory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +82,16 @@ impl RegistryProfile {
                     "registry-1.docker.io" | "docker.io" | "index.docker.io"
                 )
             }
+            RegistryType::Artifactory => false,
         }
+    }
+
+    /// Returns `true` when the registry is a JFrog Artifactory instance
+    /// hosting multiple Docker repo-keys. No URL-based auto-detection —
+    /// Artifactory is self-hosted with no fixed hostname, so this must be
+    /// set explicitly with `type = "artifactory"`.
+    pub fn is_artifactory(&self) -> bool {
+        self.registry_type == RegistryType::Artifactory
     }
 }
 
@@ -279,6 +306,34 @@ mod tests {
             registry: vec![profile("local", "http://localhost:5000")],
         };
         assert_eq!(config.default_idx(), 0);
+    }
+
+    #[test]
+    fn artifactory_type_round_trips_and_is_detected() {
+        let profile = RegistryProfile {
+            name: "artifactory".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: Some("ci".to_owned()),
+            registry_type: RegistryType::Artifactory,
+        };
+        let text = toml::to_string_pretty(&profile).unwrap();
+        assert!(text.contains(r#"type = "artifactory""#));
+        let loaded: RegistryProfile = toml::from_str(&text).unwrap();
+        assert!(loaded.is_artifactory());
+        assert!(!loaded.is_dockerhub());
+    }
+
+    #[test]
+    fn standard_and_dockerhub_are_not_artifactory() {
+        assert!(!profile("local", "http://localhost:5000").is_artifactory());
+        let dockerhub = RegistryProfile {
+            name: "hub".to_owned(),
+            url: "https://registry-1.docker.io".to_owned(),
+            username: None,
+            registry_type: RegistryType::Standard,
+        };
+        assert!(dockerhub.is_dockerhub());
+        assert!(!dockerhub.is_artifactory());
     }
 
     #[test]

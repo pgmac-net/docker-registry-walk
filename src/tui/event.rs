@@ -10,11 +10,11 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use url::Url;
 
-use crate::config::RegistryProfile;
+use crate::config::{RegistryProfile, RegistryType};
 use crate::ops::diff::DiffLayer;
 use crate::registry::{
-    BearerCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError,
-    search_dockerhub,
+    ArtifactoryRepo, BasicCredentials, BearerCredentials, ImageConfigBlob, KeyringStore, Manifest,
+    RegistryClient, RegistryError, search_dockerhub,
 };
 
 use super::app::{
@@ -106,6 +106,11 @@ pub enum AppEvent {
         results: Vec<String>,
     },
     DockerHubSearchError(String),
+    /// Docker repo-keys hosted on a JFrog Artifactory instance.
+    ArtifactoryRepos(Vec<ArtifactoryRepo>),
+    ArtifactoryReposError(String),
+    /// User picked a repo-key from the Artifactory picker.
+    ArtifactoryRepoSelected(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
@@ -156,9 +161,15 @@ pub(super) async fn event_loop(
     clients.insert(profiles[initial_idx].name.clone(), init_client);
     let mut active_name = profiles[initial_idx].name.clone();
 
-    // Kick off initial catalog load.
-    app.repo_load = LoadState::Loading;
-    spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+    // Kick off initial catalog load — or, for an Artifactory profile, fetch
+    // the repo-key list and let the user pick one first.
+    if profiles[initial_idx].is_artifactory() {
+        app.start_artifactory_switch(initial_idx);
+        spawn_artifactory_repos_fetch(clients[&active_name].clone(), tx.clone());
+    } else {
+        app.repo_load = LoadState::Loading;
+        spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+    }
 
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
@@ -176,8 +187,42 @@ pub(super) async fn event_loop(
                         let name = profile.name.clone();
                         clients.entry(name.clone()).or_insert_with(|| make_client_for_profile(profile));
                         active_name = name;
-                        app.start_registry_switch(idx);
-                        spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+                        if profile.is_artifactory() {
+                            app.start_artifactory_switch(idx);
+                            spawn_artifactory_repos_fetch(clients[&active_name].clone(), tx.clone());
+                        } else {
+                            app.start_registry_switch(idx);
+                            spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
+                        }
+                    }
+                    AppEvent::ArtifactoryRepos(repos) => {
+                        app.on_artifactory_repos(repos);
+                    }
+                    AppEvent::ArtifactoryReposError(msg) => {
+                        app.on_artifactory_repos_error(msg);
+                    }
+                    AppEvent::ArtifactoryRepoSelected(repo_key) => {
+                        if let Some(base_client) = clients.get(&active_name).cloned() {
+                            match base_client.for_artifactory_repo(&repo_key) {
+                                Ok(scoped_client) => {
+                                    let profile_name =
+                                        app.profiles[app.active_profile_idx].name.clone();
+                                    let scoped_url = scoped_client.base_url().to_string();
+                                    let composite = format!("{profile_name}#{repo_key}");
+                                    clients.insert(composite.clone(), scoped_client);
+                                    active_name = composite;
+                                    app.enter_artifactory_repo(&repo_key, scoped_url);
+                                    spawn_repos_fetch(
+                                        clients[&active_name].clone(),
+                                        None,
+                                        tx.clone(),
+                                    );
+                                }
+                                Err(e) => {
+                                    app.set_status(format!("✗ Artifactory: {e}"));
+                                }
+                            }
+                        }
                     }
                     AppEvent::ReposError { msg, auth_failed } => {
                         // After a password-entry retry, a 401 means scope
@@ -324,7 +369,10 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         AppEvent::ReposError { .. }
         | AppEvent::PasswordEntered { .. }
         | AppEvent::DockerHubSearch { .. }
-        | AppEvent::DockerHubSearchError(_) => {}
+        | AppEvent::DockerHubSearchError(_)
+        | AppEvent::ArtifactoryRepos(_)
+        | AppEvent::ArtifactoryReposError(_)
+        | AppEvent::ArtifactoryRepoSelected(_) => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -496,6 +544,52 @@ fn handle_key(
                             spawn_dockerhub_search(input.buffer.clone(), tx.clone());
                         }
                     }
+                }
+            }
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::ArtifactoryPicker { .. }) {
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            KeyCode::Enter => {
+                let selected = if let Modal::ArtifactoryPicker { selected, .. } = &app.modal {
+                    *selected
+                } else {
+                    0
+                };
+                if let Some(repo_key) = app
+                    .artifactory_filtered_repos()
+                    .get(selected)
+                    .map(|r| r.key.clone())
+                {
+                    let _ = tx.try_send(AppEvent::ArtifactoryRepoSelected(repo_key));
+                }
+            }
+            KeyCode::Up => {
+                if let Modal::ArtifactoryPicker { selected, .. } = &mut app.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let n = app.artifactory_filtered_repos().len();
+                if let Modal::ArtifactoryPicker { selected, .. } = &mut app.modal
+                    && n > 0
+                {
+                    *selected = (*selected + 1).min(n - 1);
+                }
+            }
+            _ => {
+                if let Modal::ArtifactoryPicker {
+                    filter, selected, ..
+                } = &mut app.modal
+                    && apply_input_key(filter, code, modifiers)
+                {
+                    *selected = 0;
                 }
             }
         }
@@ -766,6 +860,13 @@ fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
     if let Some(username) = &profile.username {
         let store = KeyringStore::new(&profile.name);
         if let Some(password) = store.get_password(username) {
+            // Artifactory's Docker v2 endpoint and REST API authenticate via
+            // plain HTTP Basic (username + API key/identity token), not
+            // Bearer token exchange.
+            if profile.registry_type == RegistryType::Artifactory {
+                let creds = BasicCredentials::new(username, &password);
+                return RegistryClient::new(url).with_credentials(Arc::new(creds));
+            }
             let creds = BearerCredentials::new(&url, username.clone(), password);
             return RegistryClient::new(url).with_credentials(Arc::new(creds));
         }
@@ -1028,6 +1129,21 @@ fn spawn_dockerhub_search(query: String, tx: mpsc::Sender<AppEvent>) {
             }
             Err(e) => {
                 let _ = tx.send(AppEvent::DockerHubSearchError(e.to_string())).await;
+            }
+        }
+    });
+}
+
+fn spawn_artifactory_repos_fetch(client: RegistryClient, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        match client.artifactory_repositories().await {
+            Ok(repos) => {
+                let _ = tx.send(AppEvent::ArtifactoryRepos(repos)).await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(AppEvent::ArtifactoryReposError(e.to_string()))
+                    .await;
             }
         }
     });

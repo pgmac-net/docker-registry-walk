@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::ops::diff::DiffStatus;
+use crate::registry::ArtifactoryRepo;
 
 use super::app::{App, Focus, LoadState, Modal, SPINNER};
 use super::detail;
@@ -57,6 +58,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             selected,
             searching,
         } => draw_search_picker_modal(frame, input, results, *selected, *searching, area),
+        Modal::ArtifactoryPicker {
+            filter,
+            repos,
+            selected,
+            loading,
+        } => draw_artifactory_picker_modal(frame, filter, repos, *selected, *loading, area),
         Modal::None => {}
     }
 }
@@ -418,6 +425,97 @@ fn draw_search_picker_modal(
     let list = List::new(items).block(
         Block::default()
             .title(" Results  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(list, chunks[1]);
+}
+
+fn draw_artifactory_picker_modal(
+    frame: &mut Frame,
+    filter: &InputState,
+    repos: &[ArtifactoryRepo],
+    selected: usize,
+    loading: bool,
+    area: Rect,
+) {
+    let filter_lower = filter.buffer.to_lowercase();
+    let filtered: Vec<&ArtifactoryRepo> = if filter_lower.is_empty() {
+        repos.iter().collect()
+    } else {
+        repos
+            .iter()
+            .filter(|r| r.key.to_lowercase().contains(&filter_lower))
+            .collect()
+    };
+
+    let width = 70u16.min(area.width.saturating_sub(4));
+    let result_rows = (filtered.len() as u16).min(10);
+    let height = if filtered.is_empty() {
+        5
+    } else {
+        result_rows + 5
+    };
+    let height = height.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, modal_area);
+
+    let title = if loading {
+        " Artifactory Repositories ⠸ "
+    } else {
+        " Artifactory Repositories "
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(modal_area);
+
+    let inner_width = (width as usize).saturating_sub(2);
+    let skip = input_scroll_skip(filter.cursor, inner_width);
+    let visible: String = filter.buffer.chars().skip(skip).take(inner_width).collect();
+    let col = filter.cursor - skip;
+    let filter_input = Paragraph::new(Line::from(cursor_spans(&visible, col))).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(filter_input, chunks[0]);
+
+    if filtered.is_empty() {
+        let msg = if loading {
+            " Loading…"
+        } else {
+            " No repositories found"
+        };
+        let p = Paragraph::new(msg).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        frame.render_widget(p, chunks[1]);
+        return;
+    }
+
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let line = format!("{} ({})", r.key, r.repo_type);
+            if i == selected {
+                ListItem::new(format!(" ► {line}")).style(HIGHLIGHT_STYLE)
+            } else {
+                ListItem::new(format!("   {line}"))
+            }
+        })
+        .collect();
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Repo-keys  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );

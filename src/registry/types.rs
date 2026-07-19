@@ -120,3 +120,45 @@ pub struct BlobInfo {
 pub struct UploadLocation {
     pub location: url::Url,
 }
+
+/// One entry from a JFrog Artifactory `/api/repositories` response.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactoryRepo {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub repo_type: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub package_type: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifactory_repo_deserializes_sample_response() {
+        let body = r#"[
+            {
+                "key": "docker-local",
+                "type": "LOCAL",
+                "url": "https://artifactory.example.com/artifactory/docker-local",
+                "packageType": "Docker"
+            },
+            {
+                "key": "docker-remote",
+                "type": "REMOTE",
+                "url": "https://artifactory.example.com/artifactory/docker-remote",
+                "packageType": "Docker"
+            }
+        ]"#;
+        let repos: Vec<ArtifactoryRepo> = serde_json::from_str(body).unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].key, "docker-local");
+        assert_eq!(repos[0].repo_type, "LOCAL");
+        assert_eq!(repos[0].package_type, "Docker");
+        assert_eq!(repos[1].key, "docker-remote");
+    }
+}
