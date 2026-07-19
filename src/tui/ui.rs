@@ -12,6 +12,7 @@ use crate::ops::diff::DiffStatus;
 
 use super::app::{App, Focus, LoadState, Modal, SPINNER};
 use super::detail;
+use super::input::{InputState, cursor_spans, input_scroll_skip};
 
 const HIGHLIGHT_STYLE: Style = Style::new()
     .fg(Color::Black)
@@ -41,12 +42,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match &app.modal {
         Modal::Confirm { message, .. } => draw_confirm_modal(frame, message.clone(), area),
-        Modal::Input {
-            prompt,
-            value,
-            cursor,
-            ..
-        } => draw_input_modal(frame, prompt.clone(), value.clone(), *cursor, area),
+        Modal::Input { prompt, input, .. } => {
+            draw_input_modal(frame, prompt, input, area);
+        }
         Modal::RegistrySelect { selected_idx } => {
             draw_registry_select_modal(frame, app, *selected_idx, area)
         }
@@ -54,12 +52,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Modal::LayerDiff(m) => draw_layer_diff_modal(frame, m, area),
         Modal::Help { scroll } => draw_help_modal(frame, *scroll, area),
         Modal::SearchPicker {
-            value,
-            cursor,
+            input,
             results,
             selected,
             searching,
-        } => draw_search_picker_modal(frame, value, *cursor, results, *selected, *searching, area),
+        } => draw_search_picker_modal(frame, input, results, *selected, *searching, area),
         Modal::None => {}
     }
 }
@@ -316,7 +313,7 @@ fn draw_confirm_modal(frame: &mut Frame, message: String, area: Rect) {
     frame.render_widget(p, modal_area);
 }
 
-fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, cursor: usize, area: Rect) {
+fn draw_input_modal(frame: &mut Frame, prompt: &str, input: &InputState, area: Rect) {
     let width = 60u16.min(area.width.saturating_sub(4));
     let height = 5u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -330,23 +327,22 @@ fn draw_input_modal(frame: &mut Frame, prompt: String, value: String, cursor: us
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
 
-    let split = value
-        .char_indices()
-        .nth(cursor)
-        .map(|(i, _)| i)
-        .unwrap_or(value.len());
-    let display = format!("{}{}{}", &value[..split], '|', &value[split..]);
-    let text = format!("{display}\n\n[Enter] Confirm  [Esc] Cancel");
-    let p = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
+    // Inner width minus the two border columns.
+    let inner_width = (width as usize).saturating_sub(2);
+    let skip = input_scroll_skip(input.cursor, inner_width);
+    let visible: String = input.buffer.chars().skip(skip).take(inner_width).collect();
+    let col = input.cursor - skip;
+
+    let mut lines = vec![Line::from(cursor_spans(&visible, col)), Line::raw("")];
+    lines.push(Line::raw("[Enter] Confirm  [Esc] Cancel"));
+    let p = Paragraph::new(lines).block(block);
 
     frame.render_widget(p, modal_area);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn draw_search_picker_modal(
     frame: &mut Frame,
-    value: &str,
-    cursor: usize,
+    input: &InputState,
     results: &[String],
     selected: usize,
     searching: bool,
@@ -377,22 +373,20 @@ fn draw_search_picker_modal(
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(modal_area);
 
-    let split = value
-        .char_indices()
-        .nth(cursor)
-        .map(|(i, _)| i)
-        .unwrap_or(value.len());
-    let display = format!("{}{}{}", &value[..split], '|', &value[split..]);
-    let input = Paragraph::new(display).block(
+    let inner_width = (width as usize).saturating_sub(2);
+    let skip = input_scroll_skip(input.cursor, inner_width);
+    let visible: String = input.buffer.chars().skip(skip).take(inner_width).collect();
+    let col = input.cursor - skip;
+    let search_input = Paragraph::new(Line::from(cursor_spans(&visible, col))).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
-    frame.render_widget(input, chunks[0]);
+    frame.render_widget(search_input, chunks[0]);
 
     if results.is_empty() {
-        if !searching && !value.is_empty() {
+        if !searching && !input.buffer.is_empty() {
             let msg = Paragraph::new(" No results").block(
                 Block::default()
                     .borders(Borders::ALL)

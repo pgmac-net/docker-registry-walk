@@ -21,6 +21,7 @@ use super::app::{
     App, ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal, LoadState, Modal,
 };
 use super::detail::ImageDetail;
+use super::input::InputState;
 use super::ui;
 
 const TICK_MS: u64 = 200;
@@ -199,8 +200,7 @@ pub(super) async fn event_loop(
                             if let Some(username) = profile.username.clone() {
                                 app.modal = Modal::Input {
                                     prompt: format!("Password for {username}:"),
-                                    value: String::new(),
-                                    cursor: 0,
+                                    input: InputState::default(),
                                     on_confirm: InputAction::EnterPassword {
                                         profile_name: profile.name.clone(),
                                         username,
@@ -224,13 +224,13 @@ pub(super) async fn event_loop(
                     }
                     AppEvent::DockerHubSearch { query, results } => {
                         if let Modal::SearchPicker {
-                            value,
+                            input,
                             results: modal_results,
                             selected,
                             searching,
                             ..
                         } = &mut app.modal
-                            && *value == query {
+                            && input.buffer == query {
                                 *modal_results = results;
                                 *selected = 0;
                                 *searching = false;
@@ -428,57 +428,17 @@ fn handle_key(
             KeyCode::Enter => {
                 let modal = std::mem::replace(&mut app.modal, Modal::None);
                 if let Modal::Input {
-                    value, on_confirm, ..
+                    input, on_confirm, ..
                 } = modal
                 {
-                    handle_input_confirm(value, on_confirm, client, tx);
+                    handle_input_confirm(input.buffer, on_confirm, client, tx);
                 }
             }
-            KeyCode::Left => {
-                if let Modal::Input { cursor, .. } = &mut app.modal {
-                    *cursor = cursor.saturating_sub(1);
+            _ => {
+                if let Modal::Input { input, .. } = &mut app.modal {
+                    apply_input_key(input, code, modifiers);
                 }
             }
-            KeyCode::Right => {
-                if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    *cursor = (*cursor + 1).min(value.chars().count());
-                }
-            }
-            KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Modal::Input { cursor, .. } = &mut app.modal {
-                    *cursor = 0;
-                }
-            }
-            KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    *cursor = value.chars().count();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Modal::Input { value, cursor, .. } = &mut app.modal
-                    && *cursor > 0
-                {
-                    let byte_pos = value
-                        .char_indices()
-                        .nth(*cursor - 1)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    value.remove(byte_pos);
-                    *cursor -= 1;
-                }
-            }
-            KeyCode::Char(ch) => {
-                if let Modal::Input { value, cursor, .. } = &mut app.modal {
-                    let byte_pos = value
-                        .char_indices()
-                        .nth(*cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(value.len());
-                    value.insert(byte_pos, ch);
-                    *cursor += 1;
-                }
-            }
-            _ => {}
         }
         return;
     }
@@ -492,13 +452,13 @@ fn handle_key(
             KeyCode::Enter => {
                 let modal = std::mem::replace(&mut app.modal, Modal::None);
                 if let Modal::SearchPicker {
-                    value,
+                    input,
                     results,
                     selected,
                     ..
                 } = modal
                 {
-                    let repo = results.into_iter().nth(selected).unwrap_or(value);
+                    let repo = results.into_iter().nth(selected).unwrap_or(input.buffer);
                     let _ = tx.try_send(AppEvent::BrowseRepo(repo));
                 }
             }
@@ -516,78 +476,28 @@ fn handle_key(
                     *selected = (*selected + 1).min(results.len().saturating_sub(1));
                 }
             }
-            KeyCode::Left => {
-                if let Modal::SearchPicker { cursor, .. } = &mut app.modal {
-                    *cursor = cursor.saturating_sub(1);
-                }
-            }
-            KeyCode::Right => {
-                if let Modal::SearchPicker { value, cursor, .. } = &mut app.modal {
-                    *cursor = (*cursor + 1).min(value.chars().count());
-                }
-            }
-            KeyCode::Home | KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Modal::SearchPicker { cursor, .. } = &mut app.modal {
-                    *cursor = 0;
-                }
-            }
-            KeyCode::End | KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Modal::SearchPicker { value, cursor, .. } = &mut app.modal {
-                    *cursor = value.chars().count();
-                }
-            }
-            KeyCode::Backspace => {
+            _ => {
                 if let Modal::SearchPicker {
-                    value,
-                    cursor,
-                    searching,
+                    input,
                     results,
                     selected,
+                    searching,
                     ..
                 } = &mut app.modal
-                    && *cursor > 0
                 {
-                    let byte_pos = value
-                        .char_indices()
-                        .nth(*cursor - 1)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    value.remove(byte_pos);
-                    *cursor -= 1;
-                    *results = Vec::new();
-                    *selected = 0;
-                    if value.trim().is_empty() {
-                        *searching = false;
-                    } else {
-                        *searching = true;
-                        spawn_dockerhub_search(value.clone(), tx.clone());
+                    let before = input.buffer.clone();
+                    if apply_input_key(input, code, modifiers) && input.buffer != before {
+                        *results = Vec::new();
+                        *selected = 0;
+                        if input.buffer.trim().is_empty() {
+                            *searching = false;
+                        } else {
+                            *searching = true;
+                            spawn_dockerhub_search(input.buffer.clone(), tx.clone());
+                        }
                     }
                 }
             }
-            KeyCode::Char(ch) => {
-                if let Modal::SearchPicker {
-                    value,
-                    cursor,
-                    searching,
-                    results,
-                    selected,
-                    ..
-                } = &mut app.modal
-                {
-                    let byte_pos = value
-                        .char_indices()
-                        .nth(*cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(value.len());
-                    value.insert(byte_pos, ch);
-                    *cursor += 1;
-                    *results = Vec::new();
-                    *selected = 0;
-                    *searching = true;
-                    spawn_dockerhub_search(value.clone(), tx.clone());
-                }
-            }
-            _ => {}
         }
         return;
     }
@@ -746,6 +656,32 @@ fn handle_confirm(action: ConfirmAction, client: &RegistryClient, tx: &mpsc::Sen
             spawn_prune(client.clone(), repo, tags, tx.clone());
         }
     }
+}
+
+/// Keys shared by every single-line `InputState` field: readline-style
+/// editing (see `docs/text-input-patterns.md`). Returns true if the key was
+/// recognized as an edit/navigation key.
+fn apply_input_key(input: &mut InputState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete_char(),
+        KeyCode::Left if ctrl => input.word_left(),
+        KeyCode::Right if ctrl => input.word_right(),
+        KeyCode::Left => input.left(),
+        KeyCode::Right => input.right(),
+        KeyCode::Home => input.home(),
+        KeyCode::End => input.end(),
+        KeyCode::Char('a') if ctrl => input.home(),
+        KeyCode::Char('e') if ctrl => input.end(),
+        KeyCode::Char('w') if ctrl => input.delete_word_back(),
+        KeyCode::Char('u') if ctrl => input.kill_to_start(),
+        KeyCode::Char('k') if ctrl => input.kill_to_end(),
+        KeyCode::Char('d') if ctrl => input.delete_char(),
+        KeyCode::Char(c) if !ctrl => input.insert(c),
+        _ => return false,
+    }
+    true
 }
 
 fn handle_input_confirm(

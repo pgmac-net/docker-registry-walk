@@ -7,6 +7,7 @@ use crate::config::RegistryProfile;
 use crate::ops::diff::DiffLayer;
 
 use super::detail::ImageDetail;
+use super::input::InputState;
 
 const STATUS_TTL: Duration = Duration::from_secs(2);
 const LOAD_AHEAD: usize = 20;
@@ -90,8 +91,7 @@ pub enum Modal {
     },
     Input {
         prompt: String,
-        value: String,
-        cursor: usize,
+        input: InputState,
         on_confirm: InputAction,
     },
     RegistrySelect {
@@ -104,8 +104,7 @@ pub enum Modal {
     },
     /// Docker Hub repository search with live results.
     SearchPicker {
-        value: String,
-        cursor: usize,
+        input: InputState,
         results: Vec<String>,
         selected: usize,
         searching: bool,
@@ -268,8 +267,7 @@ impl App {
         if show_browse && matches!(self.modal, Modal::None) {
             if is_dh {
                 self.modal = Modal::SearchPicker {
-                    value: String::new(),
-                    cursor: 0,
+                    input: InputState::default(),
                     results: Vec::new(),
                     selected: 0,
                     searching: false,
@@ -277,8 +275,7 @@ impl App {
             } else {
                 self.modal = Modal::Input {
                     prompt: "Catalog unavailable. Enter repo name to browse:".to_owned(),
-                    value: String::new(),
-                    cursor: 0,
+                    input: InputState::default(),
                     on_confirm: InputAction::BrowseRepo,
                 };
             }
@@ -648,10 +645,11 @@ impl App {
             return;
         };
         let prefilled = format!("{repo}:{tag}");
+        let mut input = InputState::default();
+        input.start(&prefilled);
         self.modal = Modal::Input {
             prompt: "Copy to (repo:tag):".to_owned(),
-            value: prefilled,
-            cursor: 0,
+            input,
             on_confirm: InputAction::CopyImage {
                 src_repo: repo,
                 src_tag: tag,
@@ -668,8 +666,7 @@ impl App {
         };
         self.modal = Modal::Input {
             prompt: format!("New tag for '{repo}:{tag}':"),
-            value: String::new(),
-            cursor: 0,
+            input: InputState::default(),
             on_confirm: InputAction::Retag { repo, src_tag: tag },
         };
     }
@@ -702,10 +699,11 @@ impl App {
             return;
         };
         let default_path = format!("{}-{}.tar", repo.replace('/', "-"), tag);
+        let mut input = InputState::default();
+        input.start(&default_path);
         self.modal = Modal::Input {
             prompt: "Export OCI tar to:".to_owned(),
-            value: default_path,
-            cursor: 0,
+            input,
             on_confirm: InputAction::Export { repo, tag },
         };
     }
@@ -719,8 +717,7 @@ impl App {
         };
         self.modal = Modal::Input {
             prompt: format!("Diff '{tag}' against tag:"),
-            value: String::new(),
-            cursor: 0,
+            input: InputState::default(),
             on_confirm: InputAction::DiffAgainst { repo, tag_a: tag },
         };
     }

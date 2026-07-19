@@ -1,6 +1,7 @@
 mod app;
 mod detail;
 mod event;
+mod input;
 mod ui;
 
 use std::io;
