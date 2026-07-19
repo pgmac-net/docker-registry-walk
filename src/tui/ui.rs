@@ -75,8 +75,11 @@ fn draw_title(frame: &mut Frame, app: &App, area: Rect) {
         ""
     };
     let title = format!(
-        " docker-registry-walk  │  [{}]  {}{}",
-        app.registry_name, app.registry_url, switch_hint
+        " docker-registry-walk v{}  │  [{}]  {}{}",
+        env!("CARGO_PKG_VERSION"),
+        app.registry_name,
+        app.registry_url,
+        switch_hint
     );
     let p = Paragraph::new(title).style(
         Style::default()
@@ -822,6 +825,16 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
         Line::from(vec![key("?"), sep(), desc("This help screen")]),
         Line::from(vec![key("q / Esc"), sep(), desc("Quit")]),
         Line::from(vec![key("Ctrl-C"), sep(), desc("Force quit")]),
+        Line::from(vec![
+            Span::styled(
+                "Version",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            sep(),
+            desc(concat!("v", env!("CARGO_PKG_VERSION"))),
+        ]),
     ];
 
     let visible_h = inner.height as usize;
