@@ -414,24 +414,19 @@ fn draw_search_picker_modal(
         return;
     }
 
-    let items: Vec<ListItem> = results
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            if i == selected {
-                ListItem::new(format!(" ► {r}")).style(HIGHLIGHT_STYLE)
-            } else {
-                ListItem::new(format!("   {r}"))
-            }
-        })
-        .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Results  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    frame.render_widget(list, chunks[1]);
+    let items: Vec<ListItem> = results.iter().map(|r| ListItem::new(r.as_str())).collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Results  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .highlight_style(HIGHLIGHT_STYLE)
+        .highlight_symbol("▶ ");
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(selected.min(results.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, chunks[1], &mut list_state);
 }
 
 fn draw_artifactory_picker_modal(
@@ -506,23 +501,20 @@ fn draw_artifactory_picker_modal(
 
     let items: Vec<ListItem> = filtered
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let line = format!("{} ({})", r.key, r.repo_type);
-            if i == selected {
-                ListItem::new(format!(" ► {line}")).style(HIGHLIGHT_STYLE)
-            } else {
-                ListItem::new(format!("   {line}"))
-            }
-        })
+        .map(|r| ListItem::new(format!("{} ({})", r.key, r.repo_type)))
         .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Repo-keys  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    frame.render_widget(list, chunks[1]);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(" Repo-keys  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .highlight_style(HIGHLIGHT_STYLE)
+        .highlight_symbol("▶ ");
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(selected.min(filtered.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, chunks[1], &mut list_state);
 }
 
 fn draw_registry_select_modal(frame: &mut Frame, app: &App, selected_idx: usize, area: Rect) {
@@ -844,4 +836,83 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
     let visible: Vec<Line> = lines.into_iter().skip(clamped).take(visible_h).collect();
 
     frame.render_widget(Paragraph::new(visible), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::config::{RegistryProfile, RegistryType};
+
+    fn make_app() -> App {
+        let profile = RegistryProfile {
+            name: "test".to_owned(),
+            url: "http://localhost:5000".to_owned(),
+            username: None,
+            registry_type: RegistryType::Standard,
+        };
+        App::new(vec![profile], 0)
+    }
+
+    fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn search_picker_scrolls_last_selection_into_view() {
+        let mut app = make_app();
+        let results: Vec<String> = (0..30).map(|i| format!("repo-{i}")).collect();
+        app.modal = Modal::SearchPicker {
+            input: InputState::default(),
+            results,
+            selected: 29,
+            searching: false,
+        };
+
+        let content = render_to_string(&mut app, 100, 40);
+        assert!(
+            content.contains("repo-29"),
+            "selected (last) result must be scrolled into view"
+        );
+    }
+
+    #[test]
+    fn artifactory_picker_scrolls_last_selection_into_view() {
+        let mut app = make_app();
+        let repos: Vec<ArtifactoryRepo> = (0..30)
+            .map(|i| ArtifactoryRepo {
+                key: format!("docker-local-{i}"),
+                repo_type: "LOCAL".to_owned(),
+                url: String::new(),
+                package_type: "Docker".to_owned(),
+            })
+            .collect();
+        app.modal = Modal::ArtifactoryPicker {
+            filter: InputState::default(),
+            repos,
+            selected: 29,
+            loading: false,
+        };
+
+        let content = render_to_string(&mut app, 100, 40);
+        assert!(
+            content.contains("docker-local-29"),
+            "selected (last) repo-key must be scrolled into view"
+        );
+    }
 }
