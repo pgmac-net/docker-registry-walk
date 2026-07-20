@@ -303,12 +303,22 @@ fn draw_keybindings(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(p, area);
 }
 
-fn draw_confirm_modal(frame: &mut Frame, message: String, area: Rect) {
-    let width = 50u16.min(area.width.saturating_sub(4));
-    let height = 5u16;
+/// Centered popup rect. `width` scales with the terminal (`width_pct` of
+/// `area.width`) but never shrinks below `min_width`, and both dimensions
+/// are clamped to fit within `area` (minus a 4-cell margin). This lets
+/// popups grow on large terminals instead of staying pinned to their
+/// design-minimum size.
+fn popup_rect(area: Rect, min_width: u16, width_pct: u16, height: u16) -> Rect {
+    let pct_width = area.width.saturating_mul(width_pct) / 100;
+    let width = min_width.max(pct_width).min(area.width.saturating_sub(4));
+    let height = height.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let modal_area = Rect::new(x, y, width, height);
+    Rect::new(x, y, width, height)
+}
+
+fn draw_confirm_modal(frame: &mut Frame, message: String, area: Rect) {
+    let modal_area = popup_rect(area, 50, 40, 5);
 
     frame.render_widget(Clear, modal_area);
 
@@ -324,11 +334,8 @@ fn draw_confirm_modal(frame: &mut Frame, message: String, area: Rect) {
 }
 
 fn draw_input_modal(frame: &mut Frame, prompt: &str, input: &InputState, area: Rect) {
-    let width = 60u16.min(area.width.saturating_sub(4));
-    let height = 5u16;
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let modal_area = Rect::new(x, y, width, height);
+    let modal_area = popup_rect(area, 60, 50, 5);
+    let width = modal_area.width;
 
     frame.render_widget(Clear, modal_area);
 
@@ -358,17 +365,18 @@ fn draw_search_picker_modal(
     searching: bool,
     area: Rect,
 ) {
-    let width = 70u16.min(area.width.saturating_sub(4));
-    let result_rows = (results.len() as u16).min(10);
+    // 4-cell margin + 3-row filter box + 2 list border rows, matching
+    // popup_rect's own clamping — leaves however many rows the terminal
+    // actually has room for instead of capping at a fixed 10.
+    let max_rows = area.height.saturating_sub(9).max(1);
+    let result_rows = (results.len() as u16).min(max_rows);
     let height = if results.is_empty() {
         5
     } else {
         result_rows + 5
     };
-    let height = height.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let modal_area = Rect::new(x, y, width, height);
+    let modal_area = popup_rect(area, 70, 60, height);
+    let width = modal_area.width;
 
     frame.render_widget(Clear, modal_area);
 
@@ -447,17 +455,15 @@ fn draw_artifactory_picker_modal(
             .collect()
     };
 
-    let width = 70u16.min(area.width.saturating_sub(4));
-    let result_rows = (filtered.len() as u16).min(10);
+    let max_rows = area.height.saturating_sub(9).max(1);
+    let result_rows = (filtered.len() as u16).min(max_rows);
     let height = if filtered.is_empty() {
         5
     } else {
         result_rows + 5
     };
-    let height = height.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let modal_area = Rect::new(x, y, width, height);
+    let modal_area = popup_rect(area, 70, 60, height);
+    let width = modal_area.width;
 
     frame.render_widget(Clear, modal_area);
 
@@ -519,11 +525,8 @@ fn draw_artifactory_picker_modal(
 
 fn draw_registry_select_modal(frame: &mut Frame, app: &App, selected_idx: usize, area: Rect) {
     let n = app.profiles.len();
-    let height = (n as u16 + 4).min(area.height.saturating_sub(4));
-    let width = 60u16.min(area.width.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let modal_area = Rect::new(x, y, width, height);
+    let height = n as u16 + 4;
+    let modal_area = popup_rect(area, 60, 50, height);
 
     frame.render_widget(Clear, modal_area);
 
@@ -700,11 +703,7 @@ fn draw_layer_diff_modal(frame: &mut Frame, m: &crate::tui::app::LayerDiffModal,
 }
 
 fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
-    let width = 62u16.min(area.width.saturating_sub(4));
-    let height = 32u16.min(area.height.saturating_sub(4));
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let modal_area = Rect::new(x, y, width, height);
+    let modal_area = popup_rect(area, 62, 50, 32);
 
     frame.render_widget(Clear, modal_area);
 
@@ -847,6 +846,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use super::super::app::{ConfirmAction, InputAction};
     use super::*;
     use crate::config::{RegistryProfile, RegistryType};
 
@@ -884,7 +884,10 @@ mod tests {
             searching: false,
         };
 
-        let content = render_to_string(&mut app, 100, 40);
+        // Small enough that the list still can't show all 30 rows at once,
+        // so this keeps exercising scroll-to-selection (not just "grew
+        // enough to fit everything").
+        let content = render_to_string(&mut app, 100, 20);
         assert!(
             content.contains("repo-29"),
             "selected (last) result must be scrolled into view"
@@ -909,10 +912,96 @@ mod tests {
             loading: false,
         };
 
-        let content = render_to_string(&mut app, 100, 40);
+        let content = render_to_string(&mut app, 100, 20);
         assert!(
             content.contains("docker-local-29"),
             "selected (last) repo-key must be scrolled into view"
         );
+    }
+
+    #[test]
+    fn search_picker_shows_more_than_ten_rows_on_a_tall_terminal() {
+        let mut app = make_app();
+        let results: Vec<String> = (0..20).map(|i| format!("repo-{i}")).collect();
+        app.modal = Modal::SearchPicker {
+            input: InputState::default(),
+            results,
+            selected: 0,
+            searching: false,
+        };
+
+        // Tall terminal, selection pinned at the top (no scroll needed) —
+        // an item past the old fixed 10-row cap must still be visible.
+        let content = render_to_string(&mut app, 100, 40);
+        assert!(
+            content.contains("repo-15"),
+            "picker should show more than 10 rows when the terminal has room"
+        );
+    }
+
+    #[test]
+    fn artifactory_picker_shows_more_than_ten_rows_on_a_tall_terminal() {
+        let mut app = make_app();
+        let repos: Vec<ArtifactoryRepo> = (0..20)
+            .map(|i| ArtifactoryRepo {
+                key: format!("docker-local-{i}"),
+                repo_type: "LOCAL".to_owned(),
+                url: String::new(),
+                package_type: "Docker".to_owned(),
+            })
+            .collect();
+        app.modal = Modal::ArtifactoryPicker {
+            filter: InputState::default(),
+            repos,
+            selected: 0,
+            loading: false,
+        };
+
+        let content = render_to_string(&mut app, 100, 40);
+        assert!(
+            content.contains("docker-local-15"),
+            "picker should show more than 10 rows when the terminal has room"
+        );
+    }
+
+    #[test]
+    fn pickers_render_without_panic_on_a_small_terminal() {
+        let mut app = make_app();
+        let results: Vec<String> = (0..30).map(|i| format!("repo-{i}")).collect();
+        app.modal = Modal::SearchPicker {
+            input: InputState::default(),
+            results,
+            selected: 29,
+            searching: false,
+        };
+        let content = render_to_string(&mut app, 40, 12);
+        assert!(
+            content.contains("repo-29"),
+            "selection should still be visible on a small terminal"
+        );
+    }
+
+    #[test]
+    fn all_popup_modals_render_without_panic_on_a_small_terminal() {
+        for modal in [
+            Modal::Confirm {
+                message: "Delete this?".to_owned(),
+                on_confirm: ConfirmAction::DeleteManifest {
+                    repo: "r".to_owned(),
+                    tag: "t".to_owned(),
+                },
+            },
+            Modal::Input {
+                prompt: "Name:".to_owned(),
+                input: InputState::default(),
+                on_confirm: InputAction::BrowseRepo,
+            },
+            Modal::Help { scroll: 0 },
+        ] {
+            let mut app = make_app();
+            app.modal = modal;
+            // Just assert it doesn't panic on a very small terminal.
+            let _ = render_to_string(&mut app, 20, 8);
+        }
     }
 }
