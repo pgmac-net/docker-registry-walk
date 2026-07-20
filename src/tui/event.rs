@@ -111,6 +111,9 @@ pub enum AppEvent {
     ArtifactoryReposError(String),
     /// User picked a repo-key from the Artifactory picker.
     ArtifactoryRepoSelected(String),
+    /// Up-navigation from inside an Artifactory repo-key back to the
+    /// repo-key picker (`Backspace` / `u`).
+    OpenArtifactoryRepoPicker,
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
@@ -221,6 +224,16 @@ pub(super) async fn event_loop(
                                 Err(e) => {
                                     app.set_status(format!("✗ Artifactory: {e}"));
                                 }
+                            }
+                        }
+                    }
+                    AppEvent::OpenArtifactoryRepoPicker => {
+                        let idx = app.active_profile_idx;
+                        if app.profiles[idx].is_artifactory() {
+                            let profile_name = app.profiles[idx].name.clone();
+                            app.open_artifactory_picker_cached();
+                            if let Some(base_client) = clients.get(&profile_name).cloned() {
+                                spawn_artifactory_repos_fetch(base_client, tx.clone());
                             }
                         }
                     }
@@ -372,7 +385,8 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         | AppEvent::DockerHubSearchError(_)
         | AppEvent::ArtifactoryRepos(_)
         | AppEvent::ArtifactoryReposError(_)
-        | AppEvent::ArtifactoryRepoSelected(_) => {}
+        | AppEvent::ArtifactoryRepoSelected(_)
+        | AppEvent::OpenArtifactoryRepoPicker => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -723,6 +737,9 @@ fn handle_key(
         KeyCode::Char('C') => app.start_copy_image(),
         KeyCode::Char('r') => app.start_retag(),
         KeyCode::Char('R') => app.start_registry_select(),
+        KeyCode::Backspace | KeyCode::Char('u') => {
+            let _ = tx.try_send(AppEvent::OpenArtifactoryRepoPicker);
+        }
         KeyCode::Char('d') => app.start_delete(),
         KeyCode::Char('i') => handle_inspect(app, client, tx),
         KeyCode::Char('P') => handle_prune(app, client, tx),

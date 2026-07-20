@@ -802,6 +802,11 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
         Line::from(vec![]),
         header("Registry"),
         Line::from(vec![key("R"), sep(), desc("Switch registry (in-app)")]),
+        Line::from(vec![
+            key("Backspace / u"),
+            sep(),
+            desc("Back to repo-key picker (Artifactory only)"),
+        ]),
         Line::from(vec![]),
         header("Docker Hub Search  (opens automatically on Docker Hub)"),
         Line::from(vec![
