@@ -10,6 +10,7 @@ use crate::registry::ArtifactoryRepo;
 
 use super::detail::ImageDetail;
 use super::input::InputState;
+use super::jsonview::{self, RowMeta};
 
 const STATUS_TTL: Duration = Duration::from_secs(2);
 const LOAD_AHEAD: usize = 20;
@@ -69,11 +70,209 @@ impl SortOrder {
     }
 }
 
+/// In-modal text search over the inspect JSON.
+#[derive(Debug, Default)]
+pub struct SearchState {
+    /// True while the user is typing a query (keys route to `input`).
+    pub active: bool,
+    pub input: InputState,
+    /// Absolute line indices of the last committed query's matches.
+    pub matches: Vec<usize>,
+    /// Index into `matches` of the currently-focused hit.
+    pub current: usize,
+    /// The committed query text (for highlighting), empty when none.
+    pub query: String,
+}
+
+/// The Inspect modal: a navigable viewer over pretty-printed manifest +
+/// config JSON with collapsible nodes, paging, and text search.
+///
+/// `cursor` and `scroll` index into `visible` (the currently-shown subset
+/// of line indices), not into `lines` directly. `viewport_h` is written by
+/// the renderer each frame so paging can step by a screenful.
 #[derive(Debug)]
 pub struct InspectModal {
     pub title: String,
     pub lines: Vec<String>,
+    pub rows: Vec<RowMeta>,
+    pub collapsed: Vec<bool>,
+    pub visible: Vec<usize>,
+    pub cursor: usize,
     pub scroll: usize,
+    pub viewport_h: usize,
+    pub search: SearchState,
+}
+
+impl InspectModal {
+    pub fn new(title: String, lines: Vec<String>) -> Self {
+        let rows = jsonview::build_rows(&lines);
+        let collapsed = vec![false; lines.len()];
+        let visible = jsonview::visible_lines(&rows, &collapsed);
+        Self {
+            title,
+            lines,
+            rows,
+            collapsed,
+            visible,
+            cursor: 0,
+            scroll: 0,
+            viewport_h: 1,
+            search: SearchState::default(),
+        }
+    }
+
+    /// Absolute line index under the cursor.
+    pub fn cursor_line(&self) -> usize {
+        self.visible.get(self.cursor).copied().unwrap_or(0)
+    }
+
+    /// Recompute the visible set after a fold change, keeping the cursor on
+    /// the same absolute line where possible.
+    fn rebuild_visible(&mut self) {
+        let anchor = self.cursor_line();
+        self.visible = jsonview::visible_lines(&self.rows, &self.collapsed);
+        self.cursor = self
+            .visible
+            .iter()
+            .position(|&l| l >= anchor)
+            .unwrap_or(self.visible.len().saturating_sub(1));
+        self.ensure_visible();
+    }
+
+    /// Scroll so the cursor row sits within the viewport.
+    fn ensure_visible(&mut self) {
+        let h = self.viewport_h.max(1);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + h {
+            self.scroll = self.cursor + 1 - h;
+        }
+        let max_scroll = self.visible.len().saturating_sub(h);
+        self.scroll = self.scroll.min(max_scroll);
+    }
+
+    /// Record the rendered content height and re-clamp scroll to it.
+    pub fn set_viewport(&mut self, h: usize) {
+        self.viewport_h = h.max(1);
+        self.ensure_visible();
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        let last = self.visible.len().saturating_sub(1);
+        let next = (self.cursor as isize + delta).clamp(0, last as isize);
+        self.cursor = next as usize;
+        self.ensure_visible();
+    }
+
+    pub fn page(&mut self, pages: isize) {
+        let step = self.viewport_h.max(1) as isize;
+        self.move_cursor(pages * step);
+    }
+
+    pub fn jump_top(&mut self) {
+        self.cursor = 0;
+        self.ensure_visible();
+    }
+
+    pub fn jump_bottom(&mut self) {
+        self.cursor = self.visible.len().saturating_sub(1);
+        self.ensure_visible();
+    }
+
+    /// Toggle the fold of the node at (or enclosing) the cursor.
+    pub fn toggle_fold(&mut self) {
+        if let Some(o) = jsonview::opener_at(&self.rows, self.cursor_line()) {
+            self.collapsed[o] = !self.collapsed[o];
+            // Keep the cursor on the opener so repeated toggles are stable.
+            self.rebuild_visible();
+            if let Some(pos) = self.visible.iter().position(|&l| l == o) {
+                self.cursor = pos;
+                self.ensure_visible();
+            }
+        }
+    }
+
+    /// Collapse (`true`) or expand (`false`) the node at the cursor.
+    pub fn set_fold(&mut self, collapse: bool) {
+        if let Some(o) = jsonview::opener_at(&self.rows, self.cursor_line())
+            && self.collapsed[o] != collapse
+        {
+            self.collapsed[o] = collapse;
+            self.rebuild_visible();
+            if let Some(pos) = self.visible.iter().position(|&l| l == o) {
+                self.cursor = pos;
+                self.ensure_visible();
+            }
+        }
+    }
+
+    pub fn collapse_all(&mut self) {
+        for (i, r) in self.rows.iter().enumerate() {
+            if r.opener {
+                self.collapsed[i] = true;
+            }
+        }
+        self.rebuild_visible();
+    }
+
+    pub fn expand_all(&mut self) {
+        for c in &mut self.collapsed {
+            *c = false;
+        }
+        self.rebuild_visible();
+    }
+
+    pub fn start_search(&mut self) {
+        self.search.active = true;
+        self.search.input.start("");
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.search.active = false;
+    }
+
+    /// Commit the typed query: compute matches and jump to the first hit.
+    pub fn commit_search(&mut self) {
+        self.search.active = false;
+        let q = self.search.input.buffer.clone();
+        self.search.matches = jsonview::find_matches(&self.lines, &q);
+        self.search.query = q;
+        self.search.current = 0;
+        if let Some(&line) = self.search.matches.first() {
+            self.jump_to(line);
+        }
+    }
+
+    pub fn next_match(&mut self) {
+        if self.search.matches.is_empty() {
+            return;
+        }
+        self.search.current = (self.search.current + 1) % self.search.matches.len();
+        self.jump_to(self.search.matches[self.search.current]);
+    }
+
+    pub fn prev_match(&mut self) {
+        if self.search.matches.is_empty() {
+            return;
+        }
+        let n = self.search.matches.len();
+        self.search.current = (self.search.current + n - 1) % n;
+        self.jump_to(self.search.matches[self.search.current]);
+    }
+
+    /// Move the cursor to an absolute line, expanding any folds hiding it.
+    fn jump_to(&mut self, line: usize) {
+        jsonview::expand_ancestors(&self.rows, &mut self.collapsed, line);
+        self.visible = jsonview::visible_lines(&self.rows, &self.collapsed);
+        if let Some(pos) = self.visible.iter().position(|&l| l == line) {
+            self.cursor = pos;
+        }
+        self.ensure_visible();
+    }
+
+    pub fn has_matches(&self) -> bool {
+        !self.search.matches.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -1293,5 +1492,108 @@ mod tests {
         let mut app = make_app_with_tags("r", vec!["v1"]);
         app.tags_has_more = true;
         assert!(app.should_load_more_tags());
+    }
+
+    // ---- InspectModal (JSON viewer) ----
+
+    const INSPECT_JSON: &str = r#"{
+  "schemaVersion": 2,
+  "config": {
+    "digest": "sha256:abc",
+    "size": 1234
+  },
+  "layers": [
+    {
+      "digest": "sha256:def"
+    }
+  ]
+}"#;
+
+    fn inspect_modal() -> InspectModal {
+        let lines = INSPECT_JSON.lines().map(str::to_owned).collect();
+        let mut m = InspectModal::new("img:tag".to_owned(), lines);
+        m.set_viewport(4); // a small viewport to exercise paging/scroll
+        m
+    }
+
+    #[test]
+    fn cursor_moves_and_clamps_at_ends() {
+        let mut m = inspect_modal();
+        assert_eq!(m.cursor, 0);
+        m.move_cursor(-1); // clamp at top
+        assert_eq!(m.cursor, 0);
+        m.jump_bottom();
+        let last = m.visible.len() - 1;
+        assert_eq!(m.cursor, last);
+        m.move_cursor(1); // clamp at bottom
+        assert_eq!(m.cursor, last);
+    }
+
+    #[test]
+    fn page_steps_by_viewport_height() {
+        let mut m = inspect_modal(); // viewport_h == 4
+        m.page(1);
+        assert_eq!(m.cursor, 4);
+    }
+
+    #[test]
+    fn toggle_fold_keeps_cursor_on_the_opener() {
+        let mut m = inspect_modal();
+        // Move cursor onto the "config" opener (absolute line 2).
+        m.move_cursor(2);
+        assert_eq!(m.cursor_line(), 2);
+        m.toggle_fold();
+        // config interior hidden; cursor still on the opener line.
+        assert_eq!(m.cursor_line(), 2);
+        assert!(m.collapsed[2]);
+        assert!(!m.visible.contains(&3));
+        m.toggle_fold(); // unfold restores interior, cursor unchanged
+        assert_eq!(m.cursor_line(), 2);
+        assert!(m.visible.contains(&3));
+    }
+
+    #[test]
+    fn collapse_all_then_expand_all_round_trips() {
+        let mut m = inspect_modal();
+        let full = m.visible.len();
+        m.collapse_all();
+        assert!(m.visible.len() < full);
+        assert!(m.visible.contains(&0)); // root opener still shown
+        m.expand_all();
+        assert_eq!(m.visible.len(), full);
+    }
+
+    #[test]
+    fn search_jumps_to_match_and_cycles() {
+        let mut m = inspect_modal();
+        m.start_search();
+        assert!(m.search.active);
+        for c in "digest".chars() {
+            m.search.input.insert(c);
+        }
+        m.commit_search();
+        assert!(!m.search.active);
+        assert_eq!(m.search.matches, vec![3, 8]);
+        assert_eq!(m.cursor_line(), 3); // first hit
+        m.next_match();
+        assert_eq!(m.cursor_line(), 8);
+        m.next_match(); // wraps back to first
+        assert_eq!(m.cursor_line(), 3);
+        m.prev_match(); // wraps to last
+        assert_eq!(m.cursor_line(), 8);
+    }
+
+    #[test]
+    fn search_expands_folds_hiding_a_match() {
+        let mut m = inspect_modal();
+        m.collapse_all();
+        assert!(!m.visible.contains(&8)); // nested "digest" hidden
+        m.start_search();
+        for c in "sha256:def".chars() {
+            m.search.input.insert(c);
+        }
+        m.commit_search();
+        assert_eq!(m.cursor_line(), 8);
+        assert!(m.visible.contains(&8)); // ancestors auto-expanded
     }
 }

@@ -11,9 +11,10 @@ use ratatui::{
 use crate::ops::diff::DiffStatus;
 use crate::registry::ArtifactoryRepo;
 
-use super::app::{App, Focus, LoadState, Modal, SPINNER};
+use super::app::{App, Focus, InspectModal, LoadState, Modal, SPINNER};
 use super::detail;
 use super::input::{InputState, cursor_spans, input_scroll_skip};
+use super::jsonview::{RowMeta, close_bracket};
 
 const HIGHLIGHT_STYLE: Style = Style::new()
     .fg(Color::Black)
@@ -41,6 +42,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_details(frame, app, vertical[2]);
     draw_keybindings(frame, app, vertical[3]);
 
+    // The Inspect modal is drawn from a mutable borrow so it can record its
+    // viewport height (for paging) each frame; handle it before the shared
+    // match over the other modals.
+    if let Modal::Inspect(m) = &mut app.modal {
+        draw_inspect_modal(frame, m, area);
+        return;
+    }
+
     match &app.modal {
         Modal::Confirm { message, .. } => draw_confirm_modal(frame, message.clone(), area),
         Modal::Input { prompt, input, .. } => {
@@ -49,7 +58,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Modal::RegistrySelect { selected_idx } => {
             draw_registry_select_modal(frame, app, *selected_idx, area)
         }
-        Modal::Inspect(m) => draw_inspect_modal(frame, &m.title, &m.lines, m.scroll, area),
+        Modal::Inspect(_) => {} // handled above
         Modal::LayerDiff(m) => draw_layer_diff_modal(frame, m, area),
         Modal::Help { scroll } => draw_help_modal(frame, *scroll, area),
         Modal::SearchPicker {
@@ -569,7 +578,7 @@ fn draw_registry_select_modal(frame: &mut Frame, app: &App, selected_idx: usize,
     frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
-fn draw_inspect_modal(frame: &mut Frame, title: &str, lines: &[String], scroll: usize, area: Rect) {
+fn draw_inspect_modal(frame: &mut Frame, m: &mut InspectModal, area: Rect) {
     let width = area.width.saturating_sub(4);
     let height = area.height.saturating_sub(4);
     let x = area.x + 2;
@@ -578,41 +587,169 @@ fn draw_inspect_modal(frame: &mut Frame, title: &str, lines: &[String], scroll: 
 
     frame.render_widget(Clear, modal_area);
 
+    let match_info = if m.has_matches() {
+        format!("  ({}/{})", m.search.current + 1, m.search.matches.len())
+    } else if !m.search.query.is_empty() {
+        "  (no matches)".to_owned()
+    } else {
+        String::new()
+    };
     let block = Block::default()
-        .title(format!(" Inspect: {title} "))
+        .title(format!(" Inspect: {}{match_info} ", m.title))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
-    let visible_h = inner.height as usize;
-    let max_scroll = lines.len().saturating_sub(visible_h);
-    let scroll = scroll.min(max_scroll);
+    // Reserve the bottom row for the search bar / key hints.
+    let content_h = inner.height.saturating_sub(1);
+    let content = Rect::new(inner.x, inner.y, inner.width, content_h);
+    let footer = Rect::new(
+        inner.x,
+        inner.y + content_h,
+        inner.width,
+        inner.height.saturating_sub(content_h),
+    );
 
-    let visible: Vec<Line> = lines
+    // Tell the modal how tall the content area is, so cursor paging and
+    // scroll-follow use the real viewport.
+    m.set_viewport(content_h as usize);
+
+    let query = m.search.query.to_lowercase();
+    let visible: Vec<Line> = m
+        .visible
         .iter()
-        .skip(scroll)
-        .take(visible_h)
-        .map(|l| colorize_json_line(l))
+        .enumerate()
+        .skip(m.scroll)
+        .take(content_h as usize)
+        .map(|(vi, &abs)| {
+            let is_cursor = vi == m.cursor;
+            let is_match = !query.is_empty() && m.search.matches.contains(&abs);
+            inspect_line(
+                &m.lines[abs],
+                m.rows[abs],
+                m.collapsed[abs],
+                is_cursor,
+                &query,
+                is_match,
+            )
+        })
         .collect();
 
-    frame.render_widget(Paragraph::new(visible), inner);
+    frame.render_widget(Paragraph::new(visible), content);
 
-    // Scroll indicator in bottom-right of border.
-    if lines.len() > visible_h {
-        let pct = (scroll * 100).checked_div(max_scroll).unwrap_or(100);
-        let indicator = format!(" {pct}% ");
-        let ind_x = modal_area.x + modal_area.width.saturating_sub(indicator.len() as u16 + 1);
-        let ind_y = modal_area.y + modal_area.height.saturating_sub(1);
-        if ind_x > modal_area.x && ind_y < modal_area.y + modal_area.height {
-            let ind_area = Rect::new(ind_x, ind_y, indicator.len() as u16, 1);
-            frame.render_widget(
-                Paragraph::new(indicator).style(Style::default().fg(Color::DarkGray)),
-                ind_area,
-            );
-        }
+    // Footer: live search entry, or a compact key hint + position.
+    if m.search.active {
+        let inner_w = (footer.width as usize).saturating_sub(1);
+        let skip = input_scroll_skip(m.search.input.cursor, inner_w);
+        let text: String = m
+            .search
+            .input
+            .buffer
+            .chars()
+            .skip(skip)
+            .take(inner_w)
+            .collect();
+        let col = m.search.input.cursor - skip;
+        let mut spans = vec![Span::styled("/", Style::default().fg(Color::Yellow))];
+        spans.extend(cursor_spans(&text, col));
+        frame.render_widget(Paragraph::new(Line::from(spans)), footer);
+    } else {
+        let pos = if m.visible.is_empty() {
+            0
+        } else {
+            (m.cursor + 1) * 100 / m.visible.len()
+        };
+        let hint = format!("↑↓ move · ␣ fold · H/L all · / search · n/N next · q close   {pos}%");
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            footer,
+        );
     }
+}
+
+/// Render one inspect row: gutter fold glyph, the JSON text (coloured, with
+/// a `⋯` marker when collapsed), and cursor / search highlighting.
+fn inspect_line(
+    line: &str,
+    row: RowMeta,
+    collapsed: bool,
+    is_cursor: bool,
+    query: &str,
+    is_match: bool,
+) -> Line<'static> {
+    let gutter = if row.opener {
+        if collapsed { "▸ " } else { "▾ " }
+    } else {
+        "  "
+    };
+    // Collapsed openers show a fold marker standing in for the hidden body.
+    let marker = if row.opener && collapsed {
+        close_bracket(line)
+            .map(|c| format!(" ⋯ {c}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Cursor row: uniform highlight over the whole line (token colour is
+    // dropped for the single selected row, matching list-selection style).
+    if is_cursor {
+        let text = format!("{gutter}{line}{marker}");
+        return Line::from(Span::styled(text, HIGHLIGHT_STYLE));
+    }
+
+    let mut spans = vec![Span::styled(
+        gutter.to_owned(),
+        Style::default().fg(Color::DarkGray),
+    )];
+    if is_match {
+        spans.extend(highlight_spans(line, query));
+    } else {
+        spans.extend(colorize_json_line(line).spans);
+    }
+    if !marker.is_empty() {
+        spans.push(Span::styled(marker, Style::default().fg(Color::DarkGray)));
+    }
+    Line::from(spans)
+}
+
+/// Split `line` on case-insensitive occurrences of `query`, styling the hits.
+///
+/// Byte offsets are taken from the lowercased haystack and reused on the
+/// original; ASCII-lowercasing preserves length, so for non-ASCII lines
+/// (rare in registry JSON) fall back to plain rendering to avoid slicing
+/// mid-codepoint.
+fn highlight_spans(line: &str, query: &str) -> Vec<Span<'static>> {
+    if !line.is_ascii() {
+        return vec![Span::raw(line.to_owned())];
+    }
+    let hay = line.to_lowercase();
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = hay[cursor..].find(query) {
+        let start = cursor + rel;
+        let end = start + query.len();
+        if start > cursor {
+            spans.push(Span::raw(line[cursor..start].to_owned()));
+        }
+        spans.push(Span::styled(
+            line[start..end].to_owned(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        cursor = end;
+    }
+    if cursor < line.len() {
+        spans.push(Span::raw(line[cursor..].to_owned()));
+    }
+    spans
 }
 
 /// Heuristic line-by-line JSON syntax colouring.
@@ -785,6 +922,20 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
             sep(),
             desc("Diff layers against another tag"),
         ]),
+        Line::from(vec![]),
+        header("Inspect viewer  (inside the JSON overlay)"),
+        Line::from(vec![key("↑↓ / j k"), sep(), desc("Move cursor")]),
+        Line::from(vec![key("PgUp/PgDn"), sep(), desc("Page up / down")]),
+        Line::from(vec![key("g / G"), sep(), desc("Jump to top / bottom")]),
+        Line::from(vec![
+            key("Space/Enter"),
+            sep(),
+            desc("Fold / unfold node at cursor"),
+        ]),
+        Line::from(vec![key("← / →"), sep(), desc("Collapse / expand node")]),
+        Line::from(vec![key("H / L"), sep(), desc("Collapse all / expand all")]),
+        Line::from(vec![key("/"), sep(), desc("Search JSON text")]),
+        Line::from(vec![key("n / N"), sep(), desc("Next / previous match")]),
         Line::from(vec![]),
         header("Repository operations  (require a repo selected)"),
         Line::from(vec![
@@ -1002,6 +1153,13 @@ mod tests {
                 on_confirm: InputAction::BrowseRepo,
             },
             Modal::Help { scroll: 0 },
+            Modal::Inspect(Box::new(InspectModal::new(
+                "img:tag".to_owned(),
+                "{\n  \"config\": {\n    \"digest\": \"sha256:abc\"\n  }\n}"
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+            ))),
         ] {
             let mut app = make_app();
             app.modal = modal;

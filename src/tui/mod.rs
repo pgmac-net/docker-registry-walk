@@ -2,6 +2,7 @@ mod app;
 mod detail;
 mod event;
 mod input;
+mod jsonview;
 mod ui;
 
 use std::io;
