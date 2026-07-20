@@ -118,4 +118,4 @@ plan called for Fable 5; Fable 5 was unavailable this session, so
 implementation proceeded on Opus (the recorded fallback) — noted on the
 work-started comment. No functional deviation from the plan.
 
-PR: https://github.com/pgmac-net/docker-registry-walk/pull/PENDING
+PR: https://github.com/pgmac-net/docker-registry-walk/pull/76
