@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ratatui::widgets::ListState;
@@ -204,6 +205,12 @@ pub struct App {
     // Registry switcher
     pub profiles: Vec<RegistryProfile>,
     pub active_profile_idx: usize,
+    /// Last-fetched repo-key list per Artifactory profile (by profile name),
+    /// so re-opening the picker via up-navigation doesn't wait on a fetch.
+    artifactory_repo_cache: HashMap<String, Vec<ArtifactoryRepo>>,
+    /// Repo-key currently being browsed, when the active registry is an
+    /// Artifactory repo-key. Used to preselect it in the picker.
+    current_artifactory_repo_key: Option<String>,
 }
 
 impl App {
@@ -248,6 +255,8 @@ impl App {
             status: None,
             profiles,
             active_profile_idx: idx,
+            artifactory_repo_cache: HashMap::new(),
+            current_artifactory_repo_key: None,
         }
     }
 
@@ -377,6 +386,7 @@ impl App {
         self.focus = Focus::Repos;
         self.filter_mode = None;
         self.catalog_retry_pending = false;
+        self.current_artifactory_repo_key = None;
     }
 
     /// Clear all repo/tag/detail state when switching registries.
@@ -407,8 +417,15 @@ impl App {
         };
     }
 
-    /// Fill in the repo-key list once `/api/repositories` returns.
+    /// Fill in the repo-key list once `/api/repositories` returns. Also
+    /// refreshes the profile's cache, so the next up-navigation open has
+    /// this list ready instantly.
     pub fn on_artifactory_repos(&mut self, repos: Vec<ArtifactoryRepo>) {
+        let profile_name = self.profiles[self.active_profile_idx].name.clone();
+        self.artifactory_repo_cache
+            .insert(profile_name, repos.clone());
+
+        let current_key = self.current_artifactory_repo_key.clone();
         if let Modal::ArtifactoryPicker {
             repos: r,
             selected,
@@ -417,9 +434,46 @@ impl App {
         } = &mut self.modal
         {
             *r = repos;
-            *selected = 0;
             *loading = false;
+            let len = r.len();
+            *selected = if len == 0 {
+                0
+            } else if let Some(idx) = current_key
+                .as_ref()
+                .and_then(|key| r.iter().position(|repo| &repo.key == key))
+            {
+                idx
+            } else {
+                (*selected).min(len - 1)
+            };
         }
+    }
+
+    /// Re-open the repo-key picker for the active Artifactory profile using
+    /// the cached list from the last fetch, so it appears instantly instead
+    /// of waiting on a network round-trip. The caller is expected to spawn a
+    /// background refetch (see `on_artifactory_repos`) to keep it current.
+    ///
+    /// Unlike `start_artifactory_switch`, this does not touch repo/tag/detail
+    /// state — `Esc` from the picker returns to browsing exactly as it was.
+    pub fn open_artifactory_picker_cached(&mut self) {
+        let profile_name = &self.profiles[self.active_profile_idx].name;
+        let cached = self
+            .artifactory_repo_cache
+            .get(profile_name)
+            .cloned()
+            .unwrap_or_default();
+        let selected = self
+            .current_artifactory_repo_key
+            .as_ref()
+            .and_then(|key| cached.iter().position(|r| &r.key == key))
+            .unwrap_or(0);
+        self.modal = Modal::ArtifactoryPicker {
+            filter: InputState::default(),
+            repos: cached,
+            selected,
+            loading: true,
+        };
     }
 
     pub fn on_artifactory_repos_error(&mut self, msg: String) {
@@ -455,6 +509,7 @@ impl App {
         self.registry_url = scoped_url;
         self.modal = Modal::None;
         self.reset_for_new_registry();
+        self.current_artifactory_repo_key = Some(repo_key.to_owned());
         self.repo_load = LoadState::Loading;
     }
 
@@ -1050,6 +1105,92 @@ mod tests {
         assert_eq!(app.registry_url, scoped_url);
         assert_eq!(app.repo_load, LoadState::Loading);
         assert!(app.repos.is_empty());
+    }
+
+    fn app_inside_artifactory_repo() -> App {
+        let profile = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: None,
+            registry_type: RegistryType::Artifactory,
+        };
+        let mut app = App::new(vec![profile], 0);
+        app.start_artifactory_switch(0);
+        app.on_artifactory_repos(vec![
+            artifactory_repo("docker-local"),
+            artifactory_repo("docker-remote"),
+        ]);
+        let scoped_url =
+            "https://artifactory.example.com/artifactory/api/docker/docker-local/".to_owned();
+        app.enter_artifactory_repo("docker-local", scoped_url);
+        app.on_repos_page(vec!["myimage".to_owned()], false);
+        app
+    }
+
+    #[test]
+    fn open_artifactory_picker_cached_uses_cache_and_preselects_current_key() {
+        let mut app = app_inside_artifactory_repo();
+
+        app.open_artifactory_picker_cached();
+
+        assert!(matches!(
+            app.modal,
+            Modal::ArtifactoryPicker { loading: true, ref repos, selected: 0, .. }
+                if repos.len() == 2 && repos[0].key == "docker-local"
+        ));
+    }
+
+    #[test]
+    fn open_artifactory_picker_cached_does_not_reset_browsing_state() {
+        let mut app = app_inside_artifactory_repo();
+        assert_eq!(app.repos, vec!["myimage"]);
+
+        app.open_artifactory_picker_cached();
+
+        // Esc from the picker (Modal::None) should return to exactly this.
+        assert_eq!(app.repos, vec!["myimage"]);
+        assert_eq!(
+            app.current_artifactory_repo_key.as_deref(),
+            Some("docker-local")
+        );
+        assert_eq!(app.registry_name, "art/docker-local");
+    }
+
+    #[test]
+    fn on_artifactory_repos_clamps_selection_on_background_refresh() {
+        let mut app = app_inside_artifactory_repo();
+        app.open_artifactory_picker_cached();
+        if let Modal::ArtifactoryPicker { selected, .. } = &mut app.modal {
+            *selected = 1;
+        }
+
+        // Refresh lands with a shorter list (docker-remote dropped upstream).
+        app.on_artifactory_repos(vec![artifactory_repo("docker-local")]);
+
+        assert!(matches!(
+            app.modal,
+            Modal::ArtifactoryPicker { loading: false, selected: 0, ref repos, .. }
+                if repos.len() == 1
+        ));
+    }
+
+    #[test]
+    fn open_artifactory_picker_cached_empty_cache_opens_loading() {
+        let profile = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: None,
+            registry_type: RegistryType::Artifactory,
+        };
+        let mut app = App::new(vec![profile], 0);
+
+        app.open_artifactory_picker_cached();
+
+        assert!(matches!(
+            app.modal,
+            Modal::ArtifactoryPicker { loading: true, ref repos, selected: 0, .. }
+                if repos.is_empty()
+        ));
     }
 
     #[test]

@@ -157,6 +157,7 @@ Press `?` inside the app for the full interactive reference. Summary:
 | Key | Action |
 |-----|--------|
 | `R` | Switch registry (in-app) |
+| `Backspace` / `u` | Back to repo-key picker (Artifactory only) |
 
 ### General
 
