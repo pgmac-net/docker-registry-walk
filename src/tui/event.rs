@@ -607,6 +607,18 @@ fn handle_key(
     }
 
     if matches!(app.modal, Modal::Inspect(_)) {
+        // `?` opens Help over the viewer; stash the modal so closing Help
+        // returns to the JSON view exactly where it was. Only when not
+        // typing a search query (there `?` is a literal character).
+        let searching = matches!(&app.modal, Modal::Inspect(m) if m.search.active);
+        if code == KeyCode::Char('?') && !searching {
+            if let Modal::Inspect(m) = std::mem::replace(&mut app.modal, Modal::None) {
+                app.inspect_return = Some(m);
+            }
+            app.modal = Modal::Help { scroll: 0 };
+            return;
+        }
+
         let Modal::Inspect(m) = &mut app.modal else {
             return;
         };
@@ -669,7 +681,11 @@ fn handle_key(
     if matches!(app.modal, Modal::Help { .. }) {
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
-                app.modal = Modal::None;
+                // If Help was opened over the Inspect viewer, return to it.
+                app.modal = match app.inspect_return.take() {
+                    Some(m) => Modal::Inspect(m),
+                    None => Modal::None,
+                };
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Modal::Help { scroll } = &mut app.modal {

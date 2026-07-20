@@ -62,6 +62,15 @@ to the first hit; `n`/`N` cycle. A hit hidden inside a collapsed node
 auto-expands its ancestors so it becomes visible. Matches are highlighted
 in place; the title shows `(current/total)`.
 
+### Help without losing your place
+
+`?` opens the keybindings help over the viewer. Since only one modal is
+active at a time, the open `InspectModal` is stashed in
+`App.inspect_return` and restored when Help closes (`?`/`q`/`Esc`), so the
+viewer comes back with its cursor, folds, and search intact rather than
+dropping to the main list. (`?` is treated as a literal character while a
+search query is being typed.)
+
 ## Implementation
 
 - `src/tui/jsonview.rs` (new) — pure fold logic, fully unit-tested:

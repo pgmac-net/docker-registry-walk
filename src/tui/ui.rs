@@ -661,7 +661,7 @@ fn draw_inspect_modal(frame: &mut Frame, m: &mut InspectModal, area: Rect) {
         } else {
             (m.cursor + 1) * 100 / m.visible.len()
         };
-        let hint = format!("↑↓ move · ␣ fold · H/L all · / search · n/N next · q close   {pos}%");
+        let hint = format!("↑↓ move · ␣ fold · / search · n/N next · ? help · q close   {pos}%");
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
@@ -936,6 +936,11 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
         Line::from(vec![key("H / L"), sep(), desc("Collapse all / expand all")]),
         Line::from(vec![key("/"), sep(), desc("Search JSON text")]),
         Line::from(vec![key("n / N"), sep(), desc("Next / previous match")]),
+        Line::from(vec![
+            key("?"),
+            sep(),
+            desc("This help (returns to the viewer on close)"),
+        ]),
         Line::from(vec![]),
         header("Repository operations  (require a repo selected)"),
         Line::from(vec![

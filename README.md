@@ -152,6 +152,7 @@ Press `?` inside the app for the full interactive reference. Summary:
 | `H` / `L` | Collapse all / expand all |
 | `/` | Search JSON text (`Enter` to run, `Esc` to cancel) |
 | `n` / `N` | Jump to next / previous match |
+| `?` | Keybindings help (returns to the viewer on close) |
 | `q` / `Esc` | Close the viewer |
 
 Folding a node hides its whole subtree, so collapsing the root line folds the

@@ -395,6 +395,9 @@ pub struct App {
     pub registry_name: String,
     pub registry_url: String,
     pub modal: Modal,
+    /// The Inspect modal stashed while the Help overlay is shown over it, so
+    /// closing Help returns to the JSON viewer where it left off.
+    pub inspect_return: Option<Box<InspectModal>>,
     pub should_quit: bool,
     pub spinner_tick: usize,
     /// Set when a password was just entered; causes the next catalog error
@@ -448,6 +451,7 @@ impl App {
             registry_name,
             registry_url,
             modal: Modal::None,
+            inspect_return: None,
             should_quit: false,
             spinner_tick: 0,
             catalog_retry_pending: false,
