@@ -412,11 +412,7 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         // Handled directly in event_loop.
         AppEvent::SwitchRegistry { .. } => {}
         AppEvent::InspectLoaded { title, lines } => {
-            app.modal = Modal::Inspect(Box::new(InspectModal {
-                title,
-                lines,
-                scroll: 0,
-            }));
+            app.modal = Modal::Inspect(Box::new(InspectModal::new(title, lines)));
         }
         AppEvent::InspectError(msg) => app.set_status(format!("✗ Inspect failed: {msg}")),
         AppEvent::PruneFound { repo, tags } => {
@@ -611,20 +607,52 @@ fn handle_key(
     }
 
     if matches!(app.modal, Modal::Inspect(_)) {
+        // `?` opens Help over the viewer; stash the modal so closing Help
+        // returns to the JSON view exactly where it was. Only when not
+        // typing a search query (there `?` is a literal character).
+        let searching = matches!(&app.modal, Modal::Inspect(m) if m.search.active);
+        if code == KeyCode::Char('?') && !searching {
+            if let Modal::Inspect(m) = std::mem::replace(&mut app.modal, Modal::None) {
+                app.inspect_return = Some(m);
+            }
+            app.modal = Modal::Help { scroll: 0 };
+            return;
+        }
+
+        let Modal::Inspect(m) = &mut app.modal else {
+            return;
+        };
+
+        // Search-entry sub-mode: keys build the query.
+        if m.search.active {
+            match code {
+                KeyCode::Esc => m.cancel_search(),
+                KeyCode::Enter => m.commit_search(),
+                _ => {
+                    apply_input_key(&mut m.search.input, code, modifiers);
+                }
+            }
+            return;
+        }
+
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 app.modal = Modal::None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if let Modal::Inspect(m) = &mut app.modal {
-                    m.scroll = m.scroll.saturating_sub(1);
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if let Modal::Inspect(m) = &mut app.modal {
-                    m.scroll = m.scroll.saturating_add(1);
-                }
-            }
+            KeyCode::Up | KeyCode::Char('k') => m.move_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => m.move_cursor(1),
+            KeyCode::PageUp => m.page(-1),
+            KeyCode::PageDown => m.page(1),
+            KeyCode::Home | KeyCode::Char('g') => m.jump_top(),
+            KeyCode::End | KeyCode::Char('G') => m.jump_bottom(),
+            KeyCode::Left | KeyCode::Char('h') => m.set_fold(true),
+            KeyCode::Right | KeyCode::Char('l') => m.set_fold(false),
+            KeyCode::Char(' ') | KeyCode::Enter => m.toggle_fold(),
+            KeyCode::Char('H') => m.collapse_all(),
+            KeyCode::Char('L') => m.expand_all(),
+            KeyCode::Char('/') => m.start_search(),
+            KeyCode::Char('n') => m.next_match(),
+            KeyCode::Char('N') => m.prev_match(),
             _ => {}
         }
         return;
@@ -653,7 +681,11 @@ fn handle_key(
     if matches!(app.modal, Modal::Help { .. }) {
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
-                app.modal = Modal::None;
+                // If Help was opened over the Inspect viewer, return to it.
+                app.modal = match app.inspect_return.take() {
+                    Some(m) => Modal::Inspect(m),
+                    None => Modal::None,
+                };
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Modal::Help { scroll } = &mut app.modal {

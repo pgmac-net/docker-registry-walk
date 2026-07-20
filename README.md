@@ -140,6 +140,24 @@ Press `?` inside the app for the full interactive reference. Summary:
 | `e` | Export as OCI tar archive |
 | `D` | Diff layers against another tag |
 
+### Inspect viewer (inside the JSON overlay)
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` / `k` / `j` | Move cursor |
+| `PgUp` / `PgDn` | Page up / down |
+| `g` / `G` | Jump to top / bottom |
+| `Space` / `Enter` | Fold / unfold the node at the cursor |
+| `←` / `→` | Collapse / expand the node at the cursor |
+| `H` / `L` | Collapse all / expand all |
+| `/` | Search JSON text (`Enter` to run, `Esc` to cancel) |
+| `n` / `N` | Jump to next / previous match |
+| `?` | Keybindings help (returns to the viewer on close) |
+| `q` / `Esc` | Close the viewer |
+
+Folding a node hides its whole subtree, so collapsing the root line folds the
+entire document. Search auto-expands any folds hiding a match.
+
 ### Repository operations (require a repo selected)
 
 | Key | Action |
