@@ -205,11 +205,12 @@ pub(super) async fn event_loop(
                         app.on_artifactory_repos_error(msg);
                     }
                     AppEvent::ArtifactoryRepoSelected(repo_key) => {
-                        if let Some(base_client) = clients.get(&active_name).cloned() {
+                        let profile_name = app.profiles[app.active_profile_idx].name.clone();
+                        if let Some(base_client) =
+                            artifactory_root_client(&clients, &profile_name).cloned()
+                        {
                             match base_client.for_artifactory_repo(&repo_key) {
                                 Ok(scoped_client) => {
-                                    let profile_name =
-                                        app.profiles[app.active_profile_idx].name.clone();
                                     let scoped_url = scoped_client.base_url().to_string();
                                     let composite = format!("{profile_name}#{repo_key}");
                                     clients.insert(composite.clone(), scoped_client);
@@ -924,6 +925,17 @@ fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
     RegistryClient::new(url)
 }
 
+/// The client to scope from when the user picks an Artifactory repo-key.
+/// Always the profile's own (unscoped) client — never a client already
+/// scoped to a different repo-key, which would double-append
+/// `api/docker/<key>/` onto an already-scoped base (issue #78).
+fn artifactory_root_client<'a>(
+    clients: &'a HashMap<String, RegistryClient>,
+    profile_name: &str,
+) -> Option<&'a RegistryClient> {
+    clients.get(profile_name)
+}
+
 // ------------------------------------------------------------------
 // Async task spawners
 // ------------------------------------------------------------------
@@ -1196,4 +1208,29 @@ fn spawn_artifactory_repos_fetch(client: RegistryClient, tx: mpsc::Sender<AppEve
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Re-selecting an Artifactory repo-key (e.g. via the picker reopened
+    /// mid-browse, issue #78) must always scope from the profile's root
+    /// client, never from a client that's already scoped to a *different*
+    /// repo-key — otherwise `for_artifactory_repo` double-appends
+    /// `api/docker/<key>/` onto an already-scoped base and every request
+    /// 404s.
+    #[test]
+    fn artifactory_root_client_ignores_already_scoped_entries() {
+        let root = RegistryClient::new(Url::parse("https://art.example.com/").unwrap());
+        let scoped = root.for_artifactory_repo("old-repo").unwrap();
+        assert_ne!(root.base_url(), scoped.base_url());
+
+        let mut clients = HashMap::new();
+        clients.insert("profileA".to_owned(), root.clone());
+        clients.insert("profileA#old-repo".to_owned(), scoped);
+
+        let found = artifactory_root_client(&clients, "profileA").unwrap();
+        assert_eq!(found.base_url(), root.base_url());
+    }
 }

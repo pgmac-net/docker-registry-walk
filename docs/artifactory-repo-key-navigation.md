@@ -86,3 +86,21 @@ the approved plan called for (STANDARD complexity) — noted on the
 ticket's work-started comment. No functional deviation from the plan.
 
 PR: https://github.com/pgmac-net/docker-registry-walk/pull/72
+
+## Follow-up: repo-key reselection bug (issue #78)
+
+Re-selecting a repo-key from the picker while already browsing a
+*different* repo-key broke catalog loading permanently (until app
+restart). `AppEvent::ArtifactoryRepoSelected`
+(`src/tui/event.rs`) looked up its base client via `active_name`, which
+by this point could already be the previous repo-key's *scoped* client
+(`profile#old-repo`) rather than the profile's root client. Scoping a
+second time off an already-scoped client double-appends
+`api/docker/<key>/` onto the URL, so every request 404s.
+
+Fix: always look up the base client by profile name (new
+`artifactory_root_client` helper in `src/tui/event.rs`), never by
+`active_name`. `OpenArtifactoryRepoPicker` already did this correctly —
+only `ArtifactoryRepoSelected` had the bug.
+
+PR: https://github.com/pgmac-net/docker-registry-walk/pull/79
