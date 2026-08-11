@@ -355,6 +355,18 @@ pub enum InputAction {
     },
 }
 
+impl InputAction {
+    /// Whether this action collects a credential, so the input modal must
+    /// mask what it echoes.
+    ///
+    /// Deriving masking from the action (rather than a flag on `Modal::Input`)
+    /// means none of the modal's construction sites can forget to set it, and
+    /// a new credential-collecting action only has to be listed here.
+    pub fn is_secret(&self) -> bool {
+        matches!(self, Self::EnterPassword { .. })
+    }
+}
+
 #[derive(Debug)]
 struct StatusMessage {
     text: String,
@@ -1599,5 +1611,38 @@ mod tests {
         m.commit_search();
         assert_eq!(m.cursor_line(), 8);
         assert!(m.visible.contains(&8)); // ancestors auto-expanded
+    }
+
+    #[test]
+    fn input_action_is_secret_only_for_credential_actions() {
+        assert!(
+            InputAction::EnterPassword {
+                profile_name: "p".to_owned(),
+                username: "u".to_owned(),
+            }
+            .is_secret()
+        );
+
+        for action in [
+            InputAction::BrowseRepo,
+            InputAction::CopyImage {
+                src_repo: "r".to_owned(),
+                src_tag: "t".to_owned(),
+            },
+            InputAction::Retag {
+                repo: "r".to_owned(),
+                src_tag: "t".to_owned(),
+            },
+            InputAction::Export {
+                repo: "r".to_owned(),
+                tag: "t".to_owned(),
+            },
+            InputAction::DiffAgainst {
+                repo: "r".to_owned(),
+                tag_a: "t".to_owned(),
+            },
+        ] {
+            assert!(!action.is_secret(), "{action:?} must not be masked");
+        }
     }
 }

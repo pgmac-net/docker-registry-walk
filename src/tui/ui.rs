@@ -52,8 +52,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match &app.modal {
         Modal::Confirm { message, .. } => draw_confirm_modal(frame, message.clone(), area),
-        Modal::Input { prompt, input, .. } => {
-            draw_input_modal(frame, prompt, input, area);
+        Modal::Input {
+            prompt,
+            input,
+            on_confirm,
+        } => {
+            draw_input_modal(frame, prompt, input, on_confirm.is_secret(), area);
         }
         Modal::RegistrySelect { selected_idx } => {
             draw_registry_select_modal(frame, app, *selected_idx, area)
@@ -342,7 +346,10 @@ fn draw_confirm_modal(frame: &mut Frame, message: String, area: Rect) {
     frame.render_widget(p, modal_area);
 }
 
-fn draw_input_modal(frame: &mut Frame, prompt: &str, input: &InputState, area: Rect) {
+/// Character echoed in place of each character of a secret.
+const MASK_CHAR: char = '•';
+
+fn draw_input_modal(frame: &mut Frame, prompt: &str, input: &InputState, secret: bool, area: Rect) {
     let modal_area = popup_rect(area, 60, 50, 5);
     let width = modal_area.width;
 
@@ -359,8 +366,30 @@ fn draw_input_modal(frame: &mut Frame, prompt: &str, input: &InputState, area: R
     let visible: String = input.buffer.chars().skip(skip).take(inner_width).collect();
     let col = input.cursor - skip;
 
-    let mut lines = vec![Line::from(cursor_spans(&visible, col)), Line::raw("")];
-    lines.push(Line::raw("[Enter] Confirm  [Esc] Cancel"));
+    // Mask *after* slicing so the scroll window and cursor column above are
+    // computed from the real buffer and need no adjustment. The replacement is
+    // 1:1 per character, so `col` still points at the right cell.
+    let visible = if secret {
+        MASK_CHAR.to_string().repeat(visible.chars().count())
+    } else {
+        visible
+    };
+
+    // A masked 600-char JWT is unreadable, but a length confirms a paste landed.
+    let footer = if secret {
+        format!(
+            "({} chars)  [Enter] Confirm  [Esc] Cancel",
+            input.buffer.chars().count()
+        )
+    } else {
+        "[Enter] Confirm  [Esc] Cancel".to_owned()
+    };
+
+    let lines = vec![
+        Line::from(cursor_spans(&visible, col)),
+        Line::raw(""),
+        Line::raw(footer),
+    ];
     let p = Paragraph::new(lines).block(block);
 
     frame.render_widget(p, modal_area);
@@ -1171,5 +1200,60 @@ mod tests {
             // Just assert it doesn't panic on a very small terminal.
             let _ = render_to_string(&mut app, 20, 8);
         }
+    }
+
+    fn input_with(text: &str) -> InputState {
+        let mut input = InputState::default();
+        for c in text.chars() {
+            input.insert(c);
+        }
+        input
+    }
+
+    #[test]
+    fn input_modal_masks_secret_action() {
+        let mut app = make_app();
+        app.modal = Modal::Input {
+            prompt: "Password for u:".to_owned(),
+            input: input_with("hunter2secret"),
+            on_confirm: InputAction::EnterPassword {
+                profile_name: "test".to_owned(),
+                username: "u".to_owned(),
+            },
+        };
+
+        let content = render_to_string(&mut app, 80, 12);
+        assert!(
+            !content.contains("hunter2secret"),
+            "secret must never be echoed to the screen"
+        );
+        assert!(
+            content.contains(&MASK_CHAR.to_string().repeat("hunter2secret".len())),
+            "every character of the secret must render as the mask char"
+        );
+        assert!(
+            content.contains("(13 chars)"),
+            "a length hint confirms a paste landed"
+        );
+    }
+
+    #[test]
+    fn input_modal_shows_plaintext_for_non_secret_action() {
+        let mut app = make_app();
+        app.modal = Modal::Input {
+            prompt: "Repo:".to_owned(),
+            input: input_with("nginx"),
+            on_confirm: InputAction::BrowseRepo,
+        };
+
+        let content = render_to_string(&mut app, 80, 12);
+        assert!(
+            content.contains("nginx"),
+            "non-secret input must stay visible"
+        );
+        assert!(
+            !content.contains(MASK_CHAR),
+            "non-secret input must not be masked"
+        );
     }
 }
