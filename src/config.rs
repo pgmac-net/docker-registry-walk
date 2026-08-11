@@ -43,7 +43,7 @@ url = "http://localhost:5000"
 "#;
 
 /// What kind of registry this is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RegistryType {
     /// A standard Docker Registry v2 endpoint.
@@ -51,6 +51,9 @@ pub enum RegistryType {
     Standard,
     /// Docker Hub (hub.docker.com).  The catalog endpoint is not supported,
     /// so the TUI falls back to the hub search API to find repos.
+    // `dockerhub`, not clap's default kebab-case `docker-hub`, so the CLI and
+    // the config file share one vocabulary.
+    #[value(name = "dockerhub")]
     DockerHub,
     /// A JFrog Artifactory instance hosting one or more Docker repositories.
     ///
@@ -67,7 +70,7 @@ pub enum RegistryType {
 ///
 /// This is the user's *intent*; the credential actually built also depends on
 /// which secrets are available at runtime — see [`RegistryProfile::auth_kind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
     /// Infer from the registry type and which secrets are present. Preserves
@@ -598,6 +601,31 @@ mod tests {
             )],
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_auth_value_errors_and_names_the_offender() {
+        // `main` reports a failed `Config::load` on stderr rather than silently
+        // starting with an invented localhost profile. That is only useful if
+        // the error identifies what was wrong, so pin it.
+        let text = r#"
+            [[registry]]
+            name = "art"
+            url = "https://art.example.com/artifactory"
+            type = "artifactory"
+            auth = "tokenn"
+        "#;
+        let err = toml::from_str::<Config>(text)
+            .expect_err("an unknown auth value must not deserialize")
+            .to_string();
+        assert!(
+            err.contains("tokenn"),
+            "error must name the bad value: {err}"
+        );
+        assert!(
+            err.contains("token"),
+            "error must list the valid alternatives: {err}"
+        );
     }
 
     #[test]

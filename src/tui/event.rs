@@ -1056,6 +1056,19 @@ fn retry_after_credential_change(
     }
 }
 
+/// Whether an error means "your credentials are the problem", so it is worth
+/// offering to re-enter them.
+///
+/// 403 counts: Artifactory answers a valid-but-under-privileged token that way
+/// rather than with 401, and treating it as a generic failure left the user
+/// looking at "catalog unavailable" with no way to supply a better credential.
+fn is_auth_failure(e: &RegistryError) -> bool {
+    matches!(
+        e,
+        RegistryError::Unauthorized | RegistryError::UnexpectedStatus { status: 403, .. }
+    )
+}
+
 /// Which credential the user should be asked for after an auth failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthPrompt {
@@ -1266,11 +1279,10 @@ fn spawn_repos_fetch(client: RegistryClient, cursor: Option<String>, tx: mpsc::S
                     .await;
             }
             Err(e) => {
-                let auth_failed = matches!(e, RegistryError::Unauthorized);
                 let _ = tx
                     .send(AppEvent::ReposError {
                         msg: e.to_string(),
-                        auth_failed,
+                        auth_failed: is_auth_failure(&e),
                     })
                     .await;
             }
@@ -1521,5 +1533,24 @@ mod tests {
         // Nothing useful to ask for: no username, and not a token profile.
         let profile = anon_profile("local", "http://localhost:5000/", RegistryType::Standard);
         assert_eq!(auth_prompt_for(&profile), None);
+    }
+
+    #[test]
+    fn is_auth_failure_covers_401_and_403() {
+        assert!(is_auth_failure(&RegistryError::Unauthorized));
+        // Artifactory's answer for a valid but under-privileged token.
+        assert!(is_auth_failure(&RegistryError::UnexpectedStatus {
+            status: 403,
+            url: "https://art.example.com/v2/_catalog".to_owned(),
+        }));
+
+        assert!(!is_auth_failure(&RegistryError::UnexpectedStatus {
+            status: 500,
+            url: "https://art.example.com/v2/_catalog".to_owned(),
+        }));
+        assert!(!is_auth_failure(&RegistryError::NotFound("x".to_owned())));
+        assert!(!is_auth_failure(&RegistryError::InvalidResponse(
+            "x".to_owned()
+        )));
     }
 }
