@@ -1046,6 +1046,7 @@ mod tests {
             url: "http://localhost:5000".to_owned(),
             username: None,
             registry_type: RegistryType::Standard,
+            ..Default::default()
         };
         App::new(vec![profile], 0)
     }

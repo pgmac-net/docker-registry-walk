@@ -353,6 +353,11 @@ pub enum InputAction {
         profile_name: String,
         username: String,
     },
+    /// User entered an access token after auth failure. Carries no username —
+    /// token auth does not need one.
+    EnterToken {
+        profile_name: String,
+    },
 }
 
 impl InputAction {
@@ -363,7 +368,7 @@ impl InputAction {
     /// means none of the modal's construction sites can forget to set it, and
     /// a new credential-collecting action only has to be listed here.
     pub fn is_secret(&self) -> bool {
-        matches!(self, Self::EnterPassword { .. })
+        matches!(self, Self::EnterPassword { .. } | Self::EnterToken { .. })
     }
 }
 
@@ -612,6 +617,42 @@ impl App {
         self.registry_url = profile.url.clone();
         self.reset_for_new_registry();
         self.repo_load = LoadState::Loading;
+    }
+
+    /// Reload the catalog in place after the user supplied a new credential.
+    ///
+    /// Deliberately narrower than [`Self::start_registry_switch`], which goes
+    /// through `reset_for_new_registry` and so clears
+    /// `current_artifactory_repo_key`. Using that here would visually eject the
+    /// user back to the repo-key picker on a *successful* re-auth, while the
+    /// client stayed scoped to the repo-key they were browsing.
+    pub fn restart_catalog_load(&mut self) {
+        self.repos_all.clear();
+        self.repos.clear();
+        self.repos_state.select(Some(0));
+        self.repos_cursor = None;
+        self.repos_has_more = false;
+        self.repo_filter.clear();
+
+        self.tags_all.clear();
+        self.tags.clear();
+        self.tags_state.select(None);
+        self.tags_cursor = None;
+        self.tags_has_more = false;
+        self.tag_filter.clear();
+        self.tag_load = LoadState::Idle;
+
+        self.current_repo = None;
+        self.current_tag = None;
+        self.detail = None;
+        self.detail_load = LoadState::Idle;
+        self.detail_scroll = 0;
+        self.focus = Focus::Repos;
+        self.filter_mode = None;
+
+        self.repo_load = LoadState::Loading;
+        // A 401 after this reload means scope rejection, not a wrong secret.
+        self.catalog_retry_pending = true;
     }
 
     /// Switch to a JFrog Artifactory profile: clear repo/tag/detail state
@@ -1089,6 +1130,7 @@ mod tests {
             url: "http://localhost:5000".to_owned(),
             username: None,
             registry_type: RegistryType::Standard,
+            ..Default::default()
         };
         App::new(vec![profile], 0)
     }
@@ -1206,12 +1248,14 @@ mod tests {
             url: "http://a:5000".to_owned(),
             username: None,
             registry_type: RegistryType::Standard,
+            ..Default::default()
         };
         let profile_b = RegistryProfile {
             name: "b".to_owned(),
             url: "http://b:5000".to_owned(),
             username: None,
             registry_type: RegistryType::Standard,
+            ..Default::default()
         };
         let mut app = App::new(vec![profile_a, profile_b], 0);
         app.on_repos_page(vec!["r1".to_owned()], false);
@@ -1244,6 +1288,7 @@ mod tests {
             url: "https://artifactory.example.com/artifactory".to_owned(),
             username: None,
             registry_type: RegistryType::Artifactory,
+            ..Default::default()
         };
         let mut app = App::new(vec![profile], 0);
         app.start_artifactory_switch(0);
@@ -1261,6 +1306,7 @@ mod tests {
             url: "https://artifactory.example.com/artifactory".to_owned(),
             username: None,
             registry_type: RegistryType::Artifactory,
+            ..Default::default()
         };
         let mut app = App::new(vec![profile], 0);
         app.start_artifactory_switch(0);
@@ -1281,6 +1327,7 @@ mod tests {
             url: "https://artifactory.example.com/artifactory".to_owned(),
             username: None,
             registry_type: RegistryType::Artifactory,
+            ..Default::default()
         };
         let mut app = App::new(vec![profile], 0);
         app.start_artifactory_switch(0);
@@ -1306,6 +1353,7 @@ mod tests {
             url: "https://artifactory.example.com/artifactory".to_owned(),
             username: None,
             registry_type: RegistryType::Artifactory,
+            ..Default::default()
         };
         let mut app = App::new(vec![profile], 0);
         app.start_artifactory_switch(0);
@@ -1322,12 +1370,50 @@ mod tests {
         assert!(app.repos.is_empty());
     }
 
+    #[test]
+    fn restart_catalog_load_preserves_artifactory_repo_key() {
+        let profile = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://artifactory.example.com/artifactory".to_owned(),
+            username: None,
+            registry_type: RegistryType::Artifactory,
+            ..Default::default()
+        };
+        let mut app = App::new(vec![profile], 0);
+        app.start_artifactory_switch(0);
+        app.on_artifactory_repos(vec![artifactory_repo("docker-local")]);
+
+        let scoped_url =
+            "https://artifactory.example.com/artifactory/api/docker/docker-local/".to_owned();
+        app.enter_artifactory_repo("docker-local", scoped_url.clone());
+        app.on_repos_page(vec!["nginx".to_owned()], false);
+
+        // Simulate a successful re-auth while browsing inside a repo-key.
+        app.restart_catalog_load();
+
+        // The catalog reloads...
+        assert_eq!(app.repo_load, LoadState::Loading);
+        assert!(app.repos.is_empty());
+        assert!(app.catalog_retry_pending);
+
+        // ...but the user is NOT ejected from the repo-key they were in.
+        // `start_registry_switch` would have cleared all three of these, while
+        // the client stayed scoped to the repo-key.
+        assert_eq!(
+            app.current_artifactory_repo_key.as_deref(),
+            Some("docker-local")
+        );
+        assert_eq!(app.registry_name, "art/docker-local");
+        assert_eq!(app.registry_url, scoped_url);
+    }
+
     fn app_inside_artifactory_repo() -> App {
         let profile = RegistryProfile {
             name: "art".to_owned(),
             url: "https://artifactory.example.com/artifactory".to_owned(),
             username: None,
             registry_type: RegistryType::Artifactory,
+            ..Default::default()
         };
         let mut app = App::new(vec![profile], 0);
         app.start_artifactory_switch(0);
@@ -1396,6 +1482,7 @@ mod tests {
             url: "https://artifactory.example.com/artifactory".to_owned(),
             username: None,
             registry_type: RegistryType::Artifactory,
+            ..Default::default()
         };
         let mut app = App::new(vec![profile], 0);
 

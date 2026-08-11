@@ -1,16 +1,68 @@
 #![allow(dead_code)]
 
+use std::fmt;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64_URL},
+};
 use reqwest::Client;
 use tokio::sync::Mutex;
 use url::Url;
 
 use crate::registry::client::Credentials;
+
+/// Hosts for which plain `http` is acceptable, so local dev registries work.
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// Environment variables consulted for a JFrog access token, in order.
+///
+/// Same names the Terraform `jfrog/artifactory` provider reads.
+const ENV_ACCESS_TOKEN_VARS: [&str; 2] = ["JFROG_ACCESS_TOKEN", "ARTIFACTORY_ACCESS_TOKEN"];
+
+/// Keyring account under which an access token is stored.
+///
+/// A token-authenticated profile has no username, so the account name cannot
+/// be derived from one. Used even when a username *is* configured, so a stored
+/// password and a stored token coexist instead of overwriting each other.
+pub const TOKEN_ACCOUNT: &str = "__token__";
+
+// ---------------------------------------------------------------------------
+// Secret wrapper
+// ---------------------------------------------------------------------------
+
+/// A credential that must not appear in debug output.
+///
+/// `AppEvent` derives `Debug` and carries entered credentials between the key
+/// handler and the event loop, so a stray `{:?}` — or a panic payload — would
+/// otherwise print the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Read the underlying value. Named to make call sites conspicuous.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Basic auth
@@ -69,43 +121,6 @@ impl BearerCredentials {
         }
     }
 
-    /// Exchange credentials for a token at the given realm with optional service/scope.
-    /// Returns the JSON body on success, or `None` on HTTP/network error.
-    async fn exchange_token(
-        &self,
-        http: &Client,
-        realm: &Url,
-        service: Option<&str>,
-        scope: Option<&str>,
-    ) -> Option<serde_json::Value> {
-        let mut url = realm.clone();
-        {
-            let mut q = url.query_pairs_mut();
-            if let Some(svc) = service {
-                q.append_pair("service", svc);
-            }
-            if let Some(s) = scope {
-                q.append_pair("scope", s);
-            }
-        }
-        http.get(url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()
-    }
-
-    /// Try to extract a token string from a token endpoint response body.
-    fn extract_token(body: &serde_json::Value) -> Option<String> {
-        body["token"]
-            .as_str()
-            .or_else(|| body["access_token"].as_str())
-            .map(|s| s.to_owned())
-    }
-
     async fn refresh(&self, http: &Client) -> Option<String> {
         // Probe /v2/ to get the Bearer challenge.
         let resp = http.get(self.probe_url.clone()).send().await.ok()?;
@@ -130,30 +145,17 @@ impl BearerCredentials {
             return None;
         }
 
-        // Try with the scope from the challenge first.
-        let mut body = self
-            .exchange_token(
-                http,
-                &token_url,
-                challenge.service.as_deref(),
-                challenge.scope.as_deref(),
-            )
-            .await;
-
-        // Some registries (e.g. Docker Hub) issue a scope in the `/v2/` 401 challenge
-        // that their own token endpoint rejects. Retry without scope.
-        if body.as_ref().and_then(Self::extract_token).is_none() {
-            body = self
-                .exchange_token(http, &token_url, challenge.service.as_deref(), None)
-                .await;
-        }
-
-        let body = body?;
-        let token_str = Self::extract_token(&body)?;
-
-        let expires_in = body["expires_in"].as_u64().unwrap_or(300);
-        // Subtract 10 s to account for clock skew and latency.
-        let ttl = Duration::from_secs(expires_in.saturating_sub(10));
+        let (token_str, ttl) = exchange_with_scope_fallback(
+            http,
+            &token_url,
+            challenge.service.as_deref(),
+            challenge.scope.as_deref(),
+            RealmAuth::Basic {
+                username: &self.username,
+                password: &self.password,
+            },
+        )
+        .await?;
 
         let mut guard = self.token.lock().await;
         *guard = Some(CachedToken {
@@ -198,30 +200,274 @@ impl Credentials for BearerCredentials {
             return None;
         }
 
-        // Try with the scope from the challenge first.
-        let mut body = self
-            .exchange_token(
-                http,
-                &token_url,
-                challenge.service.as_deref(),
-                challenge.scope.as_deref(),
-            )
-            .await;
-
-        // Fall back to no scope if the token endpoint rejects the scope.
-        if body.as_ref().and_then(Self::extract_token).is_none() {
-            body = self
-                .exchange_token(http, &token_url, challenge.service.as_deref(), None)
-                .await;
-        }
-
-        let body = body?;
-        let token_str = Self::extract_token(&body)?;
+        let (token_str, _ttl) = exchange_with_scope_fallback(
+            http,
+            &token_url,
+            challenge.service.as_deref(),
+            challenge.scope.as_deref(),
+            RealmAuth::Basic {
+                username: &self.username,
+                password: &self.password,
+            },
+        )
+        .await?;
 
         // Don't cache: this token is scoped to one specific endpoint.  Caching
         // it would cause the fast-path in get_authorization to serve the wrong
         // (narrow) scope to other endpoints, triggering a cascade of 401s.
         Some(format!("Bearer {token_str}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Token realm exchange (shared by BearerCredentials and AccessTokenCredentials)
+// ---------------------------------------------------------------------------
+
+/// How to present credentials to a Docker v2 token realm.
+#[derive(Clone, Copy)]
+enum RealmAuth<'a> {
+    Basic {
+        username: &'a str,
+        password: &'a str,
+    },
+    /// Pass a token straight through. Needs no username, which is what makes
+    /// it usable by a token-only profile.
+    Bearer(&'a str),
+}
+
+/// Build the token-endpoint URL for a challenge.
+///
+/// Appends `service`/`scope` rather than replacing the query, so a realm that
+/// already carries query parameters keeps them.
+fn realm_url(realm: &Url, service: Option<&str>, scope: Option<&str>) -> Url {
+    let mut url = realm.clone();
+    {
+        let mut q = url.query_pairs_mut();
+        if let Some(svc) = service {
+            q.append_pair("service", svc);
+        }
+        if let Some(s) = scope {
+            q.append_pair("scope", s);
+        }
+    }
+    url
+}
+
+/// Try to extract a token string from a token endpoint response body.
+fn extract_token(body: &serde_json::Value) -> Option<String> {
+    body["token"]
+        .as_str()
+        .or_else(|| body["access_token"].as_str())
+        .map(|s| s.to_owned())
+}
+
+/// Lifetime of a freshly-minted token, less an allowance for clock skew and
+/// latency. Defaults to the Docker registry spec's 300 s when unstated.
+fn token_ttl(body: &serde_json::Value) -> Duration {
+    let expires_in = body["expires_in"].as_u64().unwrap_or(300);
+    Duration::from_secs(expires_in.saturating_sub(10))
+}
+
+/// GET a token endpoint with the given credentials and parse the JSON body.
+/// Returns `None` on HTTP/network/parse error.
+async fn fetch_token_body(
+    http: &Client,
+    url: Url,
+    auth: RealmAuth<'_>,
+) -> Option<serde_json::Value> {
+    let req = http.get(url);
+    let req = match auth {
+        RealmAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
+        RealmAuth::Bearer(token) => req.bearer_auth(token),
+    };
+    req.send().await.ok()?.json().await.ok()
+}
+
+/// Exchange credentials for a token, retrying without the scope.
+///
+/// Some registries (e.g. Docker Hub) issue a scope in the `/v2/` 401 challenge
+/// that their own token endpoint then rejects. The retry is skipped when there
+/// was no scope to drop, since it would repeat an identical request.
+async fn exchange_with_scope_fallback(
+    http: &Client,
+    realm: &Url,
+    service: Option<&str>,
+    scope: Option<&str>,
+    auth: RealmAuth<'_>,
+) -> Option<(String, Duration)> {
+    if let Some(body) = fetch_token_body(http, realm_url(realm, service, scope), auth).await
+        && let Some(token) = extract_token(&body)
+    {
+        return Some((token, token_ttl(&body)));
+    }
+
+    if scope.is_some()
+        && let Some(body) = fetch_token_body(http, realm_url(realm, service, None), auth).await
+        && let Some(token) = extract_token(&body)
+    {
+        return Some((token, token_ttl(&body)));
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Access token auth
+// ---------------------------------------------------------------------------
+
+fn bearer_header(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// How an access token was successfully presented to a Docker v2 token realm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealmMode {
+    /// Passed straight through as `Authorization: Bearer`.
+    Passthrough,
+    /// Basic, with the configured username and the token as the password.
+    BasicConfiguredUser,
+    /// Basic, with the username decoded from the token's `sub` claim.
+    BasicTokenSubject,
+    /// Basic, with the token as both username and password — Docker's
+    /// identity-token convention.
+    BasicTokenAsUser,
+}
+
+/// Which realm presentations to try, in order.
+///
+/// Pass-through comes first: it is the most likely to work against
+/// Artifactory (the realm is the same front door that accepts the token) and
+/// it needs no username, which matters because a token-only profile has none.
+///
+/// Once a mode is known to work it is the only one attempted. Besides saving
+/// round trips, that stops repeated failing Basic attempts carrying a *real*
+/// username from counting against Artifactory's "Max Failed Login Attempts"
+/// policy for that user.
+fn realm_attempt_order(
+    sticky: Option<RealmMode>,
+    has_username: bool,
+    has_subject: bool,
+) -> Vec<RealmMode> {
+    if let Some(mode) = sticky {
+        return vec![mode];
+    }
+
+    let mut order = vec![RealmMode::Passthrough];
+    if has_username {
+        order.push(RealmMode::BasicConfiguredUser);
+    }
+    if has_subject {
+        order.push(RealmMode::BasicTokenSubject);
+    }
+    order.push(RealmMode::BasicTokenAsUser);
+    order
+}
+
+/// A JFrog-style access token sent as `Authorization: Bearer <token>` — the
+/// way the Terraform `jfrog/artifactory` provider authenticates.
+///
+/// Needs no username, which is the point: an Artifactory profile can
+/// authenticate with a token alone.
+///
+/// **`get_authorization` is unconditional and stateless, and must stay that
+/// way.** `RegistryClient::for_artifactory_repo` shares one
+/// `Arc<dyn Credentials>` between the client for the Artifactory REST API
+/// (`/api/repositories`) and the client for a Docker repo-key
+/// (`/api/docker/<key>/v2/...`). Those endpoints have different auth
+/// verifiers, and the raw access token is the only value valid at both.
+///
+/// So the challenge path below must never write state that `get_authorization`
+/// reads: caching a repo-scoped token minted by the Docker realm would make
+/// the next REST call present the wrong credential and 401. That is the same
+/// failure as the Docker Hub scope cascade — see `BearerCredentials` — reached
+/// by a different route. Only *which presentation worked* is remembered, which
+/// is neither a secret nor scoped to an endpoint.
+pub struct AccessTokenCredentials {
+    /// Trust anchor for realm checks. Only the host and port are compared, so
+    /// this stays valid for path-scoped derivations of the same client.
+    registry: Url,
+    token: String,
+    /// Optional, and only ever used to fill in the username of a Basic
+    /// fallback against the token realm.
+    username: Option<String>,
+    realm_mode: Mutex<Option<RealmMode>>,
+}
+
+impl AccessTokenCredentials {
+    pub fn new(registry: &Url, token: String, username: Option<String>) -> Self {
+        Self {
+            registry: registry.clone(),
+            token,
+            username,
+            realm_mode: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl Credentials for AccessTokenCredentials {
+    async fn get_authorization(&self, _http: &Client) -> Option<String> {
+        Some(bearer_header(&self.token))
+    }
+
+    async fn get_authorization_for_challenge(
+        &self,
+        http: &Client,
+        www_auth: &str,
+    ) -> Option<String> {
+        // Reached only when the registry rejected the raw access token and
+        // asked for a Docker v2 scoped token instead.
+        let challenge = parse_bearer_challenge(www_auth)?;
+        let token_url = Url::parse(&challenge.realm).ok()?;
+
+        // Guard: an access token is a platform-wide credential, so require the
+        // realm to be the registry's own origin — not merely a related domain.
+        if !is_same_origin_realm(&token_url, &self.registry) {
+            return None;
+        }
+
+        let subject = jwt_subject_username(&self.token);
+        let sticky = *self.realm_mode.lock().await;
+
+        for mode in realm_attempt_order(sticky, self.username.is_some(), subject.is_some()) {
+            let auth = match mode {
+                RealmMode::Passthrough => RealmAuth::Bearer(&self.token),
+                RealmMode::BasicConfiguredUser => match self.username.as_deref() {
+                    Some(username) => RealmAuth::Basic {
+                        username,
+                        password: &self.token,
+                    },
+                    None => continue,
+                },
+                RealmMode::BasicTokenSubject => match subject.as_deref() {
+                    Some(username) => RealmAuth::Basic {
+                        username,
+                        password: &self.token,
+                    },
+                    None => continue,
+                },
+                RealmMode::BasicTokenAsUser => RealmAuth::Basic {
+                    username: &self.token,
+                    password: &self.token,
+                },
+            };
+
+            if let Some((minted, _ttl)) = exchange_with_scope_fallback(
+                http,
+                &token_url,
+                challenge.service.as_deref(),
+                challenge.scope.as_deref(),
+                auth,
+            )
+            .await
+            {
+                *self.realm_mode.lock().await = Some(mode);
+                // Deliberately not cached — see the note on the struct.
+                return Some(bearer_header(&minted));
+            }
+        }
+
+        None
     }
 }
 
@@ -398,48 +644,190 @@ impl KeyringStore {
 }
 
 // ---------------------------------------------------------------------------
-// Password prompt
+// Secret prompt / resolution
 // ---------------------------------------------------------------------------
 
-/// Prompt for a password on the terminal with input masking.
-///
-/// Falls back to an empty string on I/O error (caller should treat that as
-/// "no password provided").
-pub fn prompt_password(username: &str) -> anyhow::Result<String> {
-    rpassword::prompt_password(format!("Password for {username}: ")).map_err(Into::into)
+/// Prompt for a secret on the terminal with input masking.
+pub fn prompt_secret(label: &str) -> anyhow::Result<String> {
+    rpassword::prompt_password(format!("{label}: ")).map_err(Into::into)
 }
 
-/// Resolve a password using the following priority:
-/// 1. Already provided (e.g. from `--password` CLI flag).
-/// 2. OS keychain lookup via `KeyringStore`.
+/// Prompt for a password on the terminal with input masking.
+pub fn prompt_password(username: &str) -> anyhow::Result<String> {
+    prompt_secret(&format!("Password for {username}"))
+}
+
+/// Resolve a secret using the following priority:
+/// 1. Already provided (e.g. from a CLI flag).
+/// 2. OS keychain lookup via `KeyringStore`, under `account`.
 /// 3. Interactive terminal prompt (masked).
 ///
-/// If `store_on_prompt` is true and the password came from the prompt, it is
+/// If `store_on_prompt` is true and the secret came from the prompt, it is
 /// saved to the keychain for future sessions.
-pub fn resolve_password(
-    username: &str,
+///
+/// `account` is the keyring account name: a username for a password, or
+/// [`TOKEN_ACCOUNT`] for an access token.
+pub fn resolve_secret(
+    account: &str,
+    prompt_label: &str,
     provided: Option<&str>,
     keyring: &KeyringStore,
     store_on_prompt: bool,
 ) -> anyhow::Result<String> {
-    if let Some(pw) = provided {
-        return Ok(pw.to_owned());
+    if let Some(secret) = provided {
+        return Ok(secret.to_owned());
     }
 
-    if let Some(pw) = keyring.get_password(username) {
-        return Ok(pw);
+    if let Some(secret) = keyring.get_password(account) {
+        return Ok(secret);
     }
 
-    let pw = prompt_password(username)?;
-    if store_on_prompt && !pw.is_empty() {
-        let _ = keyring.set_password(username, &pw);
+    let secret = prompt_secret(prompt_label)?;
+    if store_on_prompt && !secret.is_empty() {
+        let _ = keyring.set_password(account, &secret);
     }
-    Ok(pw)
+    Ok(secret)
+}
+
+// ---------------------------------------------------------------------------
+// Access token resolution
+// ---------------------------------------------------------------------------
+
+/// First candidate that is non-empty once trimmed.
+fn first_non_empty<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// An access token from the environment, if any is set.
+fn env_access_token() -> Option<String> {
+    let values: Vec<Option<String>> = ENV_ACCESS_TOKEN_VARS
+        .iter()
+        .map(|key| std::env::var(key).ok())
+        .collect();
+    first_non_empty(values.iter().map(Option::as_deref))
+}
+
+/// Resolve an access token: environment first, then the OS keychain.
+///
+/// The environment wins so a token can be overridden for one invocation
+/// without disturbing what is stored. A token that came from the environment
+/// is deliberately *not* written to the keychain — an ambient override should
+/// not silently become persistent state.
+///
+/// Returns `None` when neither source has one; the caller decides whether to
+/// prompt (interactively) or fall back to anonymous access.
+pub fn resolve_access_token(keyring: &KeyringStore) -> Option<String> {
+    if let Some(token) = env_access_token() {
+        return Some(token);
+    }
+    let stored = keyring.get_password(TOKEN_ACCOUNT)?;
+    first_non_empty([Some(stored.as_str())])
+}
+
+/// Clean up a token as pasted by a human.
+///
+/// Pasted tokens routinely arrive wrapped in quotes from a shell snippet, with
+/// a leading `Bearer ` from a copied header, or with trailing whitespace. Any
+/// of those produces a 401 that is indistinguishable from a wrong token, so
+/// strip them rather than making the user debug it.
+pub fn sanitize_pasted_token(raw: &str) -> String {
+    let mut s = raw.trim();
+
+    for quote in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(quote) && s.ends_with(quote) {
+            s = &s[1..s.len() - 1];
+            break;
+        }
+    }
+
+    let s = s.trim();
+    let s = s
+        .strip_prefix("Bearer ")
+        .or_else(|| s.strip_prefix("bearer "))
+        .unwrap_or(s);
+
+    s.trim().to_owned()
+}
+
+/// The username embedded in a JFrog access token's `sub` claim.
+///
+/// JFrog access tokens are JWTs whose subject looks like
+/// `jfrt@<instance-id>/users/<name>`; the trailing segment is the username.
+/// Used only to fill in the username field of a Basic fallback against a token
+/// realm — never as a trust decision, so the signature is deliberately not
+/// verified and the payload is not otherwise inspected.
+///
+/// Returns `None` for JFrog *reference* tokens (short opaque strings, not
+/// JWTs) and for anything malformed.
+fn jwt_subject_username(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() {
+        return None; // more than three segments: not a JWT
+    }
+
+    let bytes = B64_URL.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let subject = claims["sub"].as_str()?;
+
+    let name = subject.rsplit('/').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Realm trust validation
 // ---------------------------------------------------------------------------
+
+/// `https`, or plain `http` only for a loopback host so local dev registries
+/// keep working.
+fn realm_scheme_ok(realm: &Url) -> bool {
+    match realm.scheme() {
+        "https" => true,
+        "http" => LOOPBACK_HOSTS.contains(&realm.host_str().unwrap_or("")),
+        _ => false,
+    }
+}
+
+/// Returns `true` if `realm` is the *same origin* as `registry`.
+///
+/// Stricter than [`is_trusted_realm`], and used for access-token auth only.
+/// That function's same-registered-domain heuristic exists because Docker Hub
+/// splits `auth.docker.io` from `registry-1.docker.io`; it means a registry at
+/// `artifactory.corp.example.com` would also trust every other host under
+/// `example.com` — a marketing site, a shared-hosting subdomain, a dangling
+/// CNAME open to takeover.
+///
+/// What would leak there is not one repository's pull token but a JFrog
+/// platform access token, valid across the whole REST API. Artifactory's token
+/// realm is always same-origin, so the relaxation buys nothing here. Fail
+/// closed: an unusual proxy that moves the realm to another host or port gets a
+/// visible auth error instead of silently disclosing the token.
+fn is_same_origin_realm(realm: &Url, registry: &Url) -> bool {
+    if !realm_scheme_ok(realm) {
+        return false;
+    }
+
+    let (Some(realm_host), Some(registry_host)) = (realm.host_str(), registry.host_str()) else {
+        return false;
+    };
+
+    if realm_host.is_empty() || registry_host.is_empty() {
+        return false;
+    }
+
+    realm_host == registry_host && realm.port_or_known_default() == registry.port_or_known_default()
+}
 
 /// Returns `true` if `realm` is a host we should send credentials to.
 ///
@@ -453,16 +841,8 @@ pub fn resolve_password(
 ///    service under the same domain (e.g. `auth.docker.io` for `registry-1.docker.io`).
 ///    It does not handle multi-label public suffixes (e.g. `.co.uk`).
 fn is_trusted_realm(realm: &Url, registry: &Url) -> bool {
-    let loopback = ["localhost", "127.0.0.1", "::1"];
-
-    match realm.scheme() {
-        "https" => {}
-        "http" => {
-            if !loopback.contains(&realm.host_str().unwrap_or("")) {
-                return false;
-            }
-        }
-        _ => return false,
+    if !realm_scheme_ok(realm) {
+        return false;
     }
 
     let realm_host = realm.host_str().unwrap_or("");
@@ -611,5 +991,241 @@ mod tests {
             &u("https://10.0.0.1:5001/token"),
             &u("https://10.0.0.1:5000/v2/")
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Realm exchange helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn realm_url_appends_service_and_scope() {
+        let url = realm_url(
+            &u("https://auth.example.com/token"),
+            Some("registry.example.com"),
+            Some("repository:nginx:pull"),
+        );
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("service".to_owned(), "registry.example.com".to_owned()),
+                ("scope".to_owned(), "repository:nginx:pull".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn realm_url_preserves_existing_realm_query() {
+        // A realm that already carries query parameters must keep them —
+        // `query_pairs_mut` appends rather than replacing.
+        let url = realm_url(
+            &u("https://auth.example.com/token?tenant=acme"),
+            Some("svc"),
+            None,
+        );
+        let keys: Vec<String> = url.query_pairs().map(|(k, _)| k.into_owned()).collect();
+        assert_eq!(keys, vec!["tenant".to_owned(), "service".to_owned()]);
+    }
+
+    #[test]
+    fn extract_token_prefers_token_over_access_token() {
+        let body = serde_json::json!({ "token": "aaa", "access_token": "bbb" });
+        assert_eq!(extract_token(&body).as_deref(), Some("aaa"));
+
+        let only_access = serde_json::json!({ "access_token": "bbb" });
+        assert_eq!(extract_token(&only_access).as_deref(), Some("bbb"));
+
+        assert!(extract_token(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn token_ttl_subtracts_ten_second_skew() {
+        let body = serde_json::json!({ "expires_in": 600 });
+        assert_eq!(token_ttl(&body), Duration::from_secs(590));
+
+        // Must not underflow for an implausibly short lifetime.
+        let tiny = serde_json::json!({ "expires_in": 3 });
+        assert_eq!(token_ttl(&tiny), Duration::from_secs(0));
+    }
+
+    #[test]
+    fn token_ttl_defaults_when_expires_in_absent() {
+        assert_eq!(token_ttl(&serde_json::json!({})), Duration::from_secs(290));
+    }
+
+    // -----------------------------------------------------------------------
+    // Same-origin realm guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn same_origin_realm_requires_exact_host() {
+        assert!(is_same_origin_realm(
+            &u("https://artifactory.example.com/artifactory/api/docker/foo/v2/token"),
+            &u("https://artifactory.example.com/artifactory/")
+        ));
+    }
+
+    #[test]
+    fn same_origin_realm_rejects_sibling_subdomain() {
+        // `is_trusted_realm` would allow this (shared registered domain), which
+        // is exactly the leak this guard exists to prevent: the credential at
+        // stake is a platform-wide JFrog access token.
+        let realm = u("https://marketing.example.com/token");
+        let registry = u("https://artifactory.example.com/artifactory/");
+        assert!(is_trusted_realm(&realm, &registry));
+        assert!(!is_same_origin_realm(&realm, &registry));
+    }
+
+    #[test]
+    fn same_origin_realm_rejects_port_mismatch() {
+        assert!(!is_same_origin_realm(
+            &u("https://artifactory.example.com:8443/token"),
+            &u("https://artifactory.example.com/artifactory/")
+        ));
+    }
+
+    #[test]
+    fn same_origin_realm_allows_loopback_http() {
+        assert!(is_same_origin_realm(
+            &u("http://localhost:5000/v2/token"),
+            &u("http://localhost:5000/")
+        ));
+        assert!(!is_same_origin_realm(
+            &u("http://artifactory.example.com/token"),
+            &u("http://artifactory.example.com/")
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Token helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn first_non_empty_skips_blank_and_trims() {
+        assert_eq!(
+            first_non_empty([None, Some(""), Some("   "), Some("  tok  "), Some("later")])
+                .as_deref(),
+            Some("tok")
+        );
+        assert!(first_non_empty([None, Some(""), Some("\t\n")]).is_none());
+    }
+
+    #[test]
+    fn sanitize_pasted_token_strips_whitespace_and_bearer_prefix() {
+        assert_eq!(sanitize_pasted_token("  abc123\n"), "abc123");
+        assert_eq!(sanitize_pasted_token("Bearer abc123"), "abc123");
+        assert_eq!(sanitize_pasted_token("bearer abc123"), "abc123");
+        assert_eq!(sanitize_pasted_token("\"abc123\""), "abc123");
+        assert_eq!(sanitize_pasted_token("'abc123'"), "abc123");
+        assert_eq!(sanitize_pasted_token("\"Bearer abc123\""), "abc123");
+        // A token that merely contains the word must survive intact.
+        assert_eq!(sanitize_pasted_token("Bearerish"), "Bearerish");
+    }
+
+    /// Build an unsigned JWT with the given payload — enough for
+    /// `jwt_subject_username`, which never verifies the signature.
+    fn fake_jwt(payload: serde_json::Value) -> String {
+        let header = B64_URL.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let body = B64_URL.encode(payload.to_string().as_bytes());
+        format!("{header}.{body}.not-a-real-signature")
+    }
+
+    #[test]
+    fn jwt_subject_extracts_username_from_jfrog_sub() {
+        let token = fake_jwt(serde_json::json!({
+            "sub": "jfrt@01h2x3/users/ci-bot",
+        }));
+        assert_eq!(jwt_subject_username(&token).as_deref(), Some("ci-bot"));
+    }
+
+    #[test]
+    fn jwt_subject_none_for_opaque_reference_token() {
+        // JFrog reference tokens are short opaque strings, not JWTs.
+        assert!(jwt_subject_username("cmVmdGtuOjAxOjE3MjgwMDA").is_none());
+    }
+
+    #[test]
+    fn jwt_subject_none_for_malformed_token() {
+        assert!(jwt_subject_username("").is_none());
+        assert!(jwt_subject_username("a.b").is_none());
+        assert!(jwt_subject_username("a.b.c.d").is_none());
+        assert!(jwt_subject_username("a.!!!not-base64!!!.c").is_none());
+        // Valid base64 that is not JSON.
+        let not_json = B64_URL.encode(b"plain text");
+        assert!(jwt_subject_username(&format!("a.{not_json}.c")).is_none());
+        // JSON without a `sub` claim.
+        assert!(jwt_subject_username(&fake_jwt(serde_json::json!({ "iss": "x" }))).is_none());
+    }
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s = Secret::new("super-secret-token");
+        let rendered = format!("{s:?}");
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "Debug must not disclose the secret, got: {rendered}"
+        );
+        assert_eq!(rendered, "Secret(***)");
+        // The value is still reachable deliberately.
+        assert_eq!(s.expose(), "super-secret-token");
+    }
+
+    // -----------------------------------------------------------------------
+    // Access token credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bearer_header_formats_authorization_value() {
+        assert_eq!(bearer_header("abc123"), "Bearer abc123");
+    }
+
+    #[test]
+    fn access_token_credentials_always_send_the_raw_token() {
+        // The REST client and the Docker-repo-scoped client share this
+        // credential, so the fast path must be stateless and unconditional.
+        let creds = AccessTokenCredentials::new(
+            &u("https://artifactory.example.com/artifactory/"),
+            "tok-abc".to_owned(),
+            None,
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let http = Client::new();
+        let first = rt.block_on(creds.get_authorization(&http));
+        let second = rt.block_on(creds.get_authorization(&http));
+        assert_eq!(first.as_deref(), Some("Bearer tok-abc"));
+        assert_eq!(first, second, "must not drift between calls");
+    }
+
+    #[test]
+    fn realm_attempt_order_prefers_bearer_passthrough() {
+        // No username, not a JWT: pass-through, then the identity-token
+        // convention as a last resort.
+        assert_eq!(
+            realm_attempt_order(None, false, false),
+            vec![RealmMode::Passthrough, RealmMode::BasicTokenAsUser]
+        );
+
+        assert_eq!(
+            realm_attempt_order(None, true, true),
+            vec![
+                RealmMode::Passthrough,
+                RealmMode::BasicConfiguredUser,
+                RealmMode::BasicTokenSubject,
+                RealmMode::BasicTokenAsUser,
+            ]
+        );
+    }
+
+    #[test]
+    fn realm_attempt_order_sticks_to_a_known_good_mode() {
+        // Avoids re-sending failing Basic attempts with a real username, which
+        // can trip Artifactory's failed-login lockout.
+        assert_eq!(
+            realm_attempt_order(Some(RealmMode::BasicConfiguredUser), true, true),
+            vec![RealmMode::BasicConfiguredUser]
+        );
     }
 }

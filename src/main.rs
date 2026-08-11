@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
             url,
             username: cli.username.clone(),
             registry_type: Default::default(),
+            ..Default::default()
         };
         config.registry.insert(0, profile);
         0

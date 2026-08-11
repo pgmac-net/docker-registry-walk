@@ -10,11 +10,12 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use url::Url;
 
-use crate::config::{RegistryProfile, RegistryType};
+use crate::config::{AuthKind, AuthMode, RegistryProfile};
 use crate::ops::diff::DiffLayer;
 use crate::registry::{
-    ArtifactoryRepo, BasicCredentials, BearerCredentials, ImageConfigBlob, KeyringStore, Manifest,
-    RegistryClient, RegistryError, search_dockerhub,
+    AccessTokenCredentials, ArtifactoryRepo, BasicCredentials, BearerCredentials, Credentials,
+    ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError, Secret, TOKEN_ACCOUNT,
+    resolve_access_token, sanitize_pasted_token, search_dockerhub,
 };
 
 use super::app::{
@@ -40,7 +41,11 @@ pub enum AppEvent {
     PasswordEntered {
         profile_name: String,
         username: String,
-        password: String,
+        password: Secret,
+    },
+    TokenEntered {
+        profile_name: String,
+        token: Secret,
     },
     TagsPage(String, Vec<String>, bool),
     TagsError(String),
@@ -256,30 +261,38 @@ pub(super) async fn event_loop(
                             && matches!(app.modal, Modal::None)
                         {
                             let profile = &app.profiles[app.active_profile_idx];
-                            if let Some(username) = profile.username.clone() {
-                                app.modal = Modal::Input {
+                            let profile_name = profile.name.clone();
+                            app.modal = match auth_prompt_for(profile) {
+                                Some(AuthPrompt::Password { username }) => Modal::Input {
                                     prompt: format!("Password for {username}:"),
                                     input: InputState::default(),
                                     on_confirm: InputAction::EnterPassword {
-                                        profile_name: profile.name.clone(),
+                                        profile_name,
                                         username,
                                     },
-                                };
-                            }
+                                },
+                                Some(AuthPrompt::Token) => Modal::Input {
+                                    prompt: format!("Access token for {profile_name}:"),
+                                    input: InputState::default(),
+                                    on_confirm: InputAction::EnterToken { profile_name },
+                                },
+                                None => Modal::None,
+                            };
                         }
                     }
                     AppEvent::PasswordEntered { profile_name, username, password } => {
                         let store = KeyringStore::new(&profile_name);
-                        let _ = store.set_password(&username, &password);
-                        if let Some(profile) = app.profiles.iter().find(|p| p.name == profile_name).cloned() {
-                            let client = make_client_for_profile(&profile);
-                            clients.insert(profile_name.clone(), client);
-                        }
-                        if active_name == profile_name {
-                            app.start_registry_switch(app.active_profile_idx);
-                            app.catalog_retry_pending = true;
-                            spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
-                        }
+                        let _ = store.set_password(&username, password.expose());
+                        retry_after_credential_change(
+                            &mut app, &mut clients, &profile_name, &active_name, &tx,
+                        );
+                    }
+                    AppEvent::TokenEntered { profile_name, token } => {
+                        let store = KeyringStore::new(&profile_name);
+                        let _ = store.set_password(TOKEN_ACCOUNT, token.expose());
+                        retry_after_credential_change(
+                            &mut app, &mut clients, &profile_name, &active_name, &tx,
+                        );
                     }
                     AppEvent::DockerHubSearch { query, results } => {
                         if let Modal::SearchPicker {
@@ -382,6 +395,7 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         // Handled in event_loop; should not reach here.
         AppEvent::ReposError { .. }
         | AppEvent::PasswordEntered { .. }
+        | AppEvent::TokenEntered { .. }
         | AppEvent::DockerHubSearch { .. }
         | AppEvent::DockerHubSearchError(_)
         | AppEvent::ArtifactoryRepos(_)
@@ -873,7 +887,18 @@ fn handle_input_confirm(
                 let _ = tx.try_send(AppEvent::PasswordEntered {
                     profile_name,
                     username,
-                    password: value,
+                    password: Secret::new(value),
+                });
+            }
+        }
+        InputAction::EnterToken { profile_name } => {
+            // Tokens are usually pasted, so strip the quoting, `Bearer `
+            // prefix and stray whitespace that a paste tends to bring along.
+            let token = sanitize_pasted_token(&value);
+            if !token.is_empty() {
+                let _ = tx.try_send(AppEvent::TokenEntered {
+                    profile_name,
+                    token: Secret::new(token),
                 });
             }
         }
@@ -901,28 +926,160 @@ fn handle_prune(app: &mut App, client: &RegistryClient, tx: &mpsc::Sender<AppEve
 // Client factory
 // ------------------------------------------------------------------
 
+/// Build the client for a profile, resolving whichever secrets its configured
+/// [`AuthMode`] can use.
+///
+/// The choice of credential lives in `RegistryProfile::auth_kind`, which is
+/// pure and unit-tested against the whole matrix; this function only does the
+/// impure part (keyring and environment lookups) and the construction.
 fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
     let url = match Url::parse(&profile.url) {
         Ok(u) => u,
         Err(_) => return RegistryClient::new(Url::parse("http://localhost:5000").unwrap()),
     };
 
-    if let Some(username) = &profile.username {
-        let store = KeyringStore::new(&profile.name);
-        if let Some(password) = store.get_password(username) {
-            // Artifactory's Docker v2 endpoint and REST API authenticate via
-            // plain HTTP Basic (username + API key/identity token), not
-            // Bearer token exchange.
-            if profile.registry_type == RegistryType::Artifactory {
-                let creds = BasicCredentials::new(username, &password);
-                return RegistryClient::new(url).with_credentials(Arc::new(creds));
-            }
-            let creds = BearerCredentials::new(&url, username.clone(), password);
-            return RegistryClient::new(url).with_credentials(Arc::new(creds));
+    let store = KeyringStore::new(&profile.name);
+
+    // Only look for a token when the profile could actually use one, so a
+    // JFROG_ACCESS_TOKEN exported in a shell cannot change how an unrelated
+    // registry is authenticated.
+    let token = if profile.wants_access_token() {
+        resolve_access_token(&store)
+    } else {
+        None
+    };
+    let password = profile
+        .username
+        .as_deref()
+        .and_then(|username| store.get_password(username));
+
+    let creds: Arc<dyn Credentials> = match profile.auth_kind(token.is_some(), password.is_some()) {
+        AuthKind::None => return RegistryClient::new(url),
+        AuthKind::AccessToken => Arc::new(AccessTokenCredentials::new(
+            &url,
+            token.unwrap_or_default(),
+            profile.username.clone(),
+        )),
+        // Artifactory's Docker v2 endpoint and REST API both accept plain HTTP
+        // Basic (username + API key / identity token); no Bearer challenge is
+        // issued, and `BearerCredentials` sends no header at all without one.
+        AuthKind::Basic => Arc::new(BasicCredentials::new(
+            profile.username.as_deref().unwrap_or_default(),
+            password.as_deref().unwrap_or_default(),
+        )),
+        AuthKind::Bearer => Arc::new(BearerCredentials::new(
+            &url,
+            profile.username.clone().unwrap_or_default(),
+            password.unwrap_or_default(),
+        )),
+    };
+
+    RegistryClient::new(url).with_credentials(creds)
+}
+
+/// Whether `key` is this profile's client-cache key, either the root entry or
+/// an Artifactory repo-key scoped entry (`<profile>#<repo-key>`).
+///
+/// Config validation rejects `#` in profile names, so the prefix is
+/// unambiguous.
+fn is_client_key_for(key: &str, profile_name: &str) -> bool {
+    key == profile_name
+        || key
+            .strip_prefix(profile_name)
+            .is_some_and(|rest| rest.starts_with('#'))
+}
+
+/// Rebuild a profile's root client and every already-scoped
+/// `<profile>#<repo-key>` entry derived from it.
+///
+/// Rebuilding only the root is not enough: scoped clients hold their own
+/// `Arc<dyn Credentials>` cloned at the time they were derived, so they would
+/// keep using the credential that just failed. Re-deriving them from the fresh
+/// root is what makes a newly-entered password or token take effect in the
+/// session the user is actually in.
+fn rebuild_clients_for_profile(
+    clients: &mut HashMap<String, RegistryClient>,
+    profile: &RegistryProfile,
+) {
+    // Collect first: the map is mutated below.
+    let scoped_keys: Vec<String> = clients
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(&profile.name)
+                .and_then(|rest| rest.strip_prefix('#'))
+                .map(str::to_owned)
+        })
+        .collect();
+
+    let root = make_client_for_profile(profile);
+
+    for repo_key in scoped_keys {
+        if let Ok(scoped) = root.for_artifactory_repo(&repo_key) {
+            clients.insert(format!("{}#{repo_key}", profile.name), scoped);
         }
     }
 
-    RegistryClient::new(url)
+    clients.insert(profile.name.clone(), root);
+}
+
+/// Re-derive a profile's clients after the user entered a new credential, and
+/// reload the catalog when the profile on screen is the one that changed.
+fn retry_after_credential_change(
+    app: &mut App,
+    clients: &mut HashMap<String, RegistryClient>,
+    profile_name: &str,
+    active_name: &str,
+    tx: &mpsc::Sender<AppEvent>,
+) {
+    let Some(profile) = app
+        .profiles
+        .iter()
+        .find(|p| p.name == profile_name)
+        .cloned()
+    else {
+        return;
+    };
+
+    rebuild_clients_for_profile(clients, &profile);
+
+    // The active client may be an Artifactory repo-key scoped entry
+    // (`<profile>#<repo-key>`), so match on the profile rather than requiring
+    // the key to equal the profile name — otherwise re-auth silently does
+    // nothing whenever the user is inside a repo-key.
+    if !is_client_key_for(active_name, profile_name) {
+        return;
+    }
+
+    if let Some(client) = clients.get(active_name).cloned() {
+        app.restart_catalog_load();
+        spawn_repos_fetch(client, None, tx.clone());
+    }
+}
+
+/// Which credential the user should be asked for after an auth failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthPrompt {
+    Password { username: String },
+    Token,
+}
+
+/// What to prompt for on a 401, or `None` when the profile is anonymous and
+/// there is nothing useful to ask.
+///
+/// Token-authenticated profiles have no username, which the previous
+/// username-gated check treated as "nothing to ask" — so they got no prompt at
+/// all.
+fn auth_prompt_for(profile: &RegistryProfile) -> Option<AuthPrompt> {
+    if profile.wants_access_token() && profile.username.is_none() {
+        return Some(AuthPrompt::Token);
+    }
+    if profile.auth == AuthMode::Token {
+        return Some(AuthPrompt::Token);
+    }
+    profile
+        .username
+        .clone()
+        .map(|username| AuthPrompt::Password { username })
 }
 
 /// The client to scope from when the user picks an Artifactory repo-key.
@@ -1213,6 +1370,7 @@ fn spawn_artifactory_repos_fetch(client: RegistryClient, tx: mpsc::Sender<AppEve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RegistryType;
 
     /// Re-selecting an Artifactory repo-key (e.g. via the picker reopened
     /// mid-browse, issue #78) must always scope from the profile's root
@@ -1232,5 +1390,136 @@ mod tests {
 
         let found = artifactory_root_client(&clients, "profileA").unwrap();
         assert_eq!(found.base_url(), root.base_url());
+    }
+
+    // -----------------------------------------------------------------------
+    // Client factory
+    // -----------------------------------------------------------------------
+
+    /// An anonymous profile, so building a client does no keyring or
+    /// environment I/O.
+    fn anon_profile(name: &str, url: &str, kind: RegistryType) -> RegistryProfile {
+        RegistryProfile {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            username: None,
+            registry_type: kind,
+            auth: AuthMode::Auto,
+        }
+    }
+
+    #[test]
+    fn make_client_for_profile_falls_back_on_unparseable_url() {
+        let profile = anon_profile("broken", "not-a-url", RegistryType::Standard);
+        let client = make_client_for_profile(&profile);
+        assert_eq!(client.base_url().as_str(), "http://localhost:5000/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Client-cache keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_client_key_for_matches_root_and_scoped_only() {
+        assert!(is_client_key_for("art", "art"));
+        assert!(is_client_key_for("art#docker-local", "art"));
+
+        // A different profile that merely shares a prefix must not match, or a
+        // credential change would clobber an unrelated registry's client.
+        assert!(!is_client_key_for("artifactory", "art"));
+        assert!(!is_client_key_for("artifactory#docker-local", "art"));
+        assert!(!is_client_key_for("other#docker-local", "art"));
+        assert!(!is_client_key_for("", "art"));
+    }
+
+    #[test]
+    fn rebuild_clients_for_profile_refreshes_scoped_entries() {
+        // Scoped clients hold their own credentials `Arc`, so a rebuild that
+        // only replaced the root would leave them using the stale credential.
+        let profile = anon_profile(
+            "art",
+            "https://art.example.com/artifactory/",
+            RegistryType::Artifactory,
+        );
+
+        let root = make_client_for_profile(&profile);
+        let scoped_a = root.for_artifactory_repo("docker-local").unwrap();
+        let scoped_b = root.for_artifactory_repo("docker-remote").unwrap();
+
+        let mut clients = HashMap::new();
+        clients.insert("art".to_owned(), root.clone());
+        clients.insert("art#docker-local".to_owned(), scoped_a.clone());
+        clients.insert("art#docker-remote".to_owned(), scoped_b.clone());
+        // An unrelated profile must be left alone.
+        let other = make_client_for_profile(&anon_profile(
+            "other",
+            "https://other.example.com/",
+            RegistryType::Standard,
+        ));
+        clients.insert("other".to_owned(), other.clone());
+
+        rebuild_clients_for_profile(&mut clients, &profile);
+
+        assert_eq!(clients.len(), 4, "no entries added or dropped");
+        assert_eq!(clients["art"].base_url(), root.base_url());
+        // Re-derived from the fresh root, so still singly-scoped — not
+        // double-appended (the issue #78 failure mode).
+        assert_eq!(
+            clients["art#docker-local"].base_url(),
+            scoped_a.base_url(),
+            "scoped base URL must be unchanged and un-doubled"
+        );
+        assert_eq!(clients["art#docker-remote"].base_url(), scoped_b.base_url());
+        assert_eq!(clients["other"].base_url(), other.base_url());
+    }
+
+    // -----------------------------------------------------------------------
+    // Which credential to prompt for
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auth_prompt_for_token_when_auth_is_token() {
+        let mut profile = anon_profile("r", "https://r.example.com/", RegistryType::Standard);
+        profile.auth = AuthMode::Token;
+        assert_eq!(auth_prompt_for(&profile), Some(AuthPrompt::Token));
+
+        // Even with a username configured: token mode does not want a password.
+        profile.username = Some("u".to_owned());
+        assert_eq!(auth_prompt_for(&profile), Some(AuthPrompt::Token));
+    }
+
+    #[test]
+    fn auth_prompt_for_token_for_artifactory_without_username() {
+        // The case the old username-gated check dropped entirely: no username
+        // meant no modal at all, so a token-only profile could never re-auth.
+        let profile = anon_profile(
+            "art",
+            "https://art.example.com/artifactory/",
+            RegistryType::Artifactory,
+        );
+        assert_eq!(auth_prompt_for(&profile), Some(AuthPrompt::Token));
+    }
+
+    #[test]
+    fn auth_prompt_for_password_when_username_present() {
+        let mut profile = anon_profile(
+            "art",
+            "https://art.example.com/artifactory/",
+            RegistryType::Artifactory,
+        );
+        profile.username = Some("ci".to_owned());
+        assert_eq!(
+            auth_prompt_for(&profile),
+            Some(AuthPrompt::Password {
+                username: "ci".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn auth_prompt_for_none_when_anonymous() {
+        // Nothing useful to ask for: no username, and not a token profile.
+        let profile = anon_profile("local", "http://localhost:5000/", RegistryType::Standard);
+        assert_eq!(auth_prompt_for(&profile), None);
     }
 }
