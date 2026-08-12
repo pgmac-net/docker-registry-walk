@@ -549,21 +549,17 @@ impl KeyringStore {
             .or_else(|| self.get_password_secret_tool(username))
     }
 
+    /// A keyring miss is a routine, expected outcome — it falls through to
+    /// `get_password_secret_tool` and then, if that also misses, to an
+    /// anonymous request or a credential prompt. Logging the error here has
+    /// no channel that doesn't corrupt the display: this runs while the TUI
+    /// holds the alternate screen in raw mode, so writing to stderr paints
+    /// garbage over the rendered frame instead of appearing in a terminal
+    /// scrollback anyone would see.
     fn get_password_keyring(&self, username: &str) -> Option<String> {
-        let entry = keyring::Entry::new(&self.service, username);
-        match entry {
-            Ok(e) => match e.get_password() {
-                Ok(p) => Some(p),
-                Err(err) => {
-                    eprintln!("[keyring] get_password error: {err}");
-                    None
-                }
-            },
-            Err(err) => {
-                eprintln!("[keyring] Entry::new error: {err}");
-                None
-            }
-        }
+        keyring::Entry::new(&self.service, username)
+            .and_then(|e| e.get_password())
+            .ok()
     }
 
     fn get_password_secret_tool(&self, username: &str) -> Option<String> {

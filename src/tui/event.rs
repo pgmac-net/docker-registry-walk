@@ -165,7 +165,7 @@ pub(super) async fn event_loop(
 
     // Pre-build client for the initial profile.
     let mut clients: HashMap<String, RegistryClient> = HashMap::new();
-    let init_client = make_client_for_profile(&profiles[initial_idx]);
+    let init_client = make_client_for_profile(&profiles[initial_idx]).await;
     clients.insert(profiles[initial_idx].name.clone(), init_client);
     let mut active_name = profiles[initial_idx].name.clone();
 
@@ -191,9 +191,16 @@ pub(super) async fn event_loop(
             Some(ev) = rx.recv() => {
                 match ev {
                     AppEvent::SwitchRegistry { idx } => {
-                        let profile = &app.profiles[idx];
+                        // Cloned before the await below: `app` is mutated
+                        // by `start_artifactory_switch`/`start_registry_switch`
+                        // right after, so the borrow of `app.profiles[idx]`
+                        // can't be held across a suspend point.
+                        let profile = app.profiles[idx].clone();
                         let name = profile.name.clone();
-                        clients.entry(name.clone()).or_insert_with(|| make_client_for_profile(profile));
+                        if !clients.contains_key(&name) {
+                            let client = make_client_for_profile(&profile).await;
+                            clients.insert(name.clone(), client);
+                        }
                         active_name = name;
                         if profile.is_artifactory() {
                             app.start_artifactory_switch(idx);
@@ -281,18 +288,16 @@ pub(super) async fn event_loop(
                         }
                     }
                     AppEvent::PasswordEntered { profile_name, username, password } => {
-                        let store = KeyringStore::new(&profile_name);
-                        let _ = store.set_password(&username, password.expose());
+                        store_secret(profile_name.clone(), username, password.expose().to_owned()).await;
                         retry_after_credential_change(
                             &mut app, &mut clients, &profile_name, &active_name, &tx,
-                        );
+                        ).await;
                     }
                     AppEvent::TokenEntered { profile_name, token } => {
-                        let store = KeyringStore::new(&profile_name);
-                        let _ = store.set_password(TOKEN_ACCOUNT, token.expose());
+                        store_secret(profile_name.clone(), TOKEN_ACCOUNT.to_owned(), token.expose().to_owned()).await;
                         retry_after_credential_change(
                             &mut app, &mut clients, &profile_name, &active_name, &tx,
-                        );
+                        ).await;
                     }
                     AppEvent::DockerHubSearch { query, results } => {
                         if let Modal::SearchPicker {
@@ -926,32 +931,80 @@ fn handle_prune(app: &mut App, client: &RegistryClient, tx: &mpsc::Sender<AppEve
 // Client factory
 // ------------------------------------------------------------------
 
+/// Secrets resolved for a profile, or absent when it needs none / has none
+/// stored.
+#[derive(Default)]
+struct ResolvedSecrets {
+    token: Option<String>,
+    password: Option<String>,
+}
+
+/// Resolve whichever secrets a profile's configured [`AuthMode`] can use.
+///
+/// Keyring I/O is async-hostile: the `keyring` crate talks to the D-Bus
+/// Secret Service, and its fallback forks the `secret-tool` subprocess. Either
+/// can block for an unbounded time if the collection is locked (an `Unlock`
+/// prompt with no prompter to answer it), so this must not tie up a runtime
+/// worker thread — hence `spawn_blocking` rather than calling straight through.
+///
+/// `profile.name`/`username`/`wants_access_token()` are copied out before the
+/// blocking closure so it owns everything it touches (`spawn_blocking`
+/// requires `'static`).
+async fn resolve_secrets(profile: &RegistryProfile) -> ResolvedSecrets {
+    let name = profile.name.clone();
+    let username = profile.username.clone();
+    let wants_token = profile.wants_access_token();
+
+    tokio::task::spawn_blocking(move || {
+        let store = KeyringStore::new(&name);
+
+        // Only look for a token when the profile could actually use one, so a
+        // JFROG_ACCESS_TOKEN exported in a shell cannot change how an
+        // unrelated registry is authenticated.
+        let token = if wants_token {
+            resolve_access_token(&store)
+        } else {
+            None
+        };
+        let password = username.as_deref().and_then(|u| store.get_password(u));
+
+        ResolvedSecrets { token, password }
+    })
+    .await
+    // A panic inside the closure (not a keyring failure — those are already
+    // `None`) degrades to no secrets, same as any other miss: an anonymous
+    // client, a 401, and the existing credential prompt.
+    .unwrap_or_default()
+}
+
+/// Store a secret in the keyring off the runtime worker pool.
+///
+/// A write can block just as a read can — creating an item in a locked
+/// collection prompts for `Unlock` unconditionally, so this is not merely
+/// symmetric with [`resolve_secrets`], it is the more likely of the two to
+/// hit that case.
+async fn store_secret(profile_name: String, account: String, secret: String) {
+    let _ = tokio::task::spawn_blocking(move || {
+        KeyringStore::new(&profile_name).set_password(&account, &secret)
+    })
+    .await;
+}
+
 /// Build the client for a profile, resolving whichever secrets its configured
 /// [`AuthMode`] can use.
 ///
 /// The choice of credential lives in `RegistryProfile::auth_kind`, which is
 /// pure and unit-tested against the whole matrix; this function only does the
-/// impure part (keyring and environment lookups) and the construction.
-fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
+/// impure part (keyring and environment lookups, via [`resolve_secrets`]) and
+/// the construction.
+async fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
     let url = match Url::parse(&profile.url) {
         Ok(u) => u,
+        // Bad URL costs no keyring I/O — checked before resolving secrets.
         Err(_) => return RegistryClient::new(Url::parse("http://localhost:5000").unwrap()),
     };
 
-    let store = KeyringStore::new(&profile.name);
-
-    // Only look for a token when the profile could actually use one, so a
-    // JFROG_ACCESS_TOKEN exported in a shell cannot change how an unrelated
-    // registry is authenticated.
-    let token = if profile.wants_access_token() {
-        resolve_access_token(&store)
-    } else {
-        None
-    };
-    let password = profile
-        .username
-        .as_deref()
-        .and_then(|username| store.get_password(username));
+    let ResolvedSecrets { token, password } = resolve_secrets(profile).await;
 
     let creds: Arc<dyn Credentials> = match profile.auth_kind(token.is_some(), password.is_some()) {
         AuthKind::None => return RegistryClient::new(url),
@@ -997,7 +1050,7 @@ fn is_client_key_for(key: &str, profile_name: &str) -> bool {
 /// keep using the credential that just failed. Re-deriving them from the fresh
 /// root is what makes a newly-entered password or token take effect in the
 /// session the user is actually in.
-fn rebuild_clients_for_profile(
+async fn rebuild_clients_for_profile(
     clients: &mut HashMap<String, RegistryClient>,
     profile: &RegistryProfile,
 ) {
@@ -1011,7 +1064,7 @@ fn rebuild_clients_for_profile(
         })
         .collect();
 
-    let root = make_client_for_profile(profile);
+    let root = make_client_for_profile(profile).await;
 
     for repo_key in scoped_keys {
         if let Ok(scoped) = root.for_artifactory_repo(&repo_key) {
@@ -1024,7 +1077,7 @@ fn rebuild_clients_for_profile(
 
 /// Re-derive a profile's clients after the user entered a new credential, and
 /// reload the catalog when the profile on screen is the one that changed.
-fn retry_after_credential_change(
+async fn retry_after_credential_change(
     app: &mut App,
     clients: &mut HashMap<String, RegistryClient>,
     profile_name: &str,
@@ -1040,7 +1093,7 @@ fn retry_after_credential_change(
         return;
     };
 
-    rebuild_clients_for_profile(clients, &profile);
+    rebuild_clients_for_profile(clients, &profile).await;
 
     // The active client may be an Artifactory repo-key scoped entry
     // (`<profile>#<repo-key>`), so match on the profile rather than requiring
@@ -1421,9 +1474,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_secrets_returns_nothing_for_anonymous_profile() {
+        // No username and not in token mode: must touch no keyring at all,
+        // not merely return empty results from one.
+        let profile = anon_profile("local", "http://localhost:5000/", RegistryType::Standard);
+        let secrets = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(resolve_secrets(&profile));
+        assert!(secrets.token.is_none());
+        assert!(secrets.password.is_none());
+    }
+
+    #[test]
     fn make_client_for_profile_falls_back_on_unparseable_url() {
         let profile = anon_profile("broken", "not-a-url", RegistryType::Standard);
-        let client = make_client_for_profile(&profile);
+        let client = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(make_client_for_profile(&profile));
         assert_eq!(client.base_url().as_str(), "http://localhost:5000/");
     }
 
@@ -1446,43 +1513,47 @@ mod tests {
 
     #[test]
     fn rebuild_clients_for_profile_refreshes_scoped_entries() {
-        // Scoped clients hold their own credentials `Arc`, so a rebuild that
-        // only replaced the root would leave them using the stale credential.
-        let profile = anon_profile(
-            "art",
-            "https://art.example.com/artifactory/",
-            RegistryType::Artifactory,
-        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // Scoped clients hold their own credentials `Arc`, so a rebuild
+            // that only replaced the root would leave them using the stale
+            // credential.
+            let profile = anon_profile(
+                "art",
+                "https://art.example.com/artifactory/",
+                RegistryType::Artifactory,
+            );
 
-        let root = make_client_for_profile(&profile);
-        let scoped_a = root.for_artifactory_repo("docker-local").unwrap();
-        let scoped_b = root.for_artifactory_repo("docker-remote").unwrap();
+            let root = make_client_for_profile(&profile).await;
+            let scoped_a = root.for_artifactory_repo("docker-local").unwrap();
+            let scoped_b = root.for_artifactory_repo("docker-remote").unwrap();
 
-        let mut clients = HashMap::new();
-        clients.insert("art".to_owned(), root.clone());
-        clients.insert("art#docker-local".to_owned(), scoped_a.clone());
-        clients.insert("art#docker-remote".to_owned(), scoped_b.clone());
-        // An unrelated profile must be left alone.
-        let other = make_client_for_profile(&anon_profile(
-            "other",
-            "https://other.example.com/",
-            RegistryType::Standard,
-        ));
-        clients.insert("other".to_owned(), other.clone());
+            let mut clients = HashMap::new();
+            clients.insert("art".to_owned(), root.clone());
+            clients.insert("art#docker-local".to_owned(), scoped_a.clone());
+            clients.insert("art#docker-remote".to_owned(), scoped_b.clone());
+            // An unrelated profile must be left alone.
+            let other = make_client_for_profile(&anon_profile(
+                "other",
+                "https://other.example.com/",
+                RegistryType::Standard,
+            ))
+            .await;
+            clients.insert("other".to_owned(), other.clone());
 
-        rebuild_clients_for_profile(&mut clients, &profile);
+            rebuild_clients_for_profile(&mut clients, &profile).await;
 
-        assert_eq!(clients.len(), 4, "no entries added or dropped");
-        assert_eq!(clients["art"].base_url(), root.base_url());
-        // Re-derived from the fresh root, so still singly-scoped — not
-        // double-appended (the issue #78 failure mode).
-        assert_eq!(
-            clients["art#docker-local"].base_url(),
-            scoped_a.base_url(),
-            "scoped base URL must be unchanged and un-doubled"
-        );
-        assert_eq!(clients["art#docker-remote"].base_url(), scoped_b.base_url());
-        assert_eq!(clients["other"].base_url(), other.base_url());
+            assert_eq!(clients.len(), 4, "no entries added or dropped");
+            assert_eq!(clients["art"].base_url(), root.base_url());
+            // Re-derived from the fresh root, so still singly-scoped — not
+            // double-appended (the issue #78 failure mode).
+            assert_eq!(
+                clients["art#docker-local"].base_url(),
+                scoped_a.base_url(),
+                "scoped base URL must be unchanged and un-doubled"
+            );
+            assert_eq!(clients["art#docker-remote"].base_url(), scoped_b.base_url());
+            assert_eq!(clients["other"].base_url(), other.base_url());
+        });
     }
 
     // -----------------------------------------------------------------------
