@@ -51,7 +51,7 @@ On a challenge, the token is offered to the realm in this order:
 
 Whichever rung works is cached in a sticky `Mutex<Option<RealmMode>>` and is the only one tried thereafter. Besides saving up to three wasted round trips per 401, this stops repeated failing Basic attempts carrying a *real* username from counting against Artifactory's "Max Failed Login Attempts" policy for that user — which is the reason it is not merely an optimisation.
 
-> **Note:** the ladder was implemented in full because there was no Artifactory instance available to test against while building this. If pass-through turns out to always work on real instances, rungs 2–4 are dead code and can be dropped. Three read-only curls settle it:
+> **Note:** the ladder was implemented in full because there was no Artifactory instance available to test against while building this, and it still isn't verified live (see [#96](https://github.com/pgmac-net/docker-registry-walk/issues/96)). An attempt to measure it by standing up `jfrog/artifactory-oss` locally (with a real PostgreSQL backend, after the image's embedded-DB path turned out to be gone) hit a harder wall: **Docker repository support itself is a Pro-only feature, absent entirely from OSS** — `PUT /api/repositories/*` and even reading an existing repo's config both return `This REST API is available only in Artifactory Pro`, and the fixed `/api/docker/<repo-key>/v2/...` route 401s unconditionally regardless of credentials once a Docker repo can't exist to serve it. No amount of local wiring gets past a licensed-feature wall, so the question stays open pending either a Pro trial license or a real instance elsewhere. Three read-only curls settle it, if one becomes available:
 >
 > ```sh
 > curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $JFROG_ACCESS_TOKEN" \
@@ -60,6 +60,8 @@ Whichever rung works is cached in a sticky `Mutex<Option<RealmMode>>` and is the
 >   "$BASE/api/docker/<repo-key>/v2/_catalog"
 > curl -si "$BASE/api/docker/<repo-key>/v2/_catalog" | grep -i www-authenticate
 > ```
+>
+> In the meantime, #96 (the scope-keyed token cache this ladder's cost would motivate) is closed on documented evidence rather than a live measurement: JFrog's own docs state an access token "can be used as a bearer token in authorization headers" against Artifactory endpoints, which is the same conclusion Arm A of #96's plan expected from a 200. Whether the *specific* Docker v2 challenge path ever fires — and so whether ladder rungs 2–4 are reachable at all — remains genuinely unknown; no cleanup ticket for them has been filed on the strength of docs alone.
 
 ### A stricter realm guard
 
