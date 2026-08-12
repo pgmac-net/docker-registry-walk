@@ -19,7 +19,8 @@ use crate::registry::{
 };
 
 use super::app::{
-    App, ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal, LoadState, Modal,
+    App, CatalogAttempt, ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal,
+    LoadState, Modal,
 };
 use super::detail::ImageDetail;
 use super::input::InputState;
@@ -251,40 +252,68 @@ pub(super) async fn event_loop(
                         }
                     }
                     AppEvent::ReposError { msg, auth_failed } => {
-                        // After a password-entry retry, a 401 means scope
-                        // rejection (not wrong credentials), so treat it the
-                        // same as an authz failure and offer BrowseRepo.
-                        let retry_pending = app.catalog_retry_pending;
-                        app.catalog_retry_pending = false;
+                        // After a silent-reread or password-entry retry, a
+                        // 401 means scope rejection (not wrong credentials),
+                        // so treat it the same as an authz failure and offer
+                        // BrowseRepo.
+                        let attempt = app.catalog_attempt;
+                        app.catalog_attempt = CatalogAttempt::Initial;
                         // Docker Hub never allows /v2/_catalog; a 401 there is
                         // always a policy restriction, not wrong credentials.
                         let is_dh = app
                             .profiles
                             .get(app.active_profile_idx)
                             .is_some_and(|p| p.is_dockerhub());
-                        let show_browse = !auth_failed || retry_pending || is_dh;
-                        app.on_repos_error(msg, show_browse);
-                        if auth_failed && !retry_pending && !is_dh
+                        let profile = app.profiles[app.active_profile_idx].clone();
+
+                        // A first auth failure may only mean the cached
+                        // client's credentials predate something now in the
+                        // keyring — another process wrote it, or it was
+                        // unlocked after startup — so it's worth one silent
+                        // re-read before bothering the user. Skipped for a
+                        // profile with no credential source at all
+                        // (`auth_prompt_for` returns `None`), since that would
+                        // be a guaranteed-useless retry.
+                        let should_reread = auth_failed
+                            && !is_dh
+                            && attempt == CatalogAttempt::Initial
                             && matches!(app.modal, Modal::None)
-                        {
-                            let profile = &app.profiles[app.active_profile_idx];
-                            let profile_name = profile.name.clone();
-                            app.modal = match auth_prompt_for(profile) {
-                                Some(AuthPrompt::Password { username }) => Modal::Input {
-                                    prompt: format!("Password for {username}:"),
-                                    input: InputState::default(),
-                                    on_confirm: InputAction::EnterPassword {
-                                        profile_name,
-                                        username,
+                            && auth_prompt_for(&profile).is_some();
+
+                        if should_reread {
+                            rebuild_clients_for_profile(&mut clients, &profile).await;
+                            app.catalog_attempt = CatalogAttempt::AfterReread;
+                            app.restart_catalog_load();
+                            if let Some(client) = clients.get(&active_name).cloned() {
+                                spawn_repos_fetch(client, None, tx.clone());
+                            }
+                        } else {
+                            let show_browse =
+                                !auth_failed || attempt == CatalogAttempt::AfterCredential || is_dh;
+                            app.on_repos_error(msg, show_browse);
+                            if auth_failed
+                                && attempt != CatalogAttempt::AfterCredential
+                                && !is_dh
+                                && matches!(app.modal, Modal::None)
+                            {
+                                let profile_name = profile.name.clone();
+                                app.modal = match auth_prompt_for(&profile) {
+                                    Some(AuthPrompt::Password { username }) => Modal::Input {
+                                        prompt: format!("Password for {username}:"),
+                                        input: InputState::default(),
+                                        on_confirm: InputAction::EnterPassword {
+                                            profile_name,
+                                            username,
+                                        },
                                     },
-                                },
-                                Some(AuthPrompt::Token) => Modal::Input {
-                                    prompt: format!("Access token for {profile_name}:"),
-                                    input: InputState::default(),
-                                    on_confirm: InputAction::EnterToken { profile_name },
-                                },
-                                None => Modal::None,
-                            };
+                                    Some(AuthPrompt::Token) => Modal::Input {
+                                        prompt: format!("Access token for {profile_name}:"),
+                                        input: InputState::default(),
+                                        on_confirm: InputAction::EnterToken { profile_name },
+                                    },
+                                    None => Modal::None,
+                                };
+                            }
                         }
                     }
                     AppEvent::PasswordEntered { profile_name, username, password } => {
@@ -1104,6 +1133,7 @@ async fn retry_after_credential_change(
     }
 
     if let Some(client) = clients.get(active_name).cloned() {
+        app.catalog_attempt = CatalogAttempt::AfterCredential;
         app.restart_catalog_load();
         spawn_repos_fetch(client, None, tx.clone());
     }
@@ -1604,6 +1634,31 @@ mod tests {
         // Nothing useful to ask for: no username, and not a token profile.
         let profile = anon_profile("local", "http://localhost:5000/", RegistryType::Standard);
         assert_eq!(auth_prompt_for(&profile), None);
+    }
+
+    /// The silent-reread guard in the `ReposError` handler reuses
+    /// `auth_prompt_for(&profile).is_some()` to decide whether a profile has
+    /// any credential source worth re-reading. An anonymous profile has
+    /// none, so re-reading it would be a guaranteed-useless retry — this
+    /// pins the exact condition that skips it.
+    #[test]
+    fn silent_reread_skipped_for_anonymous_profile() {
+        let anonymous = anon_profile("local", "http://localhost:5000/", RegistryType::Standard);
+        assert!(auth_prompt_for(&anonymous).is_none());
+
+        let with_username = RegistryProfile {
+            username: Some("admin".to_owned()),
+            ..anon_profile("local", "http://localhost:5000/", RegistryType::Standard)
+        };
+        assert!(auth_prompt_for(&with_username).is_some());
+
+        let mut token_profile = anon_profile(
+            "art",
+            "https://art.example.com/artifactory/",
+            RegistryType::Artifactory,
+        );
+        token_profile.auth = AuthMode::Token;
+        assert!(auth_prompt_for(&token_profile).is_some());
     }
 
     #[test]

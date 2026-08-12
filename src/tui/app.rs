@@ -48,6 +48,19 @@ pub enum LoadState {
     Error(String),
 }
 
+/// Which retry, if any, produced the in-flight catalog load. See the field
+/// doc on `App::catalog_attempt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogAttempt {
+    /// First load for this registry (or repo-key).
+    #[default]
+    Initial,
+    /// Retry after silently re-reading credentials from the keyring.
+    AfterReread,
+    /// Retry after the user supplied a credential at the prompt.
+    AfterCredential,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
     NameAsc,
@@ -417,9 +430,15 @@ pub struct App {
     pub inspect_return: Option<Box<InspectModal>>,
     pub should_quit: bool,
     pub spinner_tick: usize,
-    /// Set when a password was just entered; causes the next catalog error
-    /// (even 401) to open BrowseRepo rather than the password modal again.
-    pub catalog_retry_pending: bool,
+    /// Which retry, if any, produced the catalog load currently in flight.
+    ///
+    /// A 401 on `Initial` means the cached client's credentials might simply
+    /// predate something now in the keyring (another process wrote it, or it
+    /// was unlocked after startup) — worth one silent re-read before bothering
+    /// the user. A 401 on `AfterReread` or `AfterCredential` means that
+    /// re-read (or a prompt) already ran and failed, so it opens BrowseRepo /
+    /// the credential prompt instead of retrying again.
+    pub catalog_attempt: CatalogAttempt,
     status: Option<StatusMessage>,
     // Registry switcher
     pub profiles: Vec<RegistryProfile>,
@@ -471,7 +490,7 @@ impl App {
             inspect_return: None,
             should_quit: false,
             spinner_tick: 0,
-            catalog_retry_pending: false,
+            catalog_attempt: CatalogAttempt::Initial,
             status: None,
             profiles,
             active_profile_idx: idx,
@@ -605,7 +624,7 @@ impl App {
         self.detail_scroll = 0;
         self.focus = Focus::Repos;
         self.filter_mode = None;
-        self.catalog_retry_pending = false;
+        self.catalog_attempt = CatalogAttempt::Initial;
         self.current_artifactory_repo_key = None;
     }
 
@@ -619,13 +638,18 @@ impl App {
         self.repo_load = LoadState::Loading;
     }
 
-    /// Reload the catalog in place after the user supplied a new credential.
+    /// Reload the catalog in place after a credential change (a silent
+    /// keyring re-read or a prompt).
     ///
     /// Deliberately narrower than [`Self::start_registry_switch`], which goes
     /// through `reset_for_new_registry` and so clears
     /// `current_artifactory_repo_key`. Using that here would visually eject the
     /// user back to the repo-key picker on a *successful* re-auth, while the
     /// client stayed scoped to the repo-key they were browsing.
+    ///
+    /// Does not touch `catalog_attempt` — the caller sets it to whichever
+    /// retry stage this reload is for, since `restart_catalog_load` itself
+    /// has no way to know which one that is.
     pub fn restart_catalog_load(&mut self) {
         self.repos_all.clear();
         self.repos.clear();
@@ -651,8 +675,6 @@ impl App {
         self.filter_mode = None;
 
         self.repo_load = LoadState::Loading;
-        // A 401 after this reload means scope rejection, not a wrong secret.
-        self.catalog_retry_pending = true;
     }
 
     /// Switch to a JFrog Artifactory profile: clear repo/tag/detail state
@@ -1389,12 +1411,16 @@ mod tests {
         app.on_repos_page(vec!["nginx".to_owned()], false);
 
         // Simulate a successful re-auth while browsing inside a repo-key.
+        app.catalog_attempt = CatalogAttempt::AfterCredential;
         app.restart_catalog_load();
 
         // The catalog reloads...
         assert_eq!(app.repo_load, LoadState::Loading);
         assert!(app.repos.is_empty());
-        assert!(app.catalog_retry_pending);
+        // ...and restart_catalog_load leaves the stage alone — it's the
+        // caller's job to set it, since the reload alone can't say which
+        // retry it's for.
+        assert_eq!(app.catalog_attempt, CatalogAttempt::AfterCredential);
 
         // ...but the user is NOT ejected from the repo-key they were in.
         // `start_registry_switch` would have cleared all three of these, while
@@ -1731,5 +1757,47 @@ mod tests {
         ] {
             assert!(!action.is_secret(), "{action:?} must not be masked");
         }
+    }
+
+    #[test]
+    fn catalog_attempt_defaults_to_initial() {
+        let profile = RegistryProfile {
+            name: "local".to_owned(),
+            url: "http://localhost:5000".to_owned(),
+            username: None,
+            registry_type: RegistryType::Standard,
+            ..Default::default()
+        };
+        let app = App::new(vec![profile], 0);
+        assert_eq!(app.catalog_attempt, CatalogAttempt::Initial);
+    }
+
+    #[test]
+    fn reset_for_new_registry_resets_catalog_attempt() {
+        // A stale AfterCredential/AfterReread stage from the previous
+        // registry must not suppress a legitimate silent-reread or prompt on
+        // the next one.
+        let profiles = vec![
+            RegistryProfile {
+                name: "a".to_owned(),
+                url: "http://a.example.com".to_owned(),
+                username: None,
+                registry_type: RegistryType::Standard,
+                ..Default::default()
+            },
+            RegistryProfile {
+                name: "b".to_owned(),
+                url: "http://b.example.com".to_owned(),
+                username: None,
+                registry_type: RegistryType::Standard,
+                ..Default::default()
+            },
+        ];
+        let mut app = App::new(profiles, 0);
+        app.catalog_attempt = CatalogAttempt::AfterCredential;
+
+        app.start_registry_switch(1);
+
+        assert_eq!(app.catalog_attempt, CatalogAttempt::Initial);
     }
 }
