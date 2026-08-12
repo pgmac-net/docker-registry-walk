@@ -16,7 +16,7 @@ An interactive TUI browser for Docker registries, written in Rust.
   - **Export** — save image as an OCI-layout tar archive (skopeo-compatible)
   - **Diff** — compare layer sets between two tags
 - Multi-registry support with in-app switching (`R`)
-- JFrog Artifactory support: browse the Docker repo-keys hosted on an Artifactory instance via a picker, with credentials sent as HTTP Basic (username + API key/identity token)
+- JFrog Artifactory support: browse the Docker repo-keys hosted on an Artifactory instance via a picker, authenticating with either HTTP Basic (username + API key/identity token) or a JFrog access token sent as `Authorization: Bearer` — the same way the Terraform `jfrog/artifactory` provider authenticates
 - Per-registry credentials stored in the OS keychain — never in the config file
 - Live filter and sort within repos/tags panels
 - In-app keybindings reference (`?`)
@@ -79,11 +79,29 @@ name = "artifactory"
 url = "https://artifactory.example.com/artifactory"
 username = "ci"
 type = "artifactory"
+
+# The same instance authenticated with a JFrog access token instead. No
+# username needed — see "Access tokens" below.
+[[registry]]
+name = "artifactory-token"
+url = "https://artifactory.example.com/artifactory"
+type = "artifactory"
+auth = "token"
 ```
+
+Per-profile keys:
+
+| Key | Description |
+|-----|-------------|
+| `name` | Profile name, shown in the title bar and used as the keychain key. Must not contain `#` |
+| `url` | Registry URL. For `type = "artifactory"`, the Artifactory server base rather than a `/v2/` root |
+| `username` | Optional. Not needed for `auth = "token"` |
+| `type` | `standard` (default), `dockerhub`, or `artifactory` |
+| `auth` | `auto` (default), `basic`, `bearer`, or `token` |
 
 ### Credentials / keyring
 
-Passwords are **never** written to the config file. They are stored in the OS keychain (macOS Keychain, GNOME Secret Service, Windows Credential Manager) under the key `docker-registry-walk/<registry-name>`.
+Secrets are **never** written to the config file, and never passed as a flag value. They are stored in the OS keychain (macOS Keychain, GNOME Secret Service, Windows Credential Manager) under the key `docker-registry-walk/<registry-name>`.
 
 Store a password on first use — `--password` takes no value; it prompts interactively with masked input, so the password never appears in your shell history or process list:
 
@@ -99,6 +117,33 @@ docker-registry-walk --url https://registry.example.com --username admin --passw
 
 The prompted password is written to the keychain; subsequent runs read from there automatically.
 
+### Access tokens
+
+Set `auth = "token"` on a profile to authenticate with `Authorization: Bearer <token>` instead of a username and password — the same way the Terraform `jfrog/artifactory` provider authenticates. No username is required.
+
+```sh
+# Store the token in the keychain (prompts, masked — takes no value).
+docker-registry-walk --registry artifactory --token
+
+# Or supply it via the environment, as Terraform does.
+JFROG_ACCESS_TOKEN=<token> docker-registry-walk --registry artifactory
+```
+
+The token is resolved in this order:
+
+1. `$JFROG_ACCESS_TOKEN`
+2. `$ARTIFACTORY_ACCESS_TOKEN`
+3. the OS keychain, under the account `__token__`
+4. a masked prompt in the TUI, after an authentication failure
+
+The environment wins so a token can be overridden for a single run without disturbing what is stored — and a token that came from the environment is deliberately *not* written to the keychain.
+
+`auth = "token"` works for any registry type (a GitHub / GitLab / Harbor personal access token is presented the same way); the `JFROG_*` / `ARTIFACTORY_*` variables are only consulted for `type = "artifactory"` profiles, so a JFrog token exported in your shell can never change how you authenticate to Docker Hub.
+
+Leaving `auth` unset (`auto`) preserves the previous behaviour exactly: an Artifactory profile with a username and a stored password still uses HTTP Basic, and only falls back to a token when there is no password. Set `auth = "token"` explicitly to prefer the token when both exist.
+
+See [docs/artifactory-authentication.md](docs/artifactory-authentication.md) for how this interacts with Artifactory's two authenticated surfaces.
+
 ## CLI options
 
 | Flag | Description |
@@ -106,7 +151,10 @@ The prompted password is written to the keychain; subsequent runs read from ther
 | `--registry <name>` | Open this named profile from the config on startup |
 | `--url <url>` | Ad-hoc registry URL (creates a temporary "cli" profile) |
 | `--username <user>` | Username for the ad-hoc registry |
+| `--type <type>` | Registry flavour for the ad-hoc registry: `standard`, `dockerhub`, `artifactory` |
+| `--auth <mode>` | Auth mode for the ad-hoc registry: `auto`, `basic`, `bearer`, `token` |
 | `--password` | Prompt (masked) for the password and store it in the OS keychain — never to the config file, never as a CLI argument |
+| `--token` | Prompt (masked) for an access token and store it in the OS keychain, same guarantees as `--password` |
 
 ## Keybindings
 
@@ -188,7 +236,7 @@ entire document. Search auto-expands any folds hiding a match.
 
 - Docker Registry API v2 (`/v2/` endpoint)
 - For **delete / prune**: `REGISTRY_STORAGE_DELETE_ENABLED=true`
-- Auth: anonymous, HTTP Basic, or Bearer token (automatic token exchange with per-endpoint scope retry)
+- Auth: anonymous, HTTP Basic, Bearer token (automatic token exchange with per-endpoint scope retry), or a static access token sent as `Authorization: Bearer`
 - HTTPS strongly recommended; plain HTTP supported for local/internal registries
 
 ## License

@@ -9,7 +9,9 @@ mod search;
 mod types;
 
 pub use auth::{
-    BasicCredentials, BearerCredentials, KeyringStore, prompt_password, resolve_password,
+    AccessTokenCredentials, BasicCredentials, BearerCredentials, KeyringStore, Secret,
+    TOKEN_ACCOUNT, prompt_password, prompt_secret, resolve_access_token, resolve_secret,
+    sanitize_pasted_token,
 };
 pub use client::{Credentials, NoCredentials, RegistryClient};
 pub use error::{RegistryError, Result};
