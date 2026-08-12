@@ -27,6 +27,20 @@ impl InputState {
         self.cursor += 1;
     }
 
+    /// Insert `s` at the cursor in one step (e.g. a terminal paste).
+    ///
+    /// Strips `\n`/`\r`: this buffer is documented single-line, and a literal
+    /// newline would break the cursor/scroll-window arithmetic that assumes
+    /// one visual line. Stripping also means a paste can never itself trigger
+    /// a submit — no path treats a bare embedded newline as Enter — which
+    /// matters most for a pasted secret: the user always gets a chance to see
+    /// the char count before confirming.
+    pub fn insert_str(&mut self, s: &str) {
+        for c in s.chars().filter(|&c| c != '\n' && c != '\r') {
+            self.insert(c);
+        }
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -164,6 +178,31 @@ mod tests {
         assert_eq!(i.buffer, "hélo");
         i.insert('x');
         assert_eq!(i.buffer, "hélxo");
+    }
+
+    #[test]
+    fn insert_str_inserts_at_cursor_in_one_step() {
+        let mut i = input("ac", 1);
+        i.insert_str("bXY");
+        assert_eq!(i.buffer, "abXYc");
+        assert_eq!(i.cursor, 4);
+    }
+
+    #[test]
+    fn insert_str_strips_embedded_newlines() {
+        // A paste can never contain a newline after this, so it can never
+        // itself trigger a submit — see the doc comment on insert_str.
+        let mut i = InputState::default();
+        i.insert_str("tok\ntok2\r\n");
+        assert_eq!(i.buffer, "toktok2");
+        assert!(!i.buffer.contains('\n') && !i.buffer.contains('\r'));
+    }
+
+    #[test]
+    fn insert_str_is_utf8_safe() {
+        let mut i = input("héllo", 2); // cursor after "hé"
+        i.insert_str("🎉x");
+        assert_eq!(i.buffer, "hé🎉xllo");
     }
 
     #[test]

@@ -829,6 +829,24 @@ impl App {
         }
     }
 
+    /// Append `s` to the active filter in one step (e.g. a terminal paste).
+    /// Strips `\n`/`\r` for the same reason `InputState::insert_str` does —
+    /// this is a single-line filter, not a text area.
+    pub fn push_filter_str(&mut self, s: &str) {
+        let s: String = s.chars().filter(|&c| c != '\n' && c != '\r').collect();
+        match self.filter_mode {
+            Some(Focus::Repos) => {
+                self.repo_filter.push_str(&s);
+                self.apply_repo_filter();
+            }
+            Some(Focus::Tags) => {
+                self.tag_filter.push_str(&s);
+                self.apply_tag_filter_sort();
+            }
+            Some(Focus::Detail) | None => {}
+        }
+    }
+
     pub fn pop_filter_char(&mut self) {
         match self.filter_mode {
             Some(Focus::Repos) => {
@@ -1799,5 +1817,29 @@ mod tests {
         app.start_registry_switch(1);
 
         assert_eq!(app.catalog_attempt, CatalogAttempt::Initial);
+    }
+
+    #[test]
+    fn push_filter_str_appends_and_strips_newlines() {
+        let mut app = make_app_with_repos(vec!["nginx", "budgeteer", "nginx-proxy"]);
+        app.filter_mode = Some(Focus::Repos);
+
+        app.push_filter_str("ngi\nnx\r\n");
+
+        assert_eq!(app.repo_filter, "nginx");
+        assert_eq!(
+            app.repos,
+            vec!["nginx".to_owned(), "nginx-proxy".to_owned()]
+        );
+    }
+
+    #[test]
+    fn push_filter_str_is_a_noop_without_an_active_filter() {
+        let mut app = make_app_with_repos(vec!["nginx"]);
+        assert_eq!(app.filter_mode, None);
+
+        app.push_filter_str("nginx");
+
+        assert_eq!(app.repo_filter, "");
     }
 }
