@@ -814,19 +814,7 @@ fn realm_scheme_ok(realm: &Url) -> bool {
 /// closed: an unusual proxy that moves the realm to another host or port gets a
 /// visible auth error instead of silently disclosing the token.
 fn is_same_origin_realm(realm: &Url, registry: &Url) -> bool {
-    if !realm_scheme_ok(realm) {
-        return false;
-    }
-
-    let (Some(realm_host), Some(registry_host)) = (realm.host_str(), registry.host_str()) else {
-        return false;
-    };
-
-    if realm_host.is_empty() || registry_host.is_empty() {
-        return false;
-    }
-
-    realm_host == registry_host && realm.port_or_known_default() == registry.port_or_known_default()
+    realm_scheme_ok(realm) && crate::registry::client::same_host_and_port(realm, registry)
 }
 
 /// Returns `true` if `realm` is a host we should send credentials to.

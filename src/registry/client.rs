@@ -100,17 +100,42 @@ impl RegistryClient {
         join_path(&self.base_url, path)
     }
 
+    /// Send a request, attaching `Authorization` only when it targets this
+    /// client's own origin.
+    ///
+    /// Most requests are built from `self.url(path)`, i.e. derived from
+    /// `base_url`, and are always same-origin. The exception is
+    /// `complete_blob_upload`, whose URL is a server-supplied `Location` that
+    /// may point anywhere — e.g. a presigned upload URL on S3/GCS/Azure for a
+    /// registry backed by external object storage. Guarding here, in the one
+    /// place every request passes through, means no future method that
+    /// accepts a server-supplied URL can reintroduce the leak at a call site.
+    ///
+    /// Stripping (rather than refusing) is required, not only defensive: S3
+    /// rejects a request carrying both a presigned query signature and an
+    /// `Authorization` header, so sending the header there was already a
+    /// latent bug against object-storage-backed registries.
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<Response> {
         // Clone before consuming so we can retry on 401 with a scoped token.
         let retry = builder.try_clone();
+        let mut req = builder.build()?;
+        let same_origin = same_origin(req.url(), &self.base_url);
 
-        let builder = match self.creds.get_authorization(&self.http).await {
-            Some(auth) => builder.header(reqwest::header::AUTHORIZATION, auth),
-            None => builder,
-        };
-        let resp = builder.send().await?;
+        if same_origin
+            && let Some(auth) = self.creds.get_authorization(&self.http).await
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&auth)
+        {
+            req.headers_mut()
+                .insert(reqwest::header::AUTHORIZATION, value);
+        }
 
-        if resp.status() == StatusCode::UNAUTHORIZED
+        let resp = self.http.execute(req).await?;
+
+        // Off-origin: never mint and hand over a fresh token either. A
+        // hostile host answering the unauthenticated request with its own
+        // `Bearer` challenge must not be able to extract one.
+        if same_origin
+            && resp.status() == StatusCode::UNAUTHORIZED
             && let Some(rb) = retry
             && let Some(www_auth) = resp
                 .headers()
@@ -490,6 +515,31 @@ fn join_path(base: &Url, path: &str) -> Result<Url> {
         .map_err(RegistryError::InvalidUrl)
 }
 
+/// Host and port match, ignoring scheme.
+///
+/// Shared with `registry::auth::is_same_origin_realm`, which layers its own
+/// scheme requirement (https, or http only for loopback) on top — a rule
+/// that is right for deciding whether to hand a platform token to a *token
+/// realm*, but wrong here: it would strip auth from every request on a
+/// plain-http registry the user configured. See `same_origin` below and
+/// `CLAUDE.md`'s "two realm guards" note for why these stay separate.
+pub(crate) fn same_host_and_port(a: &Url, b: &Url) -> bool {
+    let (Some(a_host), Some(b_host)) = (a.host_str(), b.host_str()) else {
+        return false;
+    };
+    !a_host.is_empty() && a_host == b_host && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Whether `request` is the same origin as `base` — scheme, host and port
+/// all equal.
+///
+/// Byte-for-byte the comparison reqwest's own redirect handling uses to
+/// decide whether to strip `Authorization` (`redirect.rs::remove_sensitive_headers`),
+/// so a fresh request and a redirect are guarded identically.
+fn same_origin(request: &Url, base: &Url) -> bool {
+    request.scheme() == base.scheme() && same_host_and_port(request, base)
+}
+
 fn require_success(resp: &Response, url: &Url) -> Result<()> {
     match resp.status() {
         s if s.is_success() => Ok(()),
@@ -597,5 +647,91 @@ mod tests {
             scoped.base_url().as_str(),
             "https://artifactory.example.com/artifactory/api/docker/docker-local/"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // same_origin — guards `Authorization` on server-supplied URLs, e.g. the
+    // blob-upload `Location` header.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn same_origin_accepts_identical_origin() {
+        assert!(same_origin(
+            &u("https://registry.example.com/v2/foo/blobs/uploads/abc"),
+            &u("https://registry.example.com/")
+        ));
+
+        // A plain-http registry the user configured must not have auth
+        // stripped from its own requests — the failure mode of naively
+        // reusing `is_same_origin_realm`'s https-or-loopback rule here.
+        assert!(same_origin(
+            &u("http://registry.lan:5000/v2/_catalog"),
+            &u("http://registry.lan:5000/")
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_different_host() {
+        assert!(!same_origin(
+            &u("https://evil.com/v2/foo/blobs/uploads/abc"),
+            &u("https://registry.example.com/")
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_scheme_downgrade() {
+        assert!(!same_origin(
+            &u("http://registry.example.com/v2/foo/blobs/uploads/abc"),
+            &u("https://registry.example.com/")
+        ));
+    }
+
+    #[test]
+    fn same_origin_rejects_port_mismatch() {
+        assert!(!same_origin(
+            &u("https://registry.example.com:8443/v2/foo/blobs/uploads/abc"),
+            &u("https://registry.example.com/")
+        ));
+    }
+
+    #[test]
+    fn same_origin_treats_default_port_as_equal() {
+        assert!(same_origin(
+            &u("https://registry.example.com:443/v2/foo/blobs/uploads/abc"),
+            &u("https://registry.example.com/")
+        ));
+    }
+
+    /// Pins `same_origin` to the exact three-field comparison reqwest's own
+    /// redirect handling uses (`redirect.rs::remove_sensitive_headers`), so a
+    /// fresh request and a redirect can never disagree about what counts as
+    /// cross-origin.
+    #[test]
+    fn same_origin_matches_reqwest_redirect_semantics() {
+        fn reqwest_cross_host(next: &Url, previous: &Url) -> bool {
+            next.host_str() != previous.host_str()
+                || next.port_or_known_default() != previous.port_or_known_default()
+                || next.scheme() != previous.scheme()
+        }
+
+        let cases = [
+            ("https://reg.example.com/a", "https://reg.example.com/b"),
+            ("https://reg.example.com/a", "http://reg.example.com/a"),
+            ("https://reg.example.com/a", "https://other.example.com/a"),
+            (
+                "https://reg.example.com:8443/a",
+                "https://reg.example.com/a",
+            ),
+            ("https://reg.example.com:443/a", "https://reg.example.com/a"),
+        ];
+
+        for (a, b) in cases {
+            let (ua, ub) = (u(a), u(b));
+            assert_eq!(
+                same_origin(&ua, &ub),
+                !reqwest_cross_host(&ua, &ub),
+                "same_origin({a}, {b}) must agree with reqwest's redirect check"
+            );
+        }
     }
 }
