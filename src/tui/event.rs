@@ -172,6 +172,17 @@ pub(super) async fn event_loop(
     let mut tick = interval(Duration::from_millis(TICK_MS));
     let mut app = App::new(profiles.clone(), initial_idx);
 
+    // Draw before the first client build. `tui::run` has already entered the
+    // alternate screen, and the build reads the keyring — which is fast in the
+    // normal case but blocks indefinitely on a locked Secret Service
+    // collection (a D-Bus `Unlock` prompt). Without this frame that leaves the
+    // user staring at a blank screen with nothing to indicate the app is even
+    // running, since the loop's own `terminal.draw` is not reached until the
+    // build returns.
+    app.repo_load = LoadState::Loading;
+    app.set_status(format!("Connecting to {}…", profiles[initial_idx].name));
+    terminal.draw(|f| ui::draw(f, &mut app))?;
+
     // Pre-build client for the initial profile.
     let mut clients: HashMap<String, RegistryClient> = HashMap::new();
     let init_client = make_client_for_profile(&profiles[initial_idx]).await;
@@ -200,22 +211,34 @@ pub(super) async fn event_loop(
             Some(ev) = rx.recv() => {
                 match ev {
                     AppEvent::SwitchRegistry { idx } => {
-                        // Cloned before the await below: `app` is mutated
-                        // by `start_artifactory_switch`/`start_registry_switch`
-                        // right after, so the borrow of `app.profiles[idx]`
-                        // can't be held across a suspend point.
+                        // Cloned so no borrow of `app.profiles[idx]` is held
+                        // across the await below (`app` is mutated first).
                         let profile = app.profiles[idx].clone();
                         let name = profile.name.clone();
+
+                        // Update app state *before* building the client, so the
+                        // pre-build frame below shows the registry being
+                        // switched to rather than the one being left.
+                        if profile.is_artifactory() {
+                            app.start_artifactory_switch(idx);
+                        } else {
+                            app.start_registry_switch(idx);
+                        }
+                        active_name = name.clone();
+
                         if !clients.contains_key(&name) {
+                            // Only on a cache miss — the build reads the
+                            // keyring, so this is the path that can block. A
+                            // cached switch draws no extra frame.
+                            app.set_status(format!("Connecting to {name}…"));
+                            terminal.draw(|f| ui::draw(f, &mut app))?;
                             let client = make_client_for_profile(&profile).await;
                             clients.insert(name.clone(), client);
                         }
-                        active_name = name;
+
                         if profile.is_artifactory() {
-                            app.start_artifactory_switch(idx);
                             spawn_artifactory_repos_fetch(clients[&active_name].clone(), tx.clone());
                         } else {
-                            app.start_registry_switch(idx);
                             spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
                         }
                     }
