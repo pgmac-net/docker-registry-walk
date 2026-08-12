@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
             std::io::stdout(),
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
         );
         orig_hook(info);
     }));

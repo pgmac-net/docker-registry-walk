@@ -33,6 +33,9 @@ const PAGE_SIZE: u32 = 100;
 pub enum AppEvent {
     Key(KeyEvent),
     Resize,
+    /// A terminal bracketed paste, delivered as one string rather than one
+    /// `Key` event per character.
+    Paste(String),
     ReposPage(Vec<String>, bool),
     ReposError {
         msg: String,
@@ -140,6 +143,11 @@ pub fn spawn_event_reader(tx: mpsc::Sender<AppEvent>) {
                         break;
                     }
                     Ok(Event::Resize(_, _)) => {}
+                    Ok(Event::Paste(s)) => {
+                        if tx.blocking_send(AppEvent::Paste(s)).is_err() {
+                            break;
+                        }
+                    }
                     _ => {}
                 },
                 Ok(false) => {}
@@ -425,6 +433,7 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
             handle_key(app, key.code, key.modifiers, client, tx);
         }
         AppEvent::Resize => {}
+        AppEvent::Paste(text) => handle_paste(app, &text, tx),
         AppEvent::ReposPage(repos, has_more) => app.on_repos_page(repos, has_more),
         // Handled in event_loop; should not reach here.
         AppEvent::ReposError { .. }
@@ -874,6 +883,69 @@ fn apply_input_key(input: &mut InputState, code: KeyCode, modifiers: KeyModifier
         _ => return false,
     }
     true
+}
+
+/// Route a bracketed-paste string to whichever text-entry surface is
+/// currently active, mirroring `handle_key`'s modal-priority order.
+///
+/// `EnableBracketedPaste` is terminal-wide — it cannot be scoped to one
+/// modal — so every surface that today accepts characters via
+/// `apply_input_key`/`push_filter_char` needs a paste path too, or pasting
+/// into it would silently do nothing once bracketed paste is on (worse than
+/// today's slow-but-working char-by-char). `Modal::Confirm` and normal mode
+/// take no text and are excluded, matching how a stray key is already
+/// ignored there.
+fn handle_paste(app: &mut App, text: &str, tx: &mpsc::Sender<AppEvent>) {
+    if let Modal::Input { input, .. } = &mut app.modal {
+        input.insert_str(text);
+        return;
+    }
+
+    if let Modal::SearchPicker {
+        input,
+        results,
+        selected,
+        searching,
+        ..
+    } = &mut app.modal
+    {
+        let before = input.buffer.clone();
+        input.insert_str(text);
+        if input.buffer != before {
+            *results = Vec::new();
+            *selected = 0;
+            if input.buffer.trim().is_empty() {
+                *searching = false;
+            } else {
+                *searching = true;
+                spawn_dockerhub_search(input.buffer.clone(), tx.clone());
+            }
+        }
+        return;
+    }
+
+    if let Modal::ArtifactoryPicker {
+        filter, selected, ..
+    } = &mut app.modal
+    {
+        let before = filter.buffer.clone();
+        filter.insert_str(text);
+        if filter.buffer != before {
+            *selected = 0;
+        }
+        return;
+    }
+
+    if let Modal::Inspect(m) = &mut app.modal
+        && m.search.active
+    {
+        m.search.input.insert_str(text);
+        return;
+    }
+
+    if app.filter_mode.is_some() {
+        app.push_filter_str(text);
+    }
 }
 
 fn handle_input_confirm(
@@ -1678,5 +1750,136 @@ mod tests {
         assert!(!is_auth_failure(&RegistryError::InvalidResponse(
             "x".to_owned()
         )));
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_paste — routes a bracketed paste to whichever surface is active
+    // -----------------------------------------------------------------------
+
+    fn app_with_modal(modal: Modal) -> App {
+        let profile = anon_profile("local", "http://localhost:5000/", RegistryType::Standard);
+        let mut app = App::new(vec![profile], 0);
+        app.modal = modal;
+        app
+    }
+
+    #[test]
+    fn handle_paste_routes_to_input_modal() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = app_with_modal(Modal::Input {
+            prompt: "Access token:".to_owned(),
+            input: InputState::default(),
+            on_confirm: InputAction::EnterToken {
+                profile_name: "local".to_owned(),
+            },
+        });
+
+        handle_paste(&mut app, "a-long-pasted-token", &tx);
+
+        let Modal::Input { input, .. } = &app.modal else {
+            panic!("expected Modal::Input");
+        };
+        assert_eq!(input.buffer, "a-long-pasted-token");
+    }
+
+    #[test]
+    fn handle_paste_routes_to_search_picker_and_resets_selection() {
+        // spawn_dockerhub_search does a real tokio::spawn, so this needs a
+        // runtime — same convention used elsewhere in this file (e.g.
+        // resolve_secrets_returns_nothing_for_anonymous_profile).
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (tx, _rx) = mpsc::channel(8);
+            let mut app = app_with_modal(Modal::SearchPicker {
+                input: InputState::default(),
+                results: vec!["stale-result".to_owned()],
+                selected: 3,
+                searching: false,
+            });
+
+            handle_paste(&mut app, "nginx", &tx);
+
+            let Modal::SearchPicker {
+                input,
+                results,
+                selected,
+                searching,
+            } = &app.modal
+            else {
+                panic!("expected Modal::SearchPicker");
+            };
+            assert_eq!(input.buffer, "nginx");
+            assert!(results.is_empty(), "stale results must be cleared");
+            assert_eq!(*selected, 0);
+            assert!(*searching);
+        });
+    }
+
+    #[test]
+    fn handle_paste_routes_to_artifactory_filter() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = app_with_modal(Modal::ArtifactoryPicker {
+            filter: InputState::default(),
+            repos: Vec::new(),
+            selected: 5,
+            loading: false,
+        });
+
+        handle_paste(&mut app, "docker-local", &tx);
+
+        let Modal::ArtifactoryPicker {
+            filter, selected, ..
+        } = &app.modal
+        else {
+            panic!("expected Modal::ArtifactoryPicker");
+        };
+        assert_eq!(filter.buffer, "docker-local");
+        assert_eq!(*selected, 0, "selection must reset on a changed filter");
+    }
+
+    #[test]
+    fn handle_paste_routes_to_inspect_search_when_active() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut inspect = InspectModal::new("img:tag".to_owned(), vec!["{}".to_owned()]);
+        inspect.start_search();
+        let mut app = app_with_modal(Modal::Inspect(Box::new(inspect)));
+
+        handle_paste(&mut app, "sha256:abc", &tx);
+
+        let Modal::Inspect(m) = &app.modal else {
+            panic!("expected Modal::Inspect");
+        };
+        assert_eq!(m.search.input.buffer, "sha256:abc");
+    }
+
+    #[test]
+    fn handle_paste_routes_to_list_filter_when_filter_mode_active() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = app_with_modal(Modal::None);
+        app.repos = vec!["nginx".to_owned(), "budgeteer".to_owned()];
+        app.filter_mode = Some(Focus::Repos);
+
+        handle_paste(&mut app, "ngi", &tx);
+
+        assert_eq!(app.repo_filter, "ngi");
+    }
+
+    #[test]
+    fn handle_paste_is_a_noop_in_normal_mode_and_confirm_modal() {
+        let (tx, _rx) = mpsc::channel(8);
+
+        let mut normal = app_with_modal(Modal::None);
+        handle_paste(&mut normal, "ignored", &tx);
+        assert_eq!(normal.repo_filter, "");
+        assert!(matches!(normal.modal, Modal::None));
+
+        let mut confirming = app_with_modal(Modal::Confirm {
+            message: "Delete?".to_owned(),
+            on_confirm: ConfirmAction::DeleteManifest {
+                repo: "r".to_owned(),
+                tag: "t".to_owned(),
+            },
+        });
+        handle_paste(&mut confirming, "ignored", &tx);
+        assert!(matches!(confirming.modal, Modal::Confirm { .. }));
     }
 }
