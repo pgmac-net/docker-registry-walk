@@ -333,6 +333,16 @@ pub enum Modal {
         selected: usize,
         loading: bool,
     },
+    /// Pick which GHCR package to browse. Fetched once from the GitHub
+    /// packages API and filtered locally, like `ArtifactoryPicker` — but the
+    /// entries are ordinary repository names, not sub-registries, so the same
+    /// list also populates the Repos pane (see `App::on_ghcr_packages`).
+    GhcrPicker {
+        filter: InputState,
+        packages: Vec<String>,
+        selected: usize,
+        loading: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +459,9 @@ pub struct App {
     /// Repo-key currently being browsed, when the active registry is an
     /// Artifactory repo-key. Used to preselect it in the picker.
     current_artifactory_repo_key: Option<String>,
+    /// Last-fetched package list per GHCR profile (by profile name), so
+    /// re-opening the picker doesn't wait on the GitHub API again.
+    ghcr_package_cache: HashMap<String, Vec<String>>,
 }
 
 impl App {
@@ -496,6 +509,7 @@ impl App {
             active_profile_idx: idx,
             artifactory_repo_cache: HashMap::new(),
             current_artifactory_repo_key: None,
+            ghcr_package_cache: HashMap::new(),
         }
     }
 
@@ -752,6 +766,160 @@ impl App {
             selected,
             loading: true,
         };
+    }
+
+    /// Switch to a GHCR profile: clear repo/tag/detail state and open the
+    /// package picker, since GHCR serves no `/v2/_catalog` to fetch instead.
+    pub fn start_ghcr_switch(&mut self, idx: usize) {
+        self.active_profile_idx = idx;
+        let profile = &self.profiles[idx];
+        self.registry_name = profile.name.clone();
+        self.registry_url = profile.url.clone();
+        self.reset_for_new_registry();
+        // Loading, not Idle: the same fetch fills the Repos pane behind the
+        // picker, so the pane must not read as an empty result until it lands.
+        self.repo_load = LoadState::Loading;
+        self.modal = Modal::GhcrPicker {
+            filter: InputState::default(),
+            packages: Vec::new(),
+            selected: 0,
+            loading: true,
+        };
+    }
+
+    /// Fill in the package list once the GitHub packages API returns.
+    ///
+    /// One fetch serves two surfaces. A GHCR package is an ordinary
+    /// repository — unlike an Artifactory repo-key, which is a whole
+    /// sub-registry whose catalog is fetched afterwards — so the list is both
+    /// the picker's contents *and* the Repos pane's contents. Populating only
+    /// the picker would leave the pane empty behind it, with nothing to return
+    /// to on `Esc`.
+    pub fn on_ghcr_packages(&mut self, packages: Vec<String>, truncated: bool) {
+        let profile_name = self.profiles[self.active_profile_idx].name.clone();
+        self.ghcr_package_cache
+            .insert(profile_name, packages.clone());
+
+        if let Modal::GhcrPicker {
+            packages: p,
+            selected,
+            loading,
+            ..
+        } = &mut self.modal
+        {
+            *p = packages.clone();
+            *loading = false;
+            let len = p.len();
+            *selected = if len == 0 {
+                0
+            } else {
+                (*selected).min(len - 1)
+            };
+        }
+
+        // `has_more = false`: the GitHub API pagination is followed to
+        // completion inside the fetch, so there is no cursor for the Repos
+        // pane to continue from.
+        self.on_repos_page(packages, false);
+
+        if truncated {
+            self.set_status("Package list truncated — refine with the picker filter");
+        }
+    }
+
+    /// Re-open the package picker from the cached list, so it appears without
+    /// a GitHub API round-trip. Unlike `start_ghcr_switch`, this leaves
+    /// repo/tag/detail state alone — `Esc` returns to browsing as it was.
+    pub fn open_ghcr_picker_cached(&mut self) {
+        let profile_name = &self.profiles[self.active_profile_idx].name;
+        let cached = self
+            .ghcr_package_cache
+            .get(profile_name)
+            .cloned()
+            .unwrap_or_default();
+        let selected = self
+            .current_repo
+            .as_ref()
+            .and_then(|repo| cached.iter().position(|p| p == repo))
+            .unwrap_or(0);
+        self.modal = Modal::GhcrPicker {
+            filter: InputState::default(),
+            packages: cached,
+            selected,
+            loading: true,
+        };
+    }
+
+    /// Report a failed package listing.
+    ///
+    /// Discovery is the only thing that fails here — browsing a *known* GHCR
+    /// repository needs no GitHub API call at all, and works even anonymously.
+    /// So when there is nothing to show, this hands over to the same
+    /// browse-by-name fallback a missing catalog uses, rather than leaving an
+    /// empty picker with no way forward. That is the whole experience for an
+    /// anonymous profile, which cannot list packages at all: GitHub exposes no
+    /// unauthenticated package listing, even for public packages.
+    ///
+    /// A cached list survives instead: a refetch failing mid-browse should not
+    /// throw away packages the user is still picking from.
+    pub fn on_ghcr_packages_error(&mut self, msg: String) {
+        let has_cached = matches!(
+            &self.modal,
+            Modal::GhcrPicker { packages, .. } if !packages.is_empty()
+        );
+
+        if has_cached {
+            if let Modal::GhcrPicker { loading, .. } = &mut self.modal {
+                *loading = false;
+            }
+            self.set_status(format!("GHCR packages error: {msg}"));
+            return;
+        }
+
+        // `on_repos_error` only opens the fallback over `Modal::None`, and it
+        // also moves the Repos pane out of the `Loading` state
+        // `start_ghcr_switch` set — otherwise the pane spins forever with the
+        // reason visible only until the status message times out.
+        self.modal = Modal::None;
+        self.on_repos_error(msg, true);
+    }
+
+    /// The picker's package list filtered by its current filter buffer
+    /// (substring match, case-insensitive).
+    pub fn ghcr_filtered_packages(&self) -> Vec<&String> {
+        let Modal::GhcrPicker {
+            filter, packages, ..
+        } = &self.modal
+        else {
+            return Vec::new();
+        };
+        let f = filter.buffer.to_lowercase();
+        if f.is_empty() {
+            packages.iter().collect()
+        } else {
+            packages
+                .iter()
+                .filter(|p| p.to_lowercase().contains(&f))
+                .collect()
+        }
+    }
+
+    /// Move the Repos pane's selection onto `repo`, reporting whether it was
+    /// there to select.
+    ///
+    /// Keeps the pane consistent with a repo chosen from the GHCR picker
+    /// rather than by navigating the pane. The event loop reloads tags
+    /// whenever the repo selection changes, so moving the selection is all
+    /// that a pick needs to do — issuing a `BrowseRepo` as well would fetch
+    /// the same tags twice, and `on_tags_page` appends, so the list would come
+    /// back doubled. `false` means the caller still has to browse it some
+    /// other way (it can be missing when a repo filter is active).
+    pub fn select_repo_by_name(&mut self, repo: &str) -> bool {
+        if let Some(idx) = self.repos.iter().position(|r| r == repo) {
+            self.repos_state.select(Some(idx));
+            return true;
+        }
+        false
     }
 
     pub fn on_artifactory_repos_error(&mut self, msg: String) {
@@ -1841,5 +2009,168 @@ mod tests {
         app.push_filter_str("nginx");
 
         assert_eq!(app.repo_filter, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // GHCR package picker
+    // -----------------------------------------------------------------------
+
+    fn make_ghcr_app() -> App {
+        let profile = RegistryProfile {
+            name: "ghcr".to_owned(),
+            url: "https://ghcr.io".to_owned(),
+            registry_type: RegistryType::Ghcr,
+            ..Default::default()
+        };
+        App::new(vec![profile], 0)
+    }
+
+    fn ghcr_packages() -> Vec<String> {
+        [
+            "homebrew/brew",
+            "homebrew/core/git",
+            "homebrew/core/sqldiff",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// The pane must not read as an empty catalog while the GitHub API call is
+    /// still out — that is what `Idle` would look like to the renderer.
+    #[test]
+    fn start_ghcr_switch_opens_a_loading_picker() {
+        let mut app = make_ghcr_app();
+        app.start_ghcr_switch(0);
+
+        assert!(matches!(app.modal, Modal::GhcrPicker { loading: true, .. }));
+        assert_eq!(app.repo_load, LoadState::Loading);
+    }
+
+    /// One fetch, two surfaces. A GHCR package is an ordinary repository, so
+    /// the list is both the picker's contents and the Repos pane's — filling
+    /// only the picker would leave an empty pane behind it with nothing to
+    /// return to on `Esc`.
+    #[test]
+    fn on_ghcr_packages_fills_both_the_picker_and_the_repos_pane() {
+        let mut app = make_ghcr_app();
+        app.start_ghcr_switch(0);
+        app.on_ghcr_packages(ghcr_packages(), false);
+
+        let Modal::GhcrPicker {
+            packages, loading, ..
+        } = &app.modal
+        else {
+            panic!("expected Modal::GhcrPicker");
+        };
+        assert_eq!(packages.len(), 3);
+        assert!(!loading);
+
+        assert_eq!(app.repos, ghcr_packages());
+        assert_eq!(app.repo_load, LoadState::Idle);
+    }
+
+    #[test]
+    fn ghcr_filter_matches_any_path_segment_case_insensitively() {
+        let mut app = make_ghcr_app();
+        app.start_ghcr_switch(0);
+        app.on_ghcr_packages(ghcr_packages(), false);
+
+        if let Modal::GhcrPicker { filter, .. } = &mut app.modal {
+            filter.buffer = "SQL".to_owned();
+        }
+
+        assert_eq!(
+            app.ghcr_filtered_packages(),
+            vec![&"homebrew/core/sqldiff".to_owned()]
+        );
+    }
+
+    /// With nothing to list, the picker is a dead end — but browsing a *known*
+    /// GHCR repo needs no GitHub API call and works even anonymously, so the
+    /// failure has to land on the browse-by-name fallback. This is the whole
+    /// experience for a profile with no PAT, since GitHub exposes no anonymous
+    /// package listing.
+    #[test]
+    fn on_ghcr_packages_error_falls_back_to_browse_by_name() {
+        let mut app = make_ghcr_app();
+        app.start_ghcr_switch(0);
+        app.on_ghcr_packages_error("no GitHub token".to_owned());
+
+        assert!(
+            matches!(
+                &app.modal,
+                Modal::Input {
+                    on_confirm: InputAction::BrowseRepo,
+                    ..
+                }
+            ),
+            "expected the browse-by-name fallback, got {:?}",
+            std::mem::discriminant(&app.modal)
+        );
+        // The pane must not be left spinning on the state start_ghcr_switch set.
+        assert!(matches!(app.repo_load, LoadState::Error(_)));
+    }
+
+    /// A refetch failing mid-browse must not throw away the list the user is
+    /// still picking from.
+    #[test]
+    fn on_ghcr_packages_error_keeps_a_cached_list() {
+        let mut app = make_ghcr_app();
+        app.start_ghcr_switch(0);
+        app.on_ghcr_packages(ghcr_packages(), false);
+        app.open_ghcr_picker_cached();
+
+        app.on_ghcr_packages_error("503 Service Unavailable".to_owned());
+
+        let Modal::GhcrPicker {
+            packages, loading, ..
+        } = &app.modal
+        else {
+            panic!("expected the cached picker to survive the error");
+        };
+        assert_eq!(packages.len(), 3);
+        assert!(!loading, "spinner must stop even though the list survived");
+    }
+
+    /// The return value is what stops a pick fetching tags twice: `true` means
+    /// the event loop's selection-change reload will cover it, so the caller
+    /// must not also issue a `BrowseRepo`.
+    #[test]
+    fn select_repo_by_name_moves_the_repos_pane_selection() {
+        let mut app = make_ghcr_app();
+        app.start_ghcr_switch(0);
+        app.on_ghcr_packages(ghcr_packages(), false);
+
+        assert!(app.select_repo_by_name("homebrew/core/sqldiff"));
+        assert_eq!(app.repos_state.selected(), Some(2));
+
+        // A name that isn't in the pane leaves the selection alone rather than
+        // clearing it or pointing past the end — and reports the miss, so the
+        // caller can fall back to browsing it by name.
+        assert!(!app.select_repo_by_name("absent/package"));
+        assert_eq!(app.repos_state.selected(), Some(2));
+    }
+
+    /// Reopening mid-browse preselects the repo being viewed and does not
+    /// disturb repo/tag state — `Esc` returns to browsing exactly as it was.
+    #[test]
+    fn open_ghcr_picker_cached_preselects_the_current_repo() {
+        let mut app = make_ghcr_app();
+        app.start_ghcr_switch(0);
+        app.on_ghcr_packages(ghcr_packages(), false);
+        app.start_tags_load("homebrew/core/git".to_owned());
+
+        app.open_ghcr_picker_cached();
+
+        let Modal::GhcrPicker {
+            packages, selected, ..
+        } = &app.modal
+        else {
+            panic!("expected Modal::GhcrPicker");
+        };
+        assert_eq!(packages.len(), 3, "served from cache, not refetched");
+        assert_eq!(*selected, 1);
+        assert_eq!(app.current_repo.as_deref(), Some("homebrew/core/git"));
     }
 }

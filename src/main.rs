@@ -39,6 +39,11 @@ struct Cli {
     #[arg(long, value_enum)]
     auth: Option<AuthMode>,
 
+    /// GHCR only: user or organisation whose packages to list (used with
+    /// --url). Omit to list the token holder's own packages.
+    #[arg(long)]
+    owner: Option<String>,
+
     /// Prompt for the registry password (masked) and store it in the OS
     /// keyring. Takes no value — pass just `--password`, never
     /// `--password=<secret>`, so the secret never lands in shell history.
@@ -48,8 +53,9 @@ struct Cli {
     /// Prompt for a registry access token (masked) and store it in the OS
     /// keyring. Takes no value, for the same reason as `--password`.
     ///
-    /// Alternatively, set $JFROG_ACCESS_TOKEN or $ARTIFACTORY_ACCESS_TOKEN,
-    /// which take precedence over the keyring.
+    /// Alternatively, set $JFROG_ACCESS_TOKEN or $ARTIFACTORY_ACCESS_TOKEN
+    /// (Artifactory), or $CR_PAT, $GITHUB_TOKEN or $GH_TOKEN (GHCR), which
+    /// take precedence over the keyring.
     #[arg(long)]
     token: bool,
 }
@@ -93,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             username: cli.username.clone(),
             registry_type: cli.registry_type.unwrap_or_default(),
             auth: cli.auth.unwrap_or_default(),
+            owner: cli.owner.clone(),
         };
         config.registry.insert(0, profile);
         0

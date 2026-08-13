@@ -9,7 +9,6 @@ use ratatui::{
 };
 
 use crate::ops::diff::DiffStatus;
-use crate::registry::ArtifactoryRepo;
 
 use super::app::{App, Focus, InspectModal, LoadState, Modal, SPINNER};
 use super::detail;
@@ -76,7 +75,45 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             repos,
             selected,
             loading,
-        } => draw_artifactory_picker_modal(frame, filter, repos, *selected, *loading, area),
+        } => {
+            let f = filter.buffer.to_lowercase();
+            let rows: Vec<String> = repos
+                .iter()
+                .filter(|r| f.is_empty() || r.key.to_lowercase().contains(&f))
+                .map(|r| format!("{} ({})", r.key, r.repo_type))
+                .collect();
+            draw_filter_picker_modal(
+                frame,
+                filter,
+                &rows,
+                *selected,
+                *loading,
+                ARTIFACTORY_PICKER_LABELS,
+                area,
+            );
+        }
+        Modal::GhcrPicker {
+            filter,
+            packages,
+            selected,
+            loading,
+        } => {
+            let f = filter.buffer.to_lowercase();
+            let rows: Vec<String> = packages
+                .iter()
+                .filter(|p| f.is_empty() || p.to_lowercase().contains(&f))
+                .cloned()
+                .collect();
+            draw_filter_picker_modal(
+                frame,
+                filter,
+                &rows,
+                *selected,
+                *loading,
+                GHCR_PICKER_LABELS,
+                area,
+            );
+        }
         Modal::None => {}
     }
 }
@@ -475,28 +512,55 @@ fn draw_search_picker_modal(
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 }
 
-fn draw_artifactory_picker_modal(
+/// The labels that distinguish one filtered picker from another.
+#[derive(Clone, Copy)]
+struct PickerLabels {
+    /// Title of the filter input box. A spinner is appended while loading.
+    title: &'static str,
+    /// Title of the results list, carrying the key hints.
+    list_title: &'static str,
+    /// Shown when the list is empty and the fetch has finished.
+    empty: &'static str,
+}
+
+const ARTIFACTORY_PICKER_LABELS: PickerLabels = PickerLabels {
+    title: " Artifactory Repositories ",
+    list_title: " Repo-keys  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ",
+    empty: " No repositories found",
+};
+
+const GHCR_PICKER_LABELS: PickerLabels = PickerLabels {
+    title: " GHCR Packages ",
+    list_title: " Packages  [↑↓/jk] navigate  [Enter] browse  [Esc] cancel ",
+    empty: " No packages found",
+};
+
+/// Renderer shared by the two one-shot, locally-filtered pickers.
+///
+/// The Artifactory repo-key picker and the GHCR package picker differ only in
+/// their labels and in how a row is formatted — layout, filter input,
+/// scrolling and empty state are identical, so they live here once. `rows` is
+/// already filtered by the caller, which is also where the per-type row
+/// formatting happens.
+fn draw_filter_picker_modal(
     frame: &mut Frame,
     filter: &InputState,
-    repos: &[ArtifactoryRepo],
+    filtered: &[String],
     selected: usize,
     loading: bool,
+    labels: PickerLabels,
     area: Rect,
 ) {
-    let filter_lower = filter.buffer.to_lowercase();
-    let filtered: Vec<&ArtifactoryRepo> = if filter_lower.is_empty() {
-        repos.iter().collect()
-    } else {
-        repos
-            .iter()
-            .filter(|r| r.key.to_lowercase().contains(&filter_lower))
-            .collect()
-    };
-
     let max_rows = area.height.saturating_sub(9).max(1);
     let result_rows = (filtered.len() as u16).min(max_rows);
+    // The empty state needs 6, not 5: the layout below gives the filter input
+    // 3 rows and the rest to the list, and a bordered block only starts having
+    // interior rows at height 3. At 5 the message ("Loading…" / "No … found")
+    // rendered into a zero-row interior and was invisible — which a GHCR
+    // listing makes obvious, since it can spend a minute paging the GitHub API
+    // with nothing else on screen to say so.
     let height = if filtered.is_empty() {
-        5
+        6
     } else {
         result_rows + 5
     };
@@ -506,9 +570,9 @@ fn draw_artifactory_picker_modal(
     frame.render_widget(Clear, modal_area);
 
     let title = if loading {
-        " Artifactory Repositories ⠸ "
+        format!("{}⠸ ", labels.title)
     } else {
-        " Artifactory Repositories "
+        labels.title.to_owned()
     };
 
     let chunks = Layout::default()
@@ -529,11 +593,7 @@ fn draw_artifactory_picker_modal(
     frame.render_widget(filter_input, chunks[0]);
 
     if filtered.is_empty() {
-        let msg = if loading {
-            " Loading…"
-        } else {
-            " No repositories found"
-        };
+        let msg = if loading { " Loading…" } else { labels.empty };
         let p = Paragraph::new(msg).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -545,12 +605,12 @@ fn draw_artifactory_picker_modal(
 
     let items: Vec<ListItem> = filtered
         .iter()
-        .map(|r| ListItem::new(format!("{} ({})", r.key, r.repo_type)))
+        .map(|row| ListItem::new(row.as_str()))
         .collect();
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Repo-keys  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
+                .title(labels.list_title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
@@ -1039,6 +1099,7 @@ mod tests {
     use super::super::app::{ConfirmAction, InputAction};
     use super::*;
     use crate::config::{RegistryProfile, RegistryType};
+    use crate::registry::ArtifactoryRepo;
 
     fn make_app() -> App {
         let profile = RegistryProfile {
@@ -1108,6 +1169,78 @@ mod tests {
             content.contains("docker-local-29"),
             "selected (last) repo-key must be scrolled into view"
         );
+    }
+
+    /// The GHCR picker shares its renderer with the Artifactory one, so this
+    /// pins that the shared code still scrolls a selection into view — and
+    /// that a nested package name survives rendering intact.
+    #[test]
+    fn ghcr_picker_scrolls_last_selection_into_view() {
+        let mut app = make_app();
+        let packages: Vec<String> = (0..30).map(|i| format!("owner/core/pkg-{i}")).collect();
+        app.modal = Modal::GhcrPicker {
+            filter: InputState::default(),
+            packages,
+            selected: 29,
+            loading: false,
+        };
+
+        let content = render_to_string(&mut app, 100, 20);
+        assert!(
+            content.contains("owner/core/pkg-29"),
+            "selected (last) package must be scrolled into view"
+        );
+    }
+
+    /// A GHCR listing can spend a minute paging the GitHub API, so the empty
+    /// state is the whole screen for that time. It has to actually render: at
+    /// the old height the message landed in a bordered box with zero interior
+    /// rows and was invisible.
+    #[test]
+    fn picker_empty_state_messages_are_visible() {
+        let mut app = make_app();
+
+        app.modal = Modal::GhcrPicker {
+            filter: InputState::default(),
+            packages: Vec::new(),
+            selected: 0,
+            loading: true,
+        };
+        assert!(
+            render_to_string(&mut app, 100, 30).contains("Loading…"),
+            "the loading message must be visible while the fetch is out"
+        );
+
+        app.modal = Modal::GhcrPicker {
+            filter: input_with("nomatch"),
+            packages: vec!["homebrew/core/git".to_owned()],
+            selected: 0,
+            loading: false,
+        };
+        assert!(
+            render_to_string(&mut app, 100, 30).contains("No packages found"),
+            "a filter matching nothing must say so rather than render blank"
+        );
+    }
+
+    /// The filter is applied by the caller now that the renderer is shared;
+    /// this pins that the GHCR arm actually wires it up.
+    #[test]
+    fn ghcr_picker_renders_only_filtered_rows() {
+        let mut app = make_app();
+        app.modal = Modal::GhcrPicker {
+            filter: input_with("sql"),
+            packages: vec![
+                "homebrew/core/git".to_owned(),
+                "homebrew/core/sqldiff".to_owned(),
+            ],
+            selected: 0,
+            loading: false,
+        };
+
+        let content = render_to_string(&mut app, 100, 20);
+        assert!(content.contains("homebrew/core/sqldiff"));
+        assert!(!content.contains("homebrew/core/git"));
     }
 
     #[test]
@@ -1188,6 +1321,12 @@ mod tests {
                 on_confirm: InputAction::BrowseRepo,
             },
             Modal::Help { scroll: 0 },
+            Modal::GhcrPicker {
+                filter: InputState::default(),
+                packages: vec!["homebrew/core/git".to_owned()],
+                selected: 0,
+                loading: false,
+            },
             Modal::Inspect(Box::new(InspectModal::new(
                 "img:tag".to_owned(),
                 "{\n  \"config\": {\n    \"digest\": \"sha256:abc\"\n  }\n}"

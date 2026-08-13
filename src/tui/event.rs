@@ -14,8 +14,9 @@ use crate::config::{AuthKind, AuthMode, RegistryProfile};
 use crate::ops::diff::DiffLayer;
 use crate::registry::{
     AccessTokenCredentials, ArtifactoryRepo, BasicCredentials, BearerCredentials, Credentials,
-    ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError, Secret, TOKEN_ACCOUNT,
-    resolve_access_token, sanitize_pasted_token, search_dockerhub,
+    GhcrCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError,
+    Secret, TOKEN_ACCOUNT, list_packages, resolve_access_token, sanitize_pasted_token,
+    search_dockerhub,
 };
 
 use super::app::{
@@ -123,6 +124,15 @@ pub enum AppEvent {
     /// Up-navigation from inside an Artifactory repo-key back to the
     /// repo-key picker (`Backspace` / `u`).
     OpenArtifactoryRepoPicker,
+    /// Container packages listed from the GitHub packages API, in `owner/name`
+    /// form. `truncated` reports that the page cap cut the listing short.
+    GhcrPackages {
+        packages: Vec<String>,
+        truncated: bool,
+    },
+    GhcrPackagesError(String),
+    /// Re-open the GHCR package picker (`Backspace` / `u`).
+    OpenGhcrPackagePicker,
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
@@ -194,6 +204,9 @@ pub(super) async fn event_loop(
     if profiles[initial_idx].is_artifactory() {
         app.start_artifactory_switch(initial_idx);
         spawn_artifactory_repos_fetch(clients[&active_name].clone(), tx.clone());
+    } else if profiles[initial_idx].is_ghcr() {
+        app.start_ghcr_switch(initial_idx);
+        spawn_ghcr_packages_fetch(profiles[initial_idx].clone(), tx.clone());
     } else {
         app.repo_load = LoadState::Loading;
         spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
@@ -221,6 +234,8 @@ pub(super) async fn event_loop(
                         // switched to rather than the one being left.
                         if profile.is_artifactory() {
                             app.start_artifactory_switch(idx);
+                        } else if profile.is_ghcr() {
+                            app.start_ghcr_switch(idx);
                         } else {
                             app.start_registry_switch(idx);
                         }
@@ -238,6 +253,11 @@ pub(super) async fn event_loop(
 
                         if profile.is_artifactory() {
                             spawn_artifactory_repos_fetch(clients[&active_name].clone(), tx.clone());
+                        } else if profile.is_ghcr() {
+                            // Takes the profile, not the client: the packages
+                            // API lives on api.github.com, a different origin
+                            // from the client's ghcr.io base URL.
+                            spawn_ghcr_packages_fetch(profile.clone(), tx.clone());
                         } else {
                             spawn_repos_fetch(clients[&active_name].clone(), None, tx.clone());
                         }
@@ -281,6 +301,23 @@ pub(super) async fn event_loop(
                                 spawn_artifactory_repos_fetch(base_client, tx.clone());
                             }
                         }
+                    }
+                    AppEvent::OpenGhcrPackagePicker => {
+                        let idx = app.active_profile_idx;
+                        if app.profiles[idx].is_ghcr() {
+                            let profile = app.profiles[idx].clone();
+                            app.open_ghcr_picker_cached();
+                            spawn_ghcr_packages_fetch(profile, tx.clone());
+                        }
+                    }
+                    AppEvent::GhcrPackages {
+                        packages,
+                        truncated,
+                    } => {
+                        app.on_ghcr_packages(packages, truncated);
+                    }
+                    AppEvent::GhcrPackagesError(msg) => {
+                        app.on_ghcr_packages_error(msg);
                     }
                     AppEvent::ReposError { msg, auth_failed } => {
                         // After a silent-reread or password-entry retry, a
@@ -467,7 +504,10 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         | AppEvent::ArtifactoryRepos(_)
         | AppEvent::ArtifactoryReposError(_)
         | AppEvent::ArtifactoryRepoSelected(_)
-        | AppEvent::OpenArtifactoryRepoPicker => {}
+        | AppEvent::OpenArtifactoryRepoPicker
+        | AppEvent::GhcrPackages { .. }
+        | AppEvent::GhcrPackagesError(_)
+        | AppEvent::OpenGhcrPackagePicker => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -687,6 +727,63 @@ fn handle_key(
         return;
     }
 
+    if matches!(app.modal, Modal::GhcrPicker { .. }) {
+        match code {
+            KeyCode::Esc => {
+                // The Repos pane already holds the same list, so cancelling
+                // leaves somewhere to browse rather than an empty screen.
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            KeyCode::Enter => {
+                let selected = if let Modal::GhcrPicker { selected, .. } = &app.modal {
+                    *selected
+                } else {
+                    0
+                };
+                if let Some(repo) = app
+                    .ghcr_filtered_packages()
+                    .get(selected)
+                    .map(|p| (*p).clone())
+                {
+                    app.modal = Modal::None;
+                    // Moving the selection is enough: the event loop reloads
+                    // tags whenever the selected repo changes. Sending
+                    // `BrowseRepo` as well would fetch the same tags twice,
+                    // and `on_tags_page` appends — so the tag list came back
+                    // doubled. Fall back to it only when the repo isn't in the
+                    // pane to select, which a repo filter can cause.
+                    if !app.select_repo_by_name(&repo) {
+                        let _ = tx.try_send(AppEvent::BrowseRepo(repo));
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if let Modal::GhcrPicker { selected, .. } = &mut app.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let n = app.ghcr_filtered_packages().len();
+                if let Modal::GhcrPicker { selected, .. } = &mut app.modal
+                    && n > 0
+                {
+                    *selected = (*selected + 1).min(n - 1);
+                }
+            }
+            _ => {
+                if let Modal::GhcrPicker {
+                    filter, selected, ..
+                } = &mut app.modal
+                    && apply_input_key(filter, code, modifiers)
+                {
+                    *selected = 0;
+                }
+            }
+        }
+        return;
+    }
+
     if matches!(app.modal, Modal::Inspect(_)) {
         // `?` opens Help over the viewer; stash the modal so closing Help
         // returns to the JSON view exactly where it was. Only when not
@@ -851,7 +948,14 @@ fn handle_key(
         KeyCode::Char('r') => app.start_retag(),
         KeyCode::Char('R') => app.start_registry_select(),
         KeyCode::Backspace | KeyCode::Char('u') => {
-            let _ = tx.try_send(AppEvent::OpenArtifactoryRepoPicker);
+            // One key, two pickers: which one is meaningful depends on the
+            // active profile, and each handler is a no-op for the other type.
+            let event = if app.profiles[app.active_profile_idx].is_ghcr() {
+                AppEvent::OpenGhcrPackagePicker
+            } else {
+                AppEvent::OpenArtifactoryRepoPicker
+            };
+            let _ = tx.try_send(event);
         }
         KeyCode::Char('d') => app.start_delete(),
         KeyCode::Char('i') => handle_inspect(app, client, tx),
@@ -1078,6 +1182,10 @@ async fn resolve_secrets(profile: &RegistryProfile) -> ResolvedSecrets {
     let name = profile.name.clone();
     let username = profile.username.clone();
     let wants_token = profile.wants_access_token();
+    // Which variables are legitimate for *this* registry type; the decision is
+    // `RegistryProfile::token_env_vars`, so a GHCR profile never reads a JFrog
+    // variable and an Artifactory one never reads GITHUB_TOKEN.
+    let env_vars = profile.token_env_vars();
 
     tokio::task::spawn_blocking(move || {
         let store = KeyringStore::new(&name);
@@ -1086,7 +1194,7 @@ async fn resolve_secrets(profile: &RegistryProfile) -> ResolvedSecrets {
         // JFROG_ACCESS_TOKEN exported in a shell cannot change how an
         // unrelated registry is authenticated.
         let token = if wants_token {
-            resolve_access_token(&store)
+            resolve_access_token(&store, env_vars)
         } else {
             None
         };
@@ -1137,6 +1245,9 @@ async fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
             token.unwrap_or_default(),
             profile.username.clone(),
         )),
+        // `token` stays an Option: GHCR's exchange works anonymously too, and
+        // that is the only way to browse public packages without a PAT.
+        AuthKind::Ghcr => Arc::new(GhcrCredentials::new(&url, token)),
         // Artifactory's Docker v2 endpoint and REST API both accept plain HTTP
         // Basic (username + API key / identity token); no Bearer challenge is
         // issued, and `BearerCredentials` sends no header at all without one.
@@ -1557,6 +1668,49 @@ fn spawn_artifactory_repos_fetch(client: RegistryClient, tx: mpsc::Sender<AppEve
     });
 }
 
+/// Fetch a GHCR profile's container packages from the GitHub packages API.
+///
+/// Takes the profile rather than a `RegistryClient` on purpose. The packages
+/// API is on `api.github.com`, a different origin from the client's `ghcr.io`
+/// base URL, and `RegistryClient::send` deliberately strips `Authorization`
+/// from off-origin requests — so the client cannot carry this call, and
+/// teaching it to would punch a hole in that guard. The token is therefore
+/// re-resolved here, through the same `resolve_secrets` (and so the same
+/// `spawn_blocking`) used to build the client.
+fn spawn_ghcr_packages_fetch(profile: RegistryProfile, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let ResolvedSecrets { token, .. } = resolve_secrets(&profile).await;
+
+        // GitHub exposes no anonymous package listing, even for public
+        // packages, so say that plainly instead of sending a request that can
+        // only 401.
+        let Some(token) = token else {
+            let _ = tx
+                .send(AppEvent::GhcrPackagesError(
+                    "no GitHub token — set $CR_PAT or run with --token \
+                     (needs the read:packages scope)"
+                        .to_owned(),
+                ))
+                .await;
+            return;
+        };
+
+        match list_packages(profile.owner.as_deref(), &token).await {
+            Ok(list) => {
+                let _ = tx
+                    .send(AppEvent::GhcrPackages {
+                        packages: list.repos,
+                        truncated: list.truncated,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx.send(AppEvent::GhcrPackagesError(e.to_string())).await;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,6 +1749,7 @@ mod tests {
             username: None,
             registry_type: kind,
             auth: AuthMode::Auto,
+            owner: None,
         }
     }
 
