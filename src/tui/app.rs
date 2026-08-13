@@ -296,6 +296,50 @@ pub struct LayerDiffModal {
     pub scroll: usize,
 }
 
+/// Which set of keybindings the Help pane shows.
+///
+/// Stored on `Modal::Help` at the moment it opens rather than re-derived from
+/// `app` at render time — `draw_help_modal` (and the key handler) only see
+/// `&app.modal`, since Help itself is one of `Modal`'s variants, so recovering
+/// "what was open before Help" would need state this enum already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpContext {
+    /// Not inside any modal; which panel has focus decides the sections shown,
+    /// matching the footer bar, which already varies with focus.
+    Normal(Focus),
+    Inspect,
+    /// Docker Hub's server-side search: `↑↓` only, since `j`/`k` insert text.
+    SearchPicker,
+    /// Artifactory repo-keys or GHCR packages: fetched once, filtered locally.
+    FilterPicker,
+    /// GHCR owner picker: like `FilterPicker`, but any typed value is also
+    /// selectable, which is worth calling out on its own.
+    OwnerPicker,
+    RegistrySelect,
+    LayerDiff,
+}
+
+/// Which keybinding context applies to `modal`, given the current `focus`.
+///
+/// Pure, so the mapping is testable without rendering — and is the single
+/// source of truth for what `?` opens, since the same modal can only mean one
+/// context.
+pub fn help_context_for(modal: &Modal, focus: Focus) -> HelpContext {
+    match modal {
+        Modal::Inspect(_) => HelpContext::Inspect,
+        Modal::SearchPicker { .. } => HelpContext::SearchPicker,
+        Modal::ArtifactoryPicker { .. } | Modal::GhcrPicker { .. } => HelpContext::FilterPicker,
+        Modal::GhcrOwnerPicker { .. } => HelpContext::OwnerPicker,
+        Modal::RegistrySelect { .. } => HelpContext::RegistrySelect,
+        Modal::LayerDiff(_) => HelpContext::LayerDiff,
+        // Confirm, Input and Help itself have no keybinding context of their
+        // own worth switching to: Confirm/Input already show their keys
+        // inline, and `?` cannot reach Help from Help. Normal is the sensible
+        // fallback for all three, and for `None`.
+        _ => HelpContext::Normal(focus),
+    }
+}
+
 #[derive(Debug)]
 pub enum Modal {
     None,
@@ -315,6 +359,7 @@ pub enum Modal {
     LayerDiff(Box<LayerDiffModal>),
     Help {
         scroll: usize,
+        context: HelpContext,
     },
     /// Docker Hub repository search with live results.
     SearchPicker {
@@ -503,9 +548,12 @@ pub struct App {
     pub registry_name: String,
     pub registry_url: String,
     pub modal: Modal,
-    /// The Inspect modal stashed while the Help overlay is shown over it, so
-    /// closing Help returns to the JSON viewer where it left off.
-    pub inspect_return: Option<Box<InspectModal>>,
+    /// The modal stashed while the Help overlay is shown over it, so closing
+    /// Help returns to it exactly where it was left — including, for a
+    /// picker, whatever filter text and selection had already been typed.
+    /// `Box` because `Modal` embeds `Self` (e.g. `LayerDiff`), and boxing here
+    /// keeps `Modal` from needing to be recursively sized.
+    pub help_return: Option<Box<Modal>>,
     pub should_quit: bool,
     pub spinner_tick: usize,
     /// Which retry, if any, produced the catalog load currently in flight.
@@ -576,7 +624,7 @@ impl App {
             registry_name,
             registry_url,
             modal: Modal::None,
-            inspect_return: None,
+            help_return: None,
             should_quit: false,
             spinner_tick: 0,
             catalog_attempt: CatalogAttempt::Initial,
@@ -2517,5 +2565,146 @@ mod tests {
         assert!(app.current_repo.is_none());
         assert!(app.tags.is_empty());
         assert_eq!(app.repo_load, LoadState::Loading);
+    }
+
+    // -----------------------------------------------------------------------
+    // Contextual help
+    // -----------------------------------------------------------------------
+
+    /// `help_context_for` is what decides which keys `?` documents. A picker
+    /// mapped to the wrong context would show keys that don't apply to it, so
+    /// every non-`Normal` `Modal` variant gets its own case pinned here.
+    #[test]
+    fn help_context_for_maps_every_modal_variant() {
+        assert_eq!(
+            help_context_for(&Modal::None, Focus::Tags),
+            HelpContext::Normal(Focus::Tags)
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::Confirm {
+                    message: "Delete?".to_owned(),
+                    on_confirm: ConfirmAction::DeleteManifest {
+                        repo: "r".to_owned(),
+                        tag: "t".to_owned(),
+                    },
+                },
+                Focus::Repos
+            ),
+            HelpContext::Normal(Focus::Repos),
+            "Confirm shows its own inline keys, so it falls back to Normal"
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::Input {
+                    prompt: "Name:".to_owned(),
+                    input: InputState::default(),
+                    on_confirm: InputAction::BrowseRepo,
+                },
+                Focus::Repos
+            ),
+            HelpContext::Normal(Focus::Repos),
+            "Input is unreachable from ? (it's a legitimate character there)"
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::Inspect(Box::new(InspectModal::new(
+                    "img:tag".to_owned(),
+                    vec!["{}".to_owned()],
+                ))),
+                Focus::Tags
+            ),
+            HelpContext::Inspect
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::SearchPicker {
+                    input: InputState::default(),
+                    results: Vec::new(),
+                    selected: 0,
+                    searching: false,
+                },
+                Focus::Repos
+            ),
+            HelpContext::SearchPicker
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::ArtifactoryPicker {
+                    filter: InputState::default(),
+                    repos: Vec::new(),
+                    selected: 0,
+                    loading: false,
+                },
+                Focus::Repos
+            ),
+            HelpContext::FilterPicker
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::GhcrPicker {
+                    filter: InputState::default(),
+                    packages: Vec::new(),
+                    selected: 0,
+                    loading: false,
+                },
+                Focus::Repos
+            ),
+            HelpContext::FilterPicker,
+            "Artifactory and GHCR packages share one picker context"
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::GhcrOwnerPicker {
+                    input: InputState::default(),
+                    owners: Vec::new(),
+                    selected: 0,
+                    loading: false,
+                },
+                Focus::Repos
+            ),
+            HelpContext::OwnerPicker,
+            "the owner picker gets its own context, not FilterPicker's"
+        );
+        assert_eq!(
+            help_context_for(&Modal::RegistrySelect { selected_idx: 0 }, Focus::Repos),
+            HelpContext::RegistrySelect
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::LayerDiff(Box::new(LayerDiffModal {
+                    tag_a: "a".to_owned(),
+                    tag_b: "b".to_owned(),
+                    layers: Vec::new(),
+                    scroll: 0,
+                })),
+                Focus::Repos
+            ),
+            HelpContext::LayerDiff
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::Help {
+                    scroll: 0,
+                    context: HelpContext::Inspect,
+                },
+                Focus::Repos
+            ),
+            HelpContext::Normal(Focus::Repos),
+            "? cannot reach Help from Help, so this case only guards against a panic"
+        );
+    }
+
+    /// `open_help` in `event.rs` reads `app.focus` at the moment `?` is
+    /// pressed, so `Normal` tracks whichever panel is focused rather than
+    /// always defaulting to `Repos`.
+    #[test]
+    fn help_context_for_normal_tracks_every_focus() {
+        for focus in [Focus::Repos, Focus::Tags, Focus::Detail] {
+            assert_eq!(
+                help_context_for(&Modal::None, focus),
+                HelpContext::Normal(focus)
+            );
+        }
     }
 }

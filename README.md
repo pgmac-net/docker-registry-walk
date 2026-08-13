@@ -174,23 +174,31 @@ See [docs/artifactory-authentication.md](docs/artifactory-authentication.md) for
 
 ## Keybindings
 
-Press `?` inside the app for the full interactive reference. Summary:
+Press `?` for the keybindings help pane. It's **contextual**: it shows only the
+keys for whatever is on screen — the focused panel, a picker, the JSON viewer —
+rather than one long list. `?` reaches it from everywhere except a text prompt,
+where `?` stays a normal character you can type. Closing help (`?`/`q`/`Esc`)
+returns you to exactly where you were, filter text and selection included.
+
+Full details of every context: [docs/keybindings.md](docs/keybindings.md).
 
 ### Navigation
 
 | Key | Action |
 |-----|--------|
-| `↑` / `k` | Move up |
-| `↓` / `j` | Move down |
-| `Tab` | Cycle panel (Repos → Tags → Detail) |
-| `Enter` | Move focus to Tags when in Repos |
+| `↑` / `k` | Move up (or scroll, in the Detail panel) |
+| `↓` / `j` | Move down (or scroll, in the Detail panel) |
+| `Tab` / `→` | Next panel (Repos → Tags → Detail) |
+| `Shift-Tab` / `←` | Previous panel |
+| `Enter` | Move to Tags (Repos) / inspect the selected tag (Tags) |
 
 ### Filter
 
 | Key | Action |
 |-----|--------|
 | `/` | Start filter in the current panel |
-| `Esc` / `Enter` | Exit filter mode |
+| `Esc` | Clear filter and exit |
+| `Enter` / `Tab` | Keep filter and exit |
 
 ### Image operations (require a tag selected)
 
@@ -210,9 +218,11 @@ Press `?` inside the app for the full interactive reference. Summary:
 |-----|--------|
 | `↑` / `↓` / `k` / `j` | Move cursor |
 | `PgUp` / `PgDn` | Page up / down |
-| `g` / `G` | Jump to top / bottom |
+| `Home` / `g` | Jump to top |
+| `End` / `G` | Jump to bottom |
 | `Space` / `Enter` | Fold / unfold the node at the cursor |
-| `←` / `→` | Collapse / expand the node at the cursor |
+| `←` / `h` | Collapse the node at the cursor |
+| `→` / `l` | Expand the node at the cursor |
 | `H` / `L` | Collapse all / expand all |
 | `/` | Search JSON text (`Enter` to run, `Esc` to cancel) |
 | `n` / `N` | Jump to next / previous match |
@@ -246,7 +256,8 @@ entire document. Search auto-expands any folds hiding a match.
 | Key | Action |
 |-----|--------|
 | `?` | Keybindings help |
-| `q` / `Ctrl-C` | Quit |
+| `q` / `Esc` | Quit |
+| `Ctrl-C` | Force quit |
 
 ## Registry requirements
 

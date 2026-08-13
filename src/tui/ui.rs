@@ -11,7 +11,8 @@ use ratatui::{
 use crate::ops::diff::DiffStatus;
 
 use super::app::{
-    App, Focus, InspectModal, LoadState, Modal, OwnerChoice, SPINNER, ghcr_owner_choices,
+    App, Focus, HelpContext, InspectModal, LoadState, Modal, OwnerChoice, SPINNER,
+    ghcr_owner_choices,
 };
 use super::detail;
 use super::input::{InputState, cursor_spans, input_scroll_skip};
@@ -65,7 +66,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Modal::Inspect(_) => {} // handled above
         Modal::LayerDiff(m) => draw_layer_diff_modal(frame, m, area),
-        Modal::Help { scroll } => draw_help_modal(frame, *scroll, area),
+        Modal::Help { scroll, context } => draw_help_modal(frame, *scroll, *context, area),
         Modal::SearchPicker {
             input,
             results,
@@ -511,7 +512,9 @@ fn draw_search_picker_modal(
             );
             frame.render_widget(msg, chunks[1]);
         } else {
-            let hint = Paragraph::new(" [↑↓/jk] navigate  [Enter] open  [Esc] cancel").block(
+            // Arrow keys only: `j`/`k` are typed into the search query, same
+            // as any other character — this is a live search box.
+            let hint = Paragraph::new(" [↑↓] navigate  [Enter] open  [Esc] cancel").block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
@@ -525,7 +528,7 @@ fn draw_search_picker_modal(
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Results  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ")
+                .title(" Results  [↑↓] navigate  [Enter] open  [Esc] cancel ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
@@ -549,7 +552,10 @@ struct PickerLabels {
 
 const ARTIFACTORY_PICKER_LABELS: PickerLabels = PickerLabels {
     title: " Artifactory Repositories ",
-    list_title: " Repo-keys  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ",
+    // Arrow keys only: `j`/`k` fall through to `apply_input_key` in this
+    // picker's key handler and are typed into the filter instead, since a
+    // repo-key could contain either letter. `[jk]` here would be a lie.
+    list_title: " Repo-keys  [↑↓] navigate  [Enter] open  [Esc] cancel ",
     empty: " No repositories found",
 };
 
@@ -561,7 +567,9 @@ const GHCR_OWNER_PICKER_LABELS: PickerLabels = PickerLabels {
 
 const GHCR_PICKER_LABELS: PickerLabels = PickerLabels {
     title: " GHCR Packages ",
-    list_title: " Packages  [↑↓/jk] navigate  [Enter] browse  [Esc] cancel ",
+    // See the note on `ARTIFACTORY_PICKER_LABELS` — same key handler shape,
+    // same reason `j`/`k` are not navigation here.
+    list_title: " Packages  [↑↓] navigate  [Enter] browse  [Esc] cancel ",
     empty: " No packages found",
 };
 
@@ -958,161 +966,276 @@ fn draw_layer_diff_modal(frame: &mut Frame, m: &crate::tui::app::LayerDiffModal,
     frame.render_widget(Paragraph::new(visible), inner);
 }
 
-fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
-    let modal_area = popup_rect(area, 62, 50, 32);
+fn help_key(k: &'static str) -> Span<'static> {
+    Span::styled(
+        k,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn help_desc(d: &'static str) -> Span<'static> {
+    Span::raw(d)
+}
+
+fn help_header(h: &'static str) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        h,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )])
+}
+
+fn help_kv(k: &'static str, d: &'static str) -> Line<'static> {
+    Line::from(vec![help_key(k), Span::raw("  "), help_desc(d)])
+}
+
+fn help_blank() -> Line<'static> {
+    Line::from(vec![])
+}
+
+fn help_version_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "Version",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        help_desc(concat!("v", env!("CARGO_PKG_VERSION"))),
+    ])
+}
+
+/// General app keys — quitting only makes sense outside any modal, so this is
+/// specific to `Normal` contexts, not shared with e.g. a picker's `Esc`
+/// (which cancels the picker, not the app).
+fn help_lines_general() -> Vec<Line<'static>> {
+    vec![
+        help_header("General"),
+        help_kv("?", "This help"),
+        help_kv("q / Esc", "Quit"),
+        help_kv("Ctrl-C", "Force quit"),
+    ]
+}
+
+fn help_lines_normal(focus: Focus) -> Vec<Line<'static>> {
+    let mut lines = vec![help_header("Navigation")];
+    lines.push(match focus {
+        Focus::Detail => help_kv("↑ / k", "Scroll up"),
+        _ => help_kv("↑ / k", "Move up"),
+    });
+    lines.push(match focus {
+        Focus::Detail => help_kv("↓ / j", "Scroll down"),
+        _ => help_kv("↓ / j", "Move down"),
+    });
+    lines.push(help_kv("Tab / →", "Next panel"));
+    lines.push(help_kv("Shift-Tab / ←", "Previous panel"));
+    match focus {
+        Focus::Repos => lines.push(help_kv("Enter", "Move to Tags (if tags are loaded)")),
+        Focus::Tags => lines.push(help_kv("Enter", "Inspect the selected tag")),
+        Focus::Detail => {}
+    }
+    lines.push(help_blank());
+
+    lines.push(help_header("Filter"));
+    lines.push(help_kv("/", "Start filter in current panel"));
+    lines.push(help_kv("Esc", "Clear filter and exit"));
+    lines.push(help_kv("Enter / Tab", "Keep filter and exit"));
+    lines.push(help_blank());
+
+    match focus {
+        Focus::Repos => {
+            lines.push(help_header(
+                "Repository operations  (require a repo selected)",
+            ));
+            lines.push(help_kv("P", "Prune digest-only (untagged) manifests"));
+            lines.push(help_blank());
+            lines.push(help_header("Registry"));
+            lines.push(help_kv("R", "Switch registry (in-app)"));
+            lines.push(help_kv(
+                "Backspace / u",
+                "Up a level: repo-key picker (Artifactory) / owner picker (GHCR)",
+            ));
+        }
+        Focus::Tags => {
+            lines.push(help_header("Image operations  (require a tag selected)"));
+            lines.push(help_kv("c", "Copy pull URL to clipboard"));
+            lines.push(help_kv("C", "Copy image to another registry/repo"));
+            lines.push(help_kv("r", "Retag — push manifest under a new tag"));
+            lines.push(help_kv("d", "Delete tag (requires delete enabled)"));
+            lines.push(help_kv("i", "Inspect raw manifest & config JSON"));
+            lines.push(help_kv("e", "Export image as OCI tar archive"));
+            lines.push(help_kv("D", "Diff layers against another tag"));
+            lines.push(help_blank());
+            lines.push(help_header("Tags panel"));
+            lines.push(help_kv("s", "Cycle tag sort order (↑ / ↓ name)"));
+        }
+        Focus::Detail => {
+            lines.push(help_header("Image operations  (require a tag selected)"));
+            lines.push(help_kv("c", "Copy pull URL to clipboard"));
+        }
+    }
+    lines.push(help_blank());
+
+    lines.extend(help_lines_general());
+    lines.push(help_blank());
+    lines.push(help_version_line());
+    lines
+}
+
+fn help_lines_inspect() -> Vec<Line<'static>> {
+    vec![
+        help_header("Inspect viewer"),
+        help_kv("↑↓ / j k", "Move cursor"),
+        help_kv("PgUp / PgDn", "Page up / down"),
+        help_kv("Home / g", "Jump to top"),
+        help_kv("End / G", "Jump to bottom"),
+        help_kv("Space / Enter", "Fold / unfold node at cursor"),
+        help_kv("← / h", "Collapse node"),
+        help_kv("→ / l", "Expand node"),
+        help_kv("H / L", "Collapse all / expand all"),
+        help_kv("/", "Search JSON text"),
+        help_kv("n / N", "Next / previous match"),
+        help_kv("Esc / q", "Close viewer"),
+        help_kv("?", "This help (returns to the viewer on close)"),
+        help_blank(),
+        help_header("Search  (while typing a query)"),
+        help_kv("Esc", "Cancel search"),
+        help_kv("Enter", "Commit search and jump to first match"),
+        help_blank(),
+        help_version_line(),
+    ]
+}
+
+fn help_lines_search_picker() -> Vec<Line<'static>> {
+    vec![
+        help_header("Docker Hub Search  (opens automatically on Docker Hub)"),
+        help_kv("type", "Search as you type"),
+        help_kv("↑ / ↓", "Select result  (j/k insert text instead)"),
+        help_kv("Enter", "Browse selected repo"),
+        help_kv("Esc", "Close without searching"),
+        help_kv("?", "This help"),
+        help_blank(),
+        help_version_line(),
+    ]
+}
+
+fn help_lines_filter_picker() -> Vec<Line<'static>> {
+    vec![
+        help_header("Picker  (Artifactory repo-keys / GHCR packages)"),
+        help_kv("type", "Filter the list  (letters filter, not navigate)"),
+        help_kv("↑ / ↓", "Navigate"),
+        help_kv("Enter", "Open the highlighted entry"),
+        help_kv("Esc", "Cancel"),
+        help_kv("?", "This help"),
+        help_blank(),
+        help_version_line(),
+    ]
+}
+
+fn help_lines_owner_picker() -> Vec<Line<'static>> {
+    vec![
+        help_header("GHCR Owner Picker"),
+        help_kv("type", "Filter suggestions, or enter any owner"),
+        help_kv("↑ / ↓", "Navigate"),
+        help_kv("Enter", "Browse the highlighted owner"),
+        help_kv("Esc", "Cancel"),
+        help_kv("?", "This help"),
+        help_blank(),
+        help_kv(
+            "Use \"…\"",
+            "Row offered for any owner not in the suggestion list",
+        ),
+        help_blank(),
+        help_version_line(),
+    ]
+}
+
+fn help_lines_registry_select() -> Vec<Line<'static>> {
+    vec![
+        help_header("Switch Registry"),
+        help_kv("↑↓ / j k", "Navigate"),
+        help_kv("Enter", "Switch to selected registry"),
+        help_kv("Esc", "Cancel"),
+        help_kv("?", "This help"),
+        help_blank(),
+        help_version_line(),
+    ]
+}
+
+fn help_lines_layer_diff() -> Vec<Line<'static>> {
+    vec![
+        help_header("Layer Diff"),
+        help_kv("↑↓ / j k", "Scroll"),
+        help_kv("Esc / q", "Close"),
+        help_kv("?", "This help"),
+        help_blank(),
+        help_version_line(),
+    ]
+}
+
+/// The keybinding lines to show for `context`.
+///
+/// One self-contained list per context rather than a shared "Navigation" /
+/// "General" pair reused everywhere: the same keys mean different things in
+/// different contexts (a picker's `Esc` cancels the picker, not the app), so
+/// forcing shared sections onto contexts that don't share the underlying
+/// keymap would misdescribe them.
+fn help_lines(context: HelpContext) -> Vec<Line<'static>> {
+    match context {
+        HelpContext::Normal(focus) => help_lines_normal(focus),
+        HelpContext::Inspect => help_lines_inspect(),
+        HelpContext::SearchPicker => help_lines_search_picker(),
+        HelpContext::FilterPicker => help_lines_filter_picker(),
+        HelpContext::OwnerPicker => help_lines_owner_picker(),
+        HelpContext::RegistrySelect => help_lines_registry_select(),
+        HelpContext::LayerDiff => help_lines_layer_diff(),
+    }
+}
+
+fn draw_help_modal(frame: &mut Frame, scroll: usize, context: HelpContext, area: Rect) {
+    let lines = help_lines(context);
+
+    // Request the modal be tall enough for every line — `popup_rect` clamps
+    // to the terminal, so most contexts (now that they're contextual instead
+    // of one ~66-line list) fit without scrolling at all.
+    let modal_area = popup_rect(area, 62, 50, lines.len() as u16 + 2);
+    let inner_height = modal_area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_height);
+    let clamped = scroll.min(max_scroll);
+    let overflows = inner_height < lines.len();
 
     frame.render_widget(Clear, modal_area);
 
+    // An indicator only when there's something to indicate: most contexts now
+    // fit, and a position readout that's always present would be noise.
+    let title = if overflows {
+        format!(
+            " Keybindings — {}-{}/{} — ↑↓ scroll — ?/q/Esc close ",
+            clamped + 1,
+            (clamped + inner_height).min(lines.len()),
+            lines.len(),
+        )
+    } else {
+        " Keybindings — ?/q/Esc to close ".to_owned()
+    };
+
     let block = Block::default()
-        .title(" Keybindings — ? or Esc to close ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
-    let key = |k: &'static str| {
-        Span::styled(
-            k,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-    let sep = || Span::raw("  ");
-    let desc = |d: &'static str| Span::raw(d);
-    let header = |h: &'static str| {
-        Line::from(vec![Span::styled(
-            h,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )])
-    };
-
-    let lines: Vec<Line> = vec![
-        header("Navigation"),
-        Line::from(vec![key("↑ / k"), sep(), desc("Move up")]),
-        Line::from(vec![key("↓ / j"), sep(), desc("Move down")]),
-        Line::from(vec![
-            key("Tab"),
-            sep(),
-            desc("Cycle panel (Repos → Tags → Detail)"),
-        ]),
-        Line::from(vec![
-            key("Enter"),
-            sep(),
-            desc("Move focus to Tags when in Repos"),
-        ]),
-        Line::from(vec![]),
-        header("Filter"),
-        Line::from(vec![key("/"), sep(), desc("Start filter in current panel")]),
-        Line::from(vec![key("Esc / Enter"), sep(), desc("Exit filter mode")]),
-        Line::from(vec![]),
-        header("Image operations  (require a tag selected)"),
-        Line::from(vec![key("c"), sep(), desc("Copy pull URL to clipboard")]),
-        Line::from(vec![
-            key("C"),
-            sep(),
-            desc("Copy image to another registry/repo"),
-        ]),
-        Line::from(vec![
-            key("r"),
-            sep(),
-            desc("Retag — push manifest under a new tag"),
-        ]),
-        Line::from(vec![
-            key("d"),
-            sep(),
-            desc("Delete tag (requires delete enabled)"),
-        ]),
-        Line::from(vec![
-            key("i"),
-            sep(),
-            desc("Inspect raw manifest & config JSON"),
-        ]),
-        Line::from(vec![
-            key("e"),
-            sep(),
-            desc("Export image as OCI tar archive"),
-        ]),
-        Line::from(vec![
-            key("D"),
-            sep(),
-            desc("Diff layers against another tag"),
-        ]),
-        Line::from(vec![]),
-        header("Inspect viewer  (inside the JSON overlay)"),
-        Line::from(vec![key("↑↓ / j k"), sep(), desc("Move cursor")]),
-        Line::from(vec![key("PgUp/PgDn"), sep(), desc("Page up / down")]),
-        Line::from(vec![key("g / G"), sep(), desc("Jump to top / bottom")]),
-        Line::from(vec![
-            key("Space/Enter"),
-            sep(),
-            desc("Fold / unfold node at cursor"),
-        ]),
-        Line::from(vec![key("← / →"), sep(), desc("Collapse / expand node")]),
-        Line::from(vec![key("H / L"), sep(), desc("Collapse all / expand all")]),
-        Line::from(vec![key("/"), sep(), desc("Search JSON text")]),
-        Line::from(vec![key("n / N"), sep(), desc("Next / previous match")]),
-        Line::from(vec![
-            key("?"),
-            sep(),
-            desc("This help (returns to the viewer on close)"),
-        ]),
-        Line::from(vec![]),
-        header("Repository operations  (require a repo selected)"),
-        Line::from(vec![
-            key("P"),
-            sep(),
-            desc("Prune digest-only (untagged) manifests"),
-        ]),
-        Line::from(vec![]),
-        header("Tags panel"),
-        Line::from(vec![
-            key("s"),
-            sep(),
-            desc("Cycle tag sort order (↑ / ↓ name)"),
-        ]),
-        Line::from(vec![]),
-        header("Registry"),
-        Line::from(vec![key("R"), sep(), desc("Switch registry (in-app)")]),
-        Line::from(vec![
-            key("Backspace / u"),
-            sep(),
-            desc("Up a level: repo-key picker (Artifactory) / owner picker (GHCR)"),
-        ]),
-        Line::from(vec![]),
-        header("Docker Hub Search  (opens automatically on Docker Hub)"),
-        Line::from(vec![
-            key("↑ / ↓"),
-            sep(),
-            desc("Select result (j/k not available — they insert text)"),
-        ]),
-        Line::from(vec![key("Enter"), sep(), desc("Browse selected repo")]),
-        Line::from(vec![key("Esc"), sep(), desc("Close without searching")]),
-        Line::from(vec![]),
-        header("General"),
-        Line::from(vec![key("?"), sep(), desc("This help screen")]),
-        Line::from(vec![key("q / Esc"), sep(), desc("Quit")]),
-        Line::from(vec![key("Ctrl-C"), sep(), desc("Force quit")]),
-        Line::from(vec![]),
-        Line::from(vec![
-            Span::styled(
-                "Version",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            sep(),
-            desc(concat!("v", env!("CARGO_PKG_VERSION"))),
-        ]),
-    ];
-
-    let visible_h = inner.height as usize;
-    let max_scroll = lines.len().saturating_sub(visible_h);
-    let clamped = scroll.min(max_scroll);
-    let visible: Vec<Line> = lines.into_iter().skip(clamped).take(visible_h).collect();
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(clamped)
+        .take(inner.height as usize)
+        .collect();
 
     frame.render_widget(Paragraph::new(visible), inner);
 }
@@ -1390,7 +1513,42 @@ mod tests {
                 input: InputState::default(),
                 on_confirm: InputAction::BrowseRepo,
             },
-            Modal::Help { scroll: 0 },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::Normal(Focus::Repos),
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::Normal(Focus::Tags),
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::Normal(Focus::Detail),
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::Inspect,
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::SearchPicker,
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::FilterPicker,
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::OwnerPicker,
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::RegistrySelect,
+            },
+            Modal::Help {
+                scroll: 0,
+                context: HelpContext::LayerDiff,
+            },
             Modal::GhcrPicker {
                 filter: InputState::default(),
                 packages: vec!["homebrew/core/git".to_owned()],
@@ -1416,6 +1574,100 @@ mod tests {
             // Just assert it doesn't panic on a very small terminal.
             let _ = render_to_string(&mut app, 20, 8);
         }
+    }
+
+    fn help_app(context: HelpContext) -> App {
+        let mut app = make_app();
+        app.modal = Modal::Help { scroll: 0, context };
+        app
+    }
+
+    /// The whole point of a *contextual* help pane: what's on screen decides
+    /// what's shown, so a section belonging to one context must not leak into
+    /// another that happens to share a nearby key. Tags-only content
+    /// (Retag) must not appear while browsing Repos, and vice versa.
+    #[test]
+    fn help_sections_do_not_leak_across_normal_mode_focus() {
+        let repos_content =
+            render_to_string(&mut help_app(HelpContext::Normal(Focus::Repos)), 100, 30);
+        assert!(repos_content.contains("Prune digest-only"));
+        assert!(repos_content.contains("Switch registry"));
+        assert!(
+            !repos_content.contains("Retag"),
+            "Repos context must not show Tags-only image operations"
+        );
+
+        let tags_content =
+            render_to_string(&mut help_app(HelpContext::Normal(Focus::Tags)), 100, 30);
+        assert!(tags_content.contains("Retag"));
+        assert!(tags_content.contains("Cycle tag sort"));
+        assert!(
+            !tags_content.contains("Prune digest-only"),
+            "Tags context must not show the Repos-only prune operation"
+        );
+    }
+
+    /// The owner picker's `Use "…"` row is what makes an unlisted owner
+    /// reachable — it must appear there and nowhere else, or the pane would
+    /// promise the same escape hatch on a picker that doesn't have one.
+    #[test]
+    fn only_the_owner_picker_mentions_the_typed_owner_row() {
+        let owner_content = render_to_string(&mut help_app(HelpContext::OwnerPicker), 100, 30);
+        assert!(owner_content.contains("Use \""));
+
+        let package_content = render_to_string(&mut help_app(HelpContext::FilterPicker), 100, 30);
+        assert!(!package_content.contains("Use \""));
+    }
+
+    /// Regression coverage for two of the audit's findings: `Shift-Tab` was
+    /// undocumented, and `Enter` on a tag opens Inspect rather than
+    /// "moving focus" (which is what the old, wrong copy said).
+    #[test]
+    fn corrected_navigation_entries_are_present() {
+        let repos_content =
+            render_to_string(&mut help_app(HelpContext::Normal(Focus::Repos)), 100, 30);
+        assert!(repos_content.contains("Shift-Tab"));
+
+        let tags_content =
+            render_to_string(&mut help_app(HelpContext::Normal(Focus::Tags)), 100, 30);
+        assert!(tags_content.contains("Inspect the selected tag"));
+    }
+
+    /// Another audit finding: the filter's `Esc` and `Enter` do different
+    /// things (clear vs. keep), which the old copy conflated as one "exit"
+    /// entry.
+    #[test]
+    fn filter_clear_and_keep_are_documented_separately() {
+        let content = render_to_string(&mut help_app(HelpContext::Normal(Focus::Repos)), 100, 30);
+        assert!(content.contains("Clear filter"));
+        assert!(content.contains("Keep filter"));
+    }
+
+    /// A third: the Inspect viewer's close keys, and the `h`/`l` fold
+    /// aliases, were both missing from the old copy.
+    #[test]
+    fn inspect_close_and_fold_aliases_are_documented() {
+        let content = render_to_string(&mut help_app(HelpContext::Inspect), 100, 30);
+        assert!(content.contains("Close viewer"));
+        assert!(content.contains("Collapse node"));
+        assert!(content.contains("Expand node"));
+    }
+
+    /// Most contexts are now short enough to need no scroll indicator at all
+    /// — the point of going contextual in the first place.
+    #[test]
+    fn short_context_shows_no_scroll_indicator() {
+        let content = render_to_string(&mut help_app(HelpContext::LayerDiff), 100, 30);
+        assert!(content.contains("Keybindings — ?/q/Esc to close"));
+    }
+
+    /// A context that still doesn't fit (a small terminal, or `Normal`, which
+    /// stayed the longest) must say so, rather than silently truncating with
+    /// no sign there's more below.
+    #[test]
+    fn overflowing_context_shows_a_scroll_indicator() {
+        let content = render_to_string(&mut help_app(HelpContext::Normal(Focus::Tags)), 100, 8);
+        assert!(content.contains("scroll"));
     }
 
     fn input_with(text: &str) -> InputState {

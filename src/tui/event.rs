@@ -21,8 +21,12 @@ use crate::registry::{
 
 use super::app::{
     App, CatalogAttempt, ConfirmAction, Focus, InputAction, InspectModal, LayerDiffModal,
-    LoadState, Modal,
+    LoadState, Modal, help_context_for,
 };
+// Only named directly in tests — production code only ever calls
+// `help_context_for` and stores its result, never spells the type.
+#[cfg(test)]
+use super::app::HelpContext;
 use super::detail::ImageDetail;
 use super::input::InputState;
 use super::ui;
@@ -673,6 +677,7 @@ fn handle_key(
                     *selected = (*selected + 1).min(results.len().saturating_sub(1));
                 }
             }
+            KeyCode::Char('?') => open_help(app),
             _ => {
                 if let Modal::SearchPicker {
                     input,
@@ -732,6 +737,7 @@ fn handle_key(
                     *selected = (*selected + 1).min(n - 1);
                 }
             }
+            KeyCode::Char('?') => open_help(app),
             _ => {
                 if let Modal::ArtifactoryPicker {
                     filter, selected, ..
@@ -789,6 +795,7 @@ fn handle_key(
                     *selected = (*selected + 1).min(n - 1);
                 }
             }
+            KeyCode::Char('?') => open_help(app),
             _ => {
                 if let Modal::GhcrPicker {
                     filter, selected, ..
@@ -837,6 +844,7 @@ fn handle_key(
                     *selected = (*selected + 1).min(n - 1);
                 }
             }
+            KeyCode::Char('?') => open_help(app),
             _ => {
                 if let Modal::GhcrOwnerPicker {
                     input, selected, ..
@@ -853,15 +861,12 @@ fn handle_key(
     }
 
     if matches!(app.modal, Modal::Inspect(_)) {
-        // `?` opens Help over the viewer; stash the modal so closing Help
-        // returns to the JSON view exactly where it was. Only when not
-        // typing a search query (there `?` is a literal character).
+        // `?` opens Help over the viewer. Only when not typing a search query
+        // — there `?` is a literal character, same as any other picker's text
+        // input.
         let searching = matches!(&app.modal, Modal::Inspect(m) if m.search.active);
         if code == KeyCode::Char('?') && !searching {
-            if let Modal::Inspect(m) = std::mem::replace(&mut app.modal, Modal::None) {
-                app.inspect_return = Some(m);
-            }
-            app.modal = Modal::Help { scroll: 0 };
+            open_help(app);
             return;
         }
 
@@ -919,6 +924,7 @@ fn handle_key(
                     m.scroll = m.scroll.saturating_add(1);
                 }
             }
+            KeyCode::Char('?') => open_help(app),
             _ => {}
         }
         return;
@@ -927,19 +933,20 @@ fn handle_key(
     if matches!(app.modal, Modal::Help { .. }) {
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
-                // If Help was opened over the Inspect viewer, return to it.
-                app.modal = match app.inspect_return.take() {
-                    Some(m) => Modal::Inspect(m),
+                // Restore whatever `?` was pressed over — a picker's typed
+                // filter and selection included, not just "which modal".
+                app.modal = match app.help_return.take() {
+                    Some(m) => *m,
                     None => Modal::None,
                 };
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Modal::Help { scroll } = &mut app.modal {
+                if let Modal::Help { scroll, .. } = &mut app.modal {
                     *scroll = scroll.saturating_sub(1);
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Modal::Help { scroll } = &mut app.modal {
+                if let Modal::Help { scroll, .. } = &mut app.modal {
                     *scroll = scroll.saturating_add(1);
                 }
             }
@@ -974,6 +981,7 @@ fn handle_key(
                     let _ = tx.try_send(AppEvent::SwitchRegistry { idx: selected_idx });
                 }
             }
+            KeyCode::Char('?') => open_help(app),
             _ => {}
         }
         return;
@@ -1037,7 +1045,7 @@ fn handle_key(
         KeyCode::Char('P') => handle_prune(app, client, tx),
         KeyCode::Char('e') => app.start_export(),
         KeyCode::Char('D') => app.start_diff(),
-        KeyCode::Char('?') => app.modal = Modal::Help { scroll: 0 },
+        KeyCode::Char('?') => open_help(app),
         _ => {}
     }
 }
@@ -1048,6 +1056,21 @@ fn handle_enter(app: &mut App, client: &RegistryClient, tx: &mpsc::Sender<AppEve
         Focus::Tags => handle_inspect(app, client, tx),
         _ => {}
     }
+}
+
+/// Open Help over whatever is currently on screen.
+///
+/// Stashes the current modal (including `Modal::None` in normal mode) so
+/// closing Help restores it exactly as it was — a picker's typed filter text
+/// and selection included, not just "which picker was open". The context
+/// shown is derived from that same modal via `help_context_for`, so Help can
+/// never show sections for a surface other than the one `?` was pressed on.
+fn open_help(app: &mut App) {
+    let focus = app.focus;
+    let current = std::mem::replace(&mut app.modal, Modal::None);
+    let context = help_context_for(&current, focus);
+    app.help_return = Some(Box::new(current));
+    app.modal = Modal::Help { scroll: 0, context };
 }
 
 fn handle_confirm(action: ConfirmAction, client: &RegistryClient, tx: &mpsc::Sender<AppEvent>) {
@@ -2092,6 +2115,150 @@ mod tests {
             assert_eq!(*selected, 0);
             assert!(*searching);
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Contextual help — `?` stashes and restores whatever it was pressed over
+    // -----------------------------------------------------------------------
+
+    fn test_client() -> RegistryClient {
+        RegistryClient::new(Url::parse("http://localhost:5000").unwrap())
+    }
+
+    fn input_with(text: &str) -> InputState {
+        let mut input = InputState::default();
+        for c in text.chars() {
+            input.insert(c);
+        }
+        input
+    }
+
+    /// The whole point of generalising `inspect_return` to `help_return`: a
+    /// filter typed into a picker, and the row highlighted, must not be lost
+    /// to a help lookup. Losing them would be worse than not having help at
+    /// all on this surface.
+    #[test]
+    fn help_over_a_picker_preserves_its_filter_and_selection() {
+        let (tx, _rx) = mpsc::channel(8);
+        let client = test_client();
+        let mut app = app_with_modal(Modal::ArtifactoryPicker {
+            filter: input_with("docker-loc"),
+            repos: vec![],
+            selected: 2,
+            loading: false,
+        });
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+            &client,
+            &tx,
+        );
+        assert!(matches!(
+            app.modal,
+            Modal::Help {
+                context: HelpContext::FilterPicker,
+                ..
+            }
+        ));
+
+        // Close: '?' also closes Help, same as Esc/q.
+        handle_key(
+            &mut app,
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+            &client,
+            &tx,
+        );
+
+        let Modal::ArtifactoryPicker {
+            filter, selected, ..
+        } = &app.modal
+        else {
+            panic!("expected the picker to come back, filter and all");
+        };
+        assert_eq!(filter.buffer, "docker-loc");
+        assert_eq!(*selected, 2);
+    }
+
+    /// Normal mode has no modal to stash — `Modal::None` — and that has to
+    /// round-trip cleanly too, not leave the app stuck showing Help.
+    #[test]
+    fn help_over_normal_mode_returns_to_normal_mode() {
+        let (tx, _rx) = mpsc::channel(8);
+        let client = test_client();
+        let mut app = app_with_modal(Modal::None);
+        app.focus = Focus::Tags;
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+            &client,
+            &tx,
+        );
+        assert!(matches!(
+            app.modal,
+            Modal::Help {
+                context: HelpContext::Normal(Focus::Tags),
+                ..
+            }
+        ));
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &client, &tx);
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    /// `?` is a legitimate character in a text prompt (it cannot be reserved
+    /// there the way it is in pickers, since a value could need one), so it
+    /// must type a literal `?` instead of opening Help.
+    #[test]
+    fn help_key_is_a_literal_character_inside_input_modal() {
+        let (tx, _rx) = mpsc::channel(8);
+        let client = test_client();
+        let mut app = app_with_modal(Modal::Input {
+            prompt: "New tag:".to_owned(),
+            input: InputState::default(),
+            on_confirm: InputAction::BrowseRepo,
+        });
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+            &client,
+            &tx,
+        );
+
+        let Modal::Input { input, .. } = &app.modal else {
+            panic!("expected Modal::Input to stay open, not Help");
+        };
+        assert_eq!(input.buffer, "?");
+    }
+
+    /// Mirrors the pre-existing Inspect-search exception, generalised: `?`
+    /// must still be typeable into the Inspect JSON search query.
+    #[test]
+    fn help_key_is_a_literal_character_while_searching_inspect() {
+        let (tx, _rx) = mpsc::channel(8);
+        let client = test_client();
+        let mut modal = InspectModal::new("img:tag".to_owned(), vec!["{}".to_owned()]);
+        modal.start_search();
+        let mut app = app_with_modal(Modal::Inspect(Box::new(modal)));
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+            &client,
+            &tx,
+        );
+
+        let Modal::Inspect(m) = &app.modal else {
+            panic!("expected Modal::Inspect to stay open, not Help");
+        };
+        assert_eq!(m.search.input.buffer, "?");
     }
 
     #[test]
