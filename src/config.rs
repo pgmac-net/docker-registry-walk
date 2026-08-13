@@ -40,7 +40,33 @@ url = "http://localhost:5000"
 # url = "https://artifactory.example.com/artifactory"
 # type = "artifactory"
 # auth = "token"
+
+# GitHub Container Registry. GHCR has no /v2/_catalog, so the repository list
+# comes from the GitHub packages API instead; that needs a personal access
+# token with the `read:packages` scope. The token is read from $CR_PAT, then
+# $GITHUB_TOKEN, then $GH_TOKEN, then the OS keyring, then a masked prompt.
+#
+# `owner` is optional: leave it out to browse the token holder's own packages,
+# or set it to any user or organisation to browse theirs.
+# [[registry]]
+# name = "ghcr"
+# url = "https://ghcr.io"
+# type = "ghcr"
+# owner = "pgmac-net"
 "#;
+
+/// Environment variables consulted for a JFrog access token, in order.
+///
+/// Same names the Terraform `jfrog/artifactory` provider reads.
+const ARTIFACTORY_TOKEN_ENV_VARS: [&str; 2] = ["JFROG_ACCESS_TOKEN", "ARTIFACTORY_ACCESS_TOKEN"];
+
+/// Environment variables consulted for a GitHub personal access token, in
+/// order.
+///
+/// `CR_PAT` is GitHub's own documented name for a GHCR token, so it wins over
+/// the more general `GITHUB_TOKEN` / `GH_TOKEN` that surrounding tooling
+/// (`gh`, Actions) exports for unrelated reasons.
+const GHCR_TOKEN_ENV_VARS: [&str; 3] = ["CR_PAT", "GITHUB_TOKEN", "GH_TOKEN"];
 
 /// What kind of registry this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
@@ -64,6 +90,16 @@ pub enum RegistryType {
     /// `/api/repositories` REST endpoint and lets the user pick one before
     /// browsing it as a normal registry.
     Artifactory,
+    /// GitHub Container Registry (`ghcr.io`).
+    ///
+    /// Like Docker Hub, GHCR implements no `/v2/_catalog`, so the repository
+    /// list has to come from somewhere else — here the GitHub packages API
+    /// (`/user/packages`, `/users/<owner>/packages`), which is a *different
+    /// host* from the registry and needs a PAT with `read:packages`. Browsing
+    /// itself is ordinary Docker v2: GHCR answers each request with a 401
+    /// carrying that endpoint's real scope, which the existing challenge
+    /// re-exchange in `RegistryClient::send` already handles.
+    Ghcr,
 }
 
 /// How to authenticate to a registry, as configured.
@@ -115,6 +151,9 @@ pub enum AuthKind {
     Bearer,
     /// `registry::AccessTokenCredentials`.
     AccessToken,
+    /// `registry::GhcrCredentials` — sends no global header and exchanges the
+    /// PAT (or nothing, anonymously) for a scope-bound token on each 401.
+    Ghcr,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +170,13 @@ pub struct RegistryProfile {
     /// behaviour from before this field existed.
     #[serde(default, skip_serializing_if = "AuthMode::is_auto")]
     pub auth: AuthMode,
+    /// GHCR only: which user or organisation's packages to list.
+    ///
+    /// `None` means the authenticated token holder's own packages
+    /// (`/user/packages`). Ignored for every other registry type, which has a
+    /// server-side catalog and so needs no namespace to be named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 impl RegistryProfile {
@@ -152,7 +198,26 @@ impl RegistryProfile {
                     "registry-1.docker.io" | "docker.io" | "index.docker.io"
                 )
             }
-            RegistryType::Artifactory => false,
+            RegistryType::Artifactory | RegistryType::Ghcr => false,
+        }
+    }
+
+    /// Returns `true` when the registry is GitHub Container Registry (either
+    /// explicitly configured or detected from the URL).
+    ///
+    /// URL-based detection mirrors [`Self::is_dockerhub`] rather than
+    /// Artifactory's explicit-only rule: GHCR is a hosted service at one fixed
+    /// hostname, so the host is conclusive. It also upgrades a profile already
+    /// pointed at `ghcr.io` as `type = "standard"` — which today dead-ends at
+    /// the catalog 401 — to the package picker, with no config change.
+    pub fn is_ghcr(&self) -> bool {
+        match self.registry_type {
+            RegistryType::Ghcr => true,
+            RegistryType::Standard => url::Url::parse(&self.url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h == "ghcr.io"))
+                .unwrap_or(false),
+            RegistryType::DockerHub | RegistryType::Artifactory => false,
         }
     }
 
@@ -167,11 +232,33 @@ impl RegistryProfile {
     /// Whether an access token should be resolved for this profile at all.
     ///
     /// Gates the environment lookup, and is deliberately narrow: under
-    /// `auth = "auto"` only Artifactory consults `JFROG_ACCESS_TOKEN` /
-    /// `ARTIFACTORY_ACCESS_TOKEN`. A stray JFrog variable exported in a shell
-    /// must not change how anyone authenticates to docker.io.
+    /// `auth = "auto"` only Artifactory and GHCR consult the environment at
+    /// all, and each consults only its own variables (see
+    /// [`Self::token_env_vars`]). A stray JFrog variable exported in a shell
+    /// must not change how anyone authenticates to docker.io — and, now that
+    /// GHCR reads `GITHUB_TOKEN`, the same has to hold in reverse for a
+    /// variable that is exported on most developer machines.
     pub fn wants_access_token(&self) -> bool {
-        self.auth.is_token() || (self.auth == AuthMode::Auto && self.is_artifactory())
+        self.auth.is_token()
+            || (self.auth == AuthMode::Auto && (self.is_artifactory() || self.is_ghcr()))
+    }
+
+    /// Which environment variables may supply this profile's access token.
+    ///
+    /// Partitioned by registry type so the two token vocabularies can never
+    /// cross-read: a `GITHUB_TOKEN` exported for `gh` must not become an
+    /// Artifactory credential, and a `JFROG_ACCESS_TOKEN` must not become a
+    /// GHCR one. Non-GHCR types keep the JFrog list they already used, so
+    /// `auth = "token"` on any pre-existing profile resolves exactly as before.
+    ///
+    /// Pure, and paired with [`Self::auth_kind`]: the decision lives here, the
+    /// `std::env` lookup stays in `registry::auth`.
+    pub fn token_env_vars(&self) -> &'static [&'static str] {
+        if self.is_ghcr() {
+            &GHCR_TOKEN_ENV_VARS
+        } else {
+            &ARTIFACTORY_TOKEN_ENV_VARS
+        }
     }
 
     /// Which credential to build, given which secrets turned out to be
@@ -190,6 +277,10 @@ impl RegistryProfile {
         let can_basic = self.username.is_some() && has_password;
 
         match self.auth {
+            // GHCR exchanges the token rather than sending it, and its
+            // exchange also works with no token at all — so `token` mode stays
+            // useful (as anonymous access) even when none was resolved.
+            AuthMode::Token if self.is_ghcr() => AuthKind::Ghcr,
             AuthMode::Token => {
                 if has_token {
                     AuthKind::AccessToken
@@ -221,6 +312,27 @@ impl RegistryProfile {
                     AuthKind::AccessToken
                 } else {
                     AuthKind::None
+                }
+            }
+            // GHCR: a PAT wins, because it is the only credential that also
+            // unlocks repo *discovery* — the GitHub packages API takes the raw
+            // token and has no username/password form at all.
+            //
+            // Note it maps to `Ghcr`, not `AccessToken`: GHCR rejects a raw PAT
+            // on `/v2/` with 403 rather than a 401 challenge, so the token must
+            // be exchanged for a scope-bound one instead of sent directly. See
+            // `registry::GhcrCredentials`.
+            //
+            // With no token, a username + password still gets the ordinary v2
+            // exchange (Bearer, not the Basic that Artifactory falls back to —
+            // GHCR will not accept plain HTTP Basic on `/v2/`). With neither,
+            // `Ghcr` again: its exchange works anonymously, which is the only
+            // way to browse public packages without a PAT.
+            AuthMode::Auto if self.is_ghcr() => {
+                if !has_token && can_basic {
+                    AuthKind::Bearer
+                } else {
+                    AuthKind::Ghcr
                 }
             }
             // Standard / Docker Hub: bearer-token *exchange* from a username
@@ -568,6 +680,7 @@ mod tests {
             username: username.map(str::to_owned),
             registry_type: kind,
             auth: mode,
+            owner: None,
         }
     }
 
@@ -662,7 +775,7 @@ mod tests {
     fn auth_kind_matrix() {
         use AuthKind as K;
         use AuthMode as M;
-        use RegistryType::{Artifactory, DockerHub, Standard};
+        use RegistryType::{Artifactory, DockerHub, Ghcr, Standard};
 
         /// (registry type, auth mode, username, has_token, has_password) -> kind
         type Case = (
@@ -694,6 +807,25 @@ mod tests {
             (DockerHub, M::Token, Some("u"), true, true, K::AccessToken),
             (Artifactory, M::Token, None, true, false, K::AccessToken),
             (Artifactory, M::Token, None, false, true, K::None),
+            // GHCR + auto: a PAT wins, because it is the only credential that
+            // also unlocks repo discovery via the GitHub packages API. It maps
+            // to `Ghcr`, never `AccessToken` — GHCR rejects a raw PAT on /v2/
+            // with a 403 that `send` cannot re-challenge from, so the token has
+            // to be exchanged for a scope-bound one.
+            (Ghcr, M::Auto, None, true, false, K::Ghcr),
+            (Ghcr, M::Auto, Some("u"), true, true, K::Ghcr),
+            // Without one, fall back to the v2 token exchange — Bearer, not
+            // the Basic that Artifactory falls back to, because GHCR is a real
+            // Docker v2 registry and rejects plain Basic on /v2/.
+            (Ghcr, M::Auto, Some("u"), false, true, K::Bearer),
+            // With no credential at all, still `Ghcr`, not `None`: its exchange
+            // works anonymously, and that is the only way to browse public
+            // packages without a PAT.
+            (Ghcr, M::Auto, None, false, false, K::Ghcr),
+            (Ghcr, M::Auto, Some("u"), false, false, K::Ghcr),
+            // Explicit token mode on GHCR, with and without a resolved token.
+            (Ghcr, M::Token, None, true, false, K::Ghcr),
+            (Ghcr, M::Token, None, false, false, K::Ghcr),
             // Explicit basic / bearer.
             (Artifactory, M::Basic, Some("u"), false, true, K::Basic),
             (Artifactory, M::Basic, Some("u"), true, false, K::None),
@@ -710,5 +842,122 @@ mod tests {
                  token={has_token} password={has_password}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // GHCR
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ghcr_type_round_trips_and_is_detected() {
+        let profile = RegistryProfile {
+            name: "ghcr".to_owned(),
+            url: "https://ghcr.io".to_owned(),
+            registry_type: RegistryType::Ghcr,
+            owner: Some("pgmac-net".to_owned()),
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&profile).unwrap();
+        assert!(text.contains(r#"type = "ghcr""#));
+        assert!(text.contains(r#"owner = "pgmac-net""#));
+
+        let loaded: RegistryProfile = toml::from_str(&text).unwrap();
+        assert!(loaded.is_ghcr());
+        assert_eq!(loaded.owner.as_deref(), Some("pgmac-net"));
+        assert!(!loaded.is_dockerhub());
+        assert!(!loaded.is_artifactory());
+    }
+
+    /// An `owner`-less profile must not write `owner = ""` into the config, or
+    /// a round-trip would turn "my own packages" into a request for the
+    /// packages of an empty-named user.
+    #[test]
+    fn absent_owner_stays_absent_through_a_round_trip() {
+        let profile = RegistryProfile {
+            name: "ghcr".to_owned(),
+            url: "https://ghcr.io".to_owned(),
+            registry_type: RegistryType::Ghcr,
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&profile).unwrap();
+        assert!(!text.contains("owner"));
+        assert!(
+            toml::from_str::<RegistryProfile>(&text)
+                .unwrap()
+                .owner
+                .is_none()
+        );
+    }
+
+    /// URL detection upgrades a profile already pointed at ghcr.io as
+    /// `standard` — which dead-ends at the catalog 401 — without a config edit.
+    #[test]
+    fn ghcr_is_detected_from_url_when_type_is_unset() {
+        assert!(profile("gh", "https://ghcr.io").is_ghcr());
+        assert!(profile("gh", "https://ghcr.io/v2/").is_ghcr());
+    }
+
+    #[test]
+    fn other_registries_are_not_ghcr() {
+        assert!(!profile("local", "http://localhost:5000").is_ghcr());
+        assert!(!profile("hub", "https://registry-1.docker.io").is_ghcr());
+        // A self-hosted Artifactory could sit at any hostname, so an explicit
+        // type must never be overridden by URL sniffing.
+        let artifactory = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://ghcr.io".to_owned(),
+            registry_type: RegistryType::Artifactory,
+            ..Default::default()
+        };
+        assert!(!artifactory.is_ghcr());
+    }
+
+    /// The two token vocabularies must not overlap in either direction: a
+    /// `GITHUB_TOKEN` exported for `gh` must never authenticate Artifactory,
+    /// and a `JFROG_ACCESS_TOKEN` must never authenticate GHCR.
+    #[test]
+    fn token_env_vars_are_disjoint_per_registry_type() {
+        let ghcr = profile("gh", "https://ghcr.io");
+        let artifactory = RegistryProfile {
+            name: "art".to_owned(),
+            url: "https://art.example.com/artifactory".to_owned(),
+            registry_type: RegistryType::Artifactory,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ghcr.token_env_vars(),
+            ["CR_PAT", "GITHUB_TOKEN", "GH_TOKEN"]
+        );
+        assert_eq!(
+            artifactory.token_env_vars(),
+            ["JFROG_ACCESS_TOKEN", "ARTIFACTORY_ACCESS_TOKEN"]
+        );
+
+        for var in ghcr.token_env_vars() {
+            assert!(
+                !artifactory.token_env_vars().contains(var),
+                "{var} must not be readable by an Artifactory profile"
+            );
+        }
+    }
+
+    /// Standard and Docker Hub keep the list they already used, so
+    /// `auth = "token"` on a pre-existing profile resolves exactly as before
+    /// this partition existed.
+    #[test]
+    fn non_ghcr_types_keep_the_pre_existing_token_env_vars() {
+        assert_eq!(
+            profile("local", "http://localhost:5000").token_env_vars(),
+            ["JFROG_ACCESS_TOKEN", "ARTIFACTORY_ACCESS_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn ghcr_wants_a_token_under_auto() {
+        // Auto only consults the environment for the two types that can use a
+        // token; GHCR joins Artifactory there.
+        assert!(profile("gh", "https://ghcr.io").wants_access_token());
+        assert!(!profile("local", "http://localhost:5000").wants_access_token());
     }
 }

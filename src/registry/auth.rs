@@ -19,11 +19,6 @@ use crate::registry::client::Credentials;
 /// Hosts for which plain `http` is acceptable, so local dev registries work.
 const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
-/// Environment variables consulted for a JFrog access token, in order.
-///
-/// Same names the Terraform `jfrog/artifactory` provider reads.
-const ENV_ACCESS_TOKEN_VARS: [&str; 2] = ["JFROG_ACCESS_TOKEN", "ARTIFACTORY_ACCESS_TOKEN"];
-
 /// Keyring account under which an access token is stored.
 ///
 /// A token-authenticated profile has no username, so the account name cannot
@@ -233,6 +228,10 @@ enum RealmAuth<'a> {
     /// Pass a token straight through. Needs no username, which is what makes
     /// it usable by a token-only profile.
     Bearer(&'a str),
+    /// Send no credentials at all. Public registries still mint a (read-only,
+    /// scope-bound) token this way — it is how an unauthenticated `docker pull`
+    /// works — so it is the anonymous half of `GhcrCredentials`.
+    Anonymous,
 }
 
 /// Build the token-endpoint URL for a challenge.
@@ -279,6 +278,7 @@ async fn fetch_token_body(
     let req = match auth {
         RealmAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
         RealmAuth::Bearer(token) => req.bearer_auth(token),
+        RealmAuth::Anonymous => req,
     };
     req.send().await.ok()?.json().await.ok()
 }
@@ -468,6 +468,88 @@ impl Credentials for AccessTokenCredentials {
         }
 
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GHCR auth
+// ---------------------------------------------------------------------------
+
+/// GitHub Container Registry credentials.
+///
+/// **`get_authorization` returns `None` on purpose, and that is the whole
+/// point of this type.** GHCR does not accept a raw personal access token on
+/// its `/v2/` API: it answers `403 Forbidden`, *not* a `401` with a
+/// `WWW-Authenticate` challenge. `RegistryClient::send` only re-challenges on
+/// 401, so a 403 is terminal — presenting the PAT eagerly (as
+/// [`AccessTokenCredentials`] does, correctly, for Artifactory) turns every
+/// request into an unrecoverable failure, even for a package that is readable
+/// anonymously.
+///
+/// Sending nothing instead draws the 401 GHCR issues for an unauthenticated
+/// request, which carries that endpoint's *real* scope
+/// (`repository:homebrew/core/git:pull`, not the canned
+/// `repository:user/image:pull` the bare `/v2/` probe returns). The exchange
+/// below then trades the PAT for a token valid for exactly that scope.
+///
+/// `token` is optional because the same exchange works with no credentials at
+/// all: that is how an unauthenticated `docker pull` of a public image works,
+/// and it is the only way to browse public GHCR packages without a PAT.
+///
+/// Like [`BearerCredentials`], the minted token is deliberately **not** cached:
+/// it is scoped to one repository, so reusing it elsewhere would reproduce the
+/// Docker Hub scope cascade.
+pub struct GhcrCredentials {
+    /// Trust anchor for the realm check.
+    registry: Url,
+    token: Option<String>,
+}
+
+impl GhcrCredentials {
+    pub fn new(registry: &Url, token: Option<String>) -> Self {
+        Self {
+            registry: registry.clone(),
+            token,
+        }
+    }
+}
+
+#[async_trait]
+impl Credentials for GhcrCredentials {
+    async fn get_authorization(&self, _http: &Client) -> Option<String> {
+        None
+    }
+
+    async fn get_authorization_for_challenge(
+        &self,
+        http: &Client,
+        www_auth: &str,
+    ) -> Option<String> {
+        let challenge = parse_bearer_challenge(www_auth)?;
+        let token_url = Url::parse(&challenge.realm).ok()?;
+
+        // A GitHub PAT is an account-wide credential, so require the realm to
+        // be the registry's own origin — the same rule access tokens use, and
+        // for the same reason.
+        if !is_same_origin_realm(&token_url, &self.registry) {
+            return None;
+        }
+
+        let auth = match self.token.as_deref() {
+            Some(token) => RealmAuth::Bearer(token),
+            None => RealmAuth::Anonymous,
+        };
+
+        let (minted, _ttl) = exchange_with_scope_fallback(
+            http,
+            &token_url,
+            challenge.service.as_deref(),
+            challenge.scope.as_deref(),
+            auth,
+        )
+        .await?;
+
+        Some(bearer_header(&minted))
     }
 }
 
@@ -699,12 +781,14 @@ fn first_non_empty<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) ->
         .map(str::to_owned)
 }
 
-/// An access token from the environment, if any is set.
-fn env_access_token() -> Option<String> {
-    let values: Vec<Option<String>> = ENV_ACCESS_TOKEN_VARS
-        .iter()
-        .map(|key| std::env::var(key).ok())
-        .collect();
+/// An access token from the environment, if any of `vars` is set.
+///
+/// `vars` is supplied by the caller rather than fixed here, because which
+/// variables are legitimate depends on the registry type — see
+/// `RegistryProfile::token_env_vars`, which owns that decision so it stays
+/// pure and testable.
+fn env_access_token(vars: &[&str]) -> Option<String> {
+    let values: Vec<Option<String>> = vars.iter().map(|key| std::env::var(key).ok()).collect();
     first_non_empty(values.iter().map(Option::as_deref))
 }
 
@@ -717,8 +801,8 @@ fn env_access_token() -> Option<String> {
 ///
 /// Returns `None` when neither source has one; the caller decides whether to
 /// prompt (interactively) or fall back to anonymous access.
-pub fn resolve_access_token(keyring: &KeyringStore) -> Option<String> {
-    if let Some(token) = env_access_token() {
+pub fn resolve_access_token(keyring: &KeyringStore, env_vars: &[&str]) -> Option<String> {
+    if let Some(token) = env_access_token(env_vars) {
         return Some(token);
     }
     let stored = keyring.get_password(TOKEN_ACCOUNT)?;
@@ -1181,6 +1265,46 @@ mod tests {
         let second = rt.block_on(creds.get_authorization(&http));
         assert_eq!(first.as_deref(), Some("Bearer tok-abc"));
         assert_eq!(first, second, "must not drift between calls");
+    }
+
+    /// The opposite of `AccessTokenCredentials`, and deliberately so.
+    ///
+    /// GHCR answers a raw PAT on `/v2/` with **403**, not a 401 challenge, and
+    /// `RegistryClient::send` only re-challenges on 401 — so eagerly sending
+    /// the token makes every request fail terminally, including for packages
+    /// that are readable anonymously. Sending nothing draws the 401 that
+    /// carries the endpoint's real scope, which is what the challenge exchange
+    /// needs. If this ever starts returning a header, GHCR browsing breaks.
+    #[test]
+    fn ghcr_credentials_never_send_a_global_authorization_header() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let http = Client::new();
+
+        let with_token =
+            GhcrCredentials::new(&u("https://ghcr.io/"), Some("ghp_example".to_owned()));
+        assert_eq!(
+            rt.block_on(with_token.get_authorization(&http)),
+            None,
+            "a PAT must be exchanged at the token realm, never sent to /v2/"
+        );
+
+        let anonymous = GhcrCredentials::new(&u("https://ghcr.io/"), None);
+        assert_eq!(rt.block_on(anonymous.get_authorization(&http)), None);
+    }
+
+    /// A GitHub PAT is an account-wide credential, so it must not be offered
+    /// to a realm on another host even if the registry points there.
+    #[test]
+    fn ghcr_credentials_reject_an_off_origin_realm() {
+        let creds = GhcrCredentials::new(&u("https://ghcr.io/"), Some("ghp_example".to_owned()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let http = Client::new();
+
+        let challenge = r#"Bearer realm="https://evil.example.com/token",service="ghcr.io""#;
+        assert_eq!(
+            rt.block_on(creds.get_authorization_for_challenge(&http, challenge)),
+            None
+        );
     }
 
     #[test]

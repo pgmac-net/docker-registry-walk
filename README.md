@@ -17,6 +17,7 @@ An interactive TUI browser for Docker registries, written in Rust.
   - **Diff** — compare layer sets between two tags
 - Multi-registry support with in-app switching (`R`)
 - JFrog Artifactory support: browse the Docker repo-keys hosted on an Artifactory instance via a picker, authenticating with either HTTP Basic (username + API key/identity token) or a JFrog access token sent as `Authorization: Bearer` — the same way the Terraform `jfrog/artifactory` provider authenticates
+- GitHub Container Registry support: GHCR serves no `/v2/_catalog`, so packages are listed from the GitHub packages API (yours, or any user's or organisation's) and offered in a filterable picker
 - Per-registry credentials stored in the OS keychain — never in the config file
 - Live filter and sort within repos/tags panels
 - In-app keybindings reference (`?`)
@@ -87,6 +88,16 @@ name = "artifactory-token"
 url = "https://artifactory.example.com/artifactory"
 type = "artifactory"
 auth = "token"
+
+# GitHub Container Registry. GHCR has no /v2/_catalog, so the repository list
+# comes from the GitHub packages API — which needs a personal access token
+# with the `read:packages` scope. `owner` is optional: omit it to list your
+# own packages, or name any user or organisation to list theirs.
+[[registry]]
+name = "ghcr"
+url = "https://ghcr.io"
+type = "ghcr"
+owner = "pgmac-net"
 ```
 
 Per-profile keys:
@@ -96,8 +107,9 @@ Per-profile keys:
 | `name` | Profile name, shown in the title bar and used as the keychain key. Must not contain `#` |
 | `url` | Registry URL. For `type = "artifactory"`, the Artifactory server base rather than a `/v2/` root |
 | `username` | Optional. Not needed for `auth = "token"` |
-| `type` | `standard` (default), `dockerhub`, or `artifactory` |
+| `type` | `standard` (default), `dockerhub`, `artifactory`, or `ghcr` |
 | `auth` | `auto` (default), `basic`, `bearer`, or `token` |
+| `owner` | `ghcr` only. User or organisation whose packages to list. Omit for your own |
 
 ### Credentials / keyring
 
@@ -131,14 +143,17 @@ JFROG_ACCESS_TOKEN=<token> docker-registry-walk --registry artifactory
 
 The token is resolved in this order:
 
-1. `$JFROG_ACCESS_TOKEN`
-2. `$ARTIFACTORY_ACCESS_TOKEN`
-3. the OS keychain, under the account `__token__`
-4. a masked prompt in the TUI, after an authentication failure
+1. the environment, from the variables that belong to this registry type:
+   - `type = "ghcr"` → `$CR_PAT`, `$GITHUB_TOKEN`, `$GH_TOKEN`
+   - everything else → `$JFROG_ACCESS_TOKEN`, `$ARTIFACTORY_ACCESS_TOKEN`
+2. the OS keychain, under the account `__token__`
+3. a masked prompt in the TUI, after an authentication failure
 
 The environment wins so a token can be overridden for a single run without disturbing what is stored — and a token that came from the environment is deliberately *not* written to the keychain.
 
-`auth = "token"` works for any registry type (a GitHub / GitLab / Harbor personal access token is presented the same way); the `JFROG_*` / `ARTIFACTORY_*` variables are only consulted for `type = "artifactory"` profiles, so a JFrog token exported in your shell can never change how you authenticate to Docker Hub.
+Those two sets never cross-read. A JFrog token exported in your shell can never change how you authenticate to Docker Hub or GHCR, and a `GITHUB_TOKEN` exported for `gh` — which is set on most developer machines — can never become an Artifactory credential.
+
+`auth = "token"` works for any registry type, though how the token is *presented* differs: Artifactory receives it directly as `Authorization: Bearer <token>`, whereas GHCR exchanges it for a repository-scoped token (see [docs/ghcr-registry-browsing.md](docs/ghcr-registry-browsing.md)).
 
 Leaving `auth` unset (`auto`) preserves the previous behaviour exactly: an Artifactory profile with a username and a stored password still uses HTTP Basic, and only falls back to a token when there is no password. Set `auth = "token"` explicitly to prefer the token when both exist.
 
@@ -151,8 +166,9 @@ See [docs/artifactory-authentication.md](docs/artifactory-authentication.md) for
 | `--registry <name>` | Open this named profile from the config on startup |
 | `--url <url>` | Ad-hoc registry URL (creates a temporary "cli" profile) |
 | `--username <user>` | Username for the ad-hoc registry |
-| `--type <type>` | Registry flavour for the ad-hoc registry: `standard`, `dockerhub`, `artifactory` |
+| `--type <type>` | Registry flavour for the ad-hoc registry: `standard`, `dockerhub`, `artifactory`, `ghcr` |
 | `--auth <mode>` | Auth mode for the ad-hoc registry: `auto`, `basic`, `bearer`, `token` |
+| `--owner <owner>` | GHCR only: user or organisation whose packages to list. Omit for your own |
 | `--password` | Prompt (masked) for the password and store it in the OS keychain — never to the config file, never as a CLI argument |
 | `--token` | Prompt (masked) for an access token and store it in the OS keychain, same guarantees as `--password` |
 
@@ -223,7 +239,7 @@ entire document. Search auto-expands any folds hiding a match.
 | Key | Action |
 |-----|--------|
 | `R` | Switch registry (in-app) |
-| `Backspace` / `u` | Back to repo-key picker (Artifactory only) |
+| `Backspace` / `u` | Back to the repo-key picker (Artifactory) or package picker (GHCR) |
 
 ### General
 
