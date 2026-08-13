@@ -15,7 +15,7 @@ use crate::ops::diff::DiffLayer;
 use crate::registry::{
     AccessTokenCredentials, ArtifactoryRepo, BasicCredentials, BearerCredentials, Credentials,
     GhcrCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError,
-    Secret, TOKEN_ACCOUNT, list_packages, resolve_access_token, sanitize_pasted_token,
+    Secret, TOKEN_ACCOUNT, list_owners, list_packages, resolve_access_token, sanitize_pasted_token,
     search_dockerhub,
 };
 
@@ -131,8 +131,14 @@ pub enum AppEvent {
         truncated: bool,
     },
     GhcrPackagesError(String),
-    /// Re-open the GHCR package picker (`Backspace` / `u`).
-    OpenGhcrPackagePicker,
+    /// Up-navigation from a GHCR package list to the owner picker
+    /// (`Backspace` / `u`).
+    OpenGhcrOwnerPicker,
+    /// Owner suggestions from the GitHub API (the token holder and their orgs).
+    GhcrOwners(Vec<String>),
+    GhcrOwnersError(String),
+    /// User chose whose packages to browse.
+    GhcrOwnerSelected(String),
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
@@ -302,13 +308,22 @@ pub(super) async fn event_loop(
                             }
                         }
                     }
-                    AppEvent::OpenGhcrPackagePicker => {
+                    AppEvent::OpenGhcrOwnerPicker => {
                         let idx = app.active_profile_idx;
                         if app.profiles[idx].is_ghcr() {
                             let profile = app.profiles[idx].clone();
-                            app.open_ghcr_picker_cached();
-                            spawn_ghcr_packages_fetch(profile, tx.clone());
+                            app.open_ghcr_owner_picker();
+                            spawn_ghcr_owners_fetch(profile, tx.clone());
                         }
+                    }
+                    AppEvent::GhcrOwners(owners) => app.on_ghcr_owners(owners),
+                    AppEvent::GhcrOwnersError(msg) => app.on_ghcr_owners_error(msg),
+                    AppEvent::GhcrOwnerSelected(owner) => {
+                        // Only the profile's owner changes — the client is
+                        // still pointed at ghcr.io, so it needs no rebuild.
+                        app.apply_ghcr_owner(owner);
+                        let profile = app.profiles[app.active_profile_idx].clone();
+                        spawn_ghcr_packages_fetch(profile, tx.clone());
                     }
                     AppEvent::GhcrPackages {
                         packages,
@@ -507,7 +522,10 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         | AppEvent::OpenArtifactoryRepoPicker
         | AppEvent::GhcrPackages { .. }
         | AppEvent::GhcrPackagesError(_)
-        | AppEvent::OpenGhcrPackagePicker => {}
+        | AppEvent::OpenGhcrOwnerPicker
+        | AppEvent::GhcrOwners(_)
+        | AppEvent::GhcrOwnersError(_)
+        | AppEvent::GhcrOwnerSelected(_) => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -784,6 +802,56 @@ fn handle_key(
         return;
     }
 
+    if matches!(app.modal, Modal::GhcrOwnerPicker { .. }) {
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            KeyCode::Enter => {
+                let selected = if let Modal::GhcrOwnerPicker { selected, .. } = &app.modal {
+                    *selected
+                } else {
+                    0
+                };
+                // `ghcr_owner_rows` is the same function the renderer uses, so
+                // the row picked here is the row that was highlighted.
+                if let Some(owner) = app
+                    .ghcr_owner_rows()
+                    .get(selected)
+                    .map(|c| c.owner().to_owned())
+                {
+                    let _ = tx.try_send(AppEvent::GhcrOwnerSelected(owner));
+                }
+            }
+            KeyCode::Up => {
+                if let Modal::GhcrOwnerPicker { selected, .. } = &mut app.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let n = app.ghcr_owner_rows().len();
+                if let Modal::GhcrOwnerPicker { selected, .. } = &mut app.modal
+                    && n > 0
+                {
+                    *selected = (*selected + 1).min(n - 1);
+                }
+            }
+            _ => {
+                if let Modal::GhcrOwnerPicker {
+                    input, selected, ..
+                } = &mut app.modal
+                    && apply_input_key(input, code, modifiers)
+                {
+                    // Typing rebuilds the rows (the "Use …" row appears and
+                    // disappears), so a stale index would point at the wrong one.
+                    *selected = 0;
+                }
+            }
+        }
+        return;
+    }
+
     if matches!(app.modal, Modal::Inspect(_)) {
         // `?` opens Help over the viewer; stash the modal so closing Help
         // returns to the JSON view exactly where it was. Only when not
@@ -948,10 +1016,17 @@ fn handle_key(
         KeyCode::Char('r') => app.start_retag(),
         KeyCode::Char('R') => app.start_registry_select(),
         KeyCode::Backspace | KeyCode::Char('u') => {
-            // One key, two pickers: which one is meaningful depends on the
-            // active profile, and each handler is a no-op for the other type.
+            // Up-navigation, so which level it lands on depends on the
+            // registry's hierarchy: Artifactory is repo-key → repo → tag, GHCR
+            // is owner → package → tag. Each handler is a no-op for the other
+            // registry type.
+            //
+            // For GHCR this is deliberately *not* the package picker: the Repos
+            // pane already holds the whole package list (one fetch fills both),
+            // so re-listing packages would add nothing, whereas the owner is
+            // otherwise only settable in config.
             let event = if app.profiles[app.active_profile_idx].is_ghcr() {
-                AppEvent::OpenGhcrPackagePicker
+                AppEvent::OpenGhcrOwnerPicker
             } else {
                 AppEvent::OpenArtifactoryRepoPicker
             };
@@ -1665,6 +1740,33 @@ fn spawn_artifactory_repos_fetch(client: RegistryClient, tx: mpsc::Sender<AppEve
                     .await;
             }
         }
+    });
+}
+
+/// Fetch owner suggestions for the GHCR owner picker.
+///
+/// Cross-host for the same reason as `spawn_ghcr_packages_fetch`, and resolves
+/// the token the same way.
+///
+/// A missing token is reported rather than treated as an error: without one
+/// there is nobody to be "the token holder", and `/user/orgs` needs `read:org`
+/// on top of the `read:packages` that browsing requires — so an empty
+/// suggestion list is an ordinary outcome. The picker stays usable either way,
+/// because the typed owner is always selectable.
+fn spawn_ghcr_owners_fetch(profile: RegistryProfile, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let ResolvedSecrets { token, .. } = resolve_secrets(&profile).await;
+
+        let Some(token) = token else {
+            let _ = tx
+                .send(AppEvent::GhcrOwnersError("no GitHub token".to_owned()))
+                .await;
+            return;
+        };
+
+        let _ = tx
+            .send(AppEvent::GhcrOwners(list_owners(&token).await))
+            .await;
     });
 }
 

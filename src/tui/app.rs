@@ -343,6 +343,74 @@ pub enum Modal {
         selected: usize,
         loading: bool,
     },
+    /// Pick whose GHCR packages to browse — one level *above* `GhcrPicker`,
+    /// since GHCR's hierarchy is owner → package → tag.
+    ///
+    /// `owners` is only ever a suggestion list; the typed input is always
+    /// offered as a choice too, so an owner nobody could enumerate (an org the
+    /// token cannot see, or any account at all when browsing anonymously)
+    /// stays reachable. See [`ghcr_owner_choices`].
+    GhcrOwnerPicker {
+        input: InputState,
+        owners: Vec<String>,
+        selected: usize,
+        loading: bool,
+    },
+}
+
+/// One row of the GHCR owner picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerChoice {
+    /// The text the user typed, offered because it matches no known owner.
+    Typed(String),
+    /// A suggestion fetched from the GitHub API, or one seen earlier.
+    Listed(String),
+}
+
+impl OwnerChoice {
+    /// What the row shows. The typed row is labelled rather than shown bare so
+    /// it reads as an action instead of looking like another suggestion.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Typed(owner) => format!("Use \"{owner}\""),
+            Self::Listed(owner) => owner.clone(),
+        }
+    }
+
+    /// The owner this row selects.
+    pub fn owner(&self) -> &str {
+        match self {
+            Self::Typed(owner) | Self::Listed(owner) => owner,
+        }
+    }
+}
+
+/// The owner picker's rows for a given input and suggestion list.
+///
+/// Pure, and the single source of truth for both rendering and selection —
+/// computing the rows twice is how a picker ends up opening the row above the
+/// one that was highlighted.
+///
+/// The typed value leads the list whenever it is non-empty and doesn't already
+/// name a suggestion, so `Enter` on a freshly typed owner does the obvious
+/// thing. Suppressing it on an exact (case-insensitive) match avoids offering
+/// `Use "pgmac"` directly above `pgmac`.
+pub fn ghcr_owner_choices(input: &str, owners: &[String]) -> Vec<OwnerChoice> {
+    let typed = input.trim();
+    let needle = typed.to_lowercase();
+
+    let mut rows = Vec::new();
+    if !typed.is_empty() && !owners.iter().any(|o| o.to_lowercase() == needle) {
+        rows.push(OwnerChoice::Typed(typed.to_owned()));
+    }
+    rows.extend(
+        owners
+            .iter()
+            .filter(|o| needle.is_empty() || o.to_lowercase().contains(&needle))
+            .cloned()
+            .map(OwnerChoice::Listed),
+    );
+    rows
 }
 
 #[derive(Debug, Clone)]
@@ -459,9 +527,17 @@ pub struct App {
     /// Repo-key currently being browsed, when the active registry is an
     /// Artifactory repo-key. Used to preselect it in the picker.
     current_artifactory_repo_key: Option<String>,
-    /// Last-fetched package list per GHCR profile (by profile name), so
-    /// re-opening the picker doesn't wait on the GitHub API again.
-    ghcr_package_cache: HashMap<String, Vec<String>>,
+    /// Last-fetched package list per GHCR profile **and owner**, so re-opening
+    /// the picker doesn't wait on the GitHub API again.
+    ///
+    /// Keyed by owner as well as profile name because the owner is now
+    /// switchable at runtime: keyed by profile alone, re-opening the picker
+    /// after an owner change would serve the *previous* owner's packages. A
+    /// tuple rather than a `<profile>#<owner>` string, to stay clear of the `#`
+    /// that `Config::validate` reserves for client-cache keys.
+    ghcr_package_cache: HashMap<(String, Option<String>), Vec<String>>,
+    /// Last-fetched owner suggestions per GHCR profile (by profile name).
+    ghcr_owner_cache: HashMap<String, Vec<String>>,
 }
 
 impl App {
@@ -510,6 +586,7 @@ impl App {
             artifactory_repo_cache: HashMap::new(),
             current_artifactory_repo_key: None,
             ghcr_package_cache: HashMap::new(),
+            ghcr_owner_cache: HashMap::new(),
         }
     }
 
@@ -768,6 +845,18 @@ impl App {
         };
     }
 
+    /// Cache key for the active profile's package list: the profile *and* the
+    /// owner it is currently pointed at, since the owner is switchable.
+    fn ghcr_cache_key(&self) -> (String, Option<String>) {
+        let profile = &self.profiles[self.active_profile_idx];
+        (profile.name.clone(), profile.owner.clone())
+    }
+
+    /// The owner whose packages are currently listed, if one is set.
+    pub fn ghcr_owner(&self) -> Option<&str> {
+        self.profiles[self.active_profile_idx].owner.as_deref()
+    }
+
     /// Switch to a GHCR profile: clear repo/tag/detail state and open the
     /// package picker, since GHCR serves no `/v2/_catalog` to fetch instead.
     pub fn start_ghcr_switch(&mut self, idx: usize) {
@@ -796,9 +885,8 @@ impl App {
     /// the picker would leave the pane empty behind it, with nothing to return
     /// to on `Esc`.
     pub fn on_ghcr_packages(&mut self, packages: Vec<String>, truncated: bool) {
-        let profile_name = self.profiles[self.active_profile_idx].name.clone();
         self.ghcr_package_cache
-            .insert(profile_name, packages.clone());
+            .insert(self.ghcr_cache_key(), packages.clone());
 
         if let Modal::GhcrPicker {
             packages: p,
@@ -825,29 +913,6 @@ impl App {
         if truncated {
             self.set_status("Package list truncated — refine with the picker filter");
         }
-    }
-
-    /// Re-open the package picker from the cached list, so it appears without
-    /// a GitHub API round-trip. Unlike `start_ghcr_switch`, this leaves
-    /// repo/tag/detail state alone — `Esc` returns to browsing as it was.
-    pub fn open_ghcr_picker_cached(&mut self) {
-        let profile_name = &self.profiles[self.active_profile_idx].name;
-        let cached = self
-            .ghcr_package_cache
-            .get(profile_name)
-            .cloned()
-            .unwrap_or_default();
-        let selected = self
-            .current_repo
-            .as_ref()
-            .and_then(|repo| cached.iter().position(|p| p == repo))
-            .unwrap_or(0);
-        self.modal = Modal::GhcrPicker {
-            filter: InputState::default(),
-            packages: cached,
-            selected,
-            loading: true,
-        };
     }
 
     /// Report a failed package listing.
@@ -882,6 +947,124 @@ impl App {
         // reason visible only until the status message times out.
         self.modal = Modal::None;
         self.on_repos_error(msg, true);
+    }
+
+    // ------------------------------------------------------------------
+    // GHCR owner picker
+    // ------------------------------------------------------------------
+
+    /// Open the owner picker, seeded from cache so it appears instantly.
+    ///
+    /// Leaves repo/tag/detail state alone — `Esc` returns to browsing exactly
+    /// as it was, and nothing changes until an owner is actually chosen.
+    pub fn open_ghcr_owner_picker(&mut self) {
+        let profile_name = self.profiles[self.active_profile_idx].name.clone();
+        let owners = self.ghcr_known_owners(&profile_name);
+        let selected = self
+            .ghcr_owner()
+            .and_then(|current| owners.iter().position(|o| o == current))
+            .unwrap_or(0);
+
+        self.modal = Modal::GhcrOwnerPicker {
+            input: InputState::default(),
+            owners,
+            selected,
+            loading: true,
+        };
+    }
+
+    /// Suggestions to show before (or without) a successful API call: whatever
+    /// was last fetched, plus the owner currently configured.
+    ///
+    /// Including the current owner matters for a token that cannot call
+    /// `/user/orgs` — an owner set in config, or reached by typing it earlier,
+    /// stays one keystroke away instead of having to be retyped.
+    fn ghcr_known_owners(&self, profile_name: &str) -> Vec<String> {
+        let mut owners = self
+            .ghcr_owner_cache
+            .get(profile_name)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(current) = self.ghcr_owner()
+            && !owners.iter().any(|o| o.eq_ignore_ascii_case(current))
+        {
+            owners.insert(0, current.to_owned());
+        }
+        owners
+    }
+
+    /// Merge fetched suggestions into the open picker.
+    pub fn on_ghcr_owners(&mut self, owners: Vec<String>) {
+        let profile_name = self.profiles[self.active_profile_idx].name.clone();
+        self.ghcr_owner_cache
+            .insert(profile_name.clone(), owners.clone());
+
+        let merged = self.ghcr_known_owners(&profile_name);
+        // Re-derive the highlight rather than clamping the old index: the list
+        // arriving is what makes the current owner *findable*, and before it
+        // lands the picker holds at most that one entry. Clamping instead
+        // dropped the highlight onto row 0 the moment the fetch returned.
+        let current = self.ghcr_owner().map(str::to_owned);
+        if let Modal::GhcrOwnerPicker {
+            input,
+            owners: o,
+            selected,
+            loading,
+        } = &mut self.modal
+        {
+            *loading = false;
+            *selected = current
+                .as_deref()
+                .filter(|_| input.buffer.is_empty())
+                .and_then(|c| merged.iter().position(|o| o == c))
+                .unwrap_or(0);
+            *o = merged;
+        }
+    }
+
+    /// Report a failed suggestion fetch.
+    ///
+    /// Only the spinner stops. The suggestions are a convenience, not the
+    /// input — the typed owner is always selectable — and `/user/orgs` needs
+    /// the `read:org` scope that a `read:packages`-only PAT lacks, so an empty
+    /// list here is an ordinary outcome rather than a fault worth a modal.
+    pub fn on_ghcr_owners_error(&mut self, msg: String) {
+        if let Modal::GhcrOwnerPicker { loading, .. } = &mut self.modal {
+            *loading = false;
+        }
+        self.set_status(format!("GHCR owners unavailable: {msg} — type an owner"));
+    }
+
+    /// The owner picker's rows for its current input.
+    pub fn ghcr_owner_rows(&self) -> Vec<OwnerChoice> {
+        let Modal::GhcrOwnerPicker { input, owners, .. } = &self.modal else {
+            return Vec::new();
+        };
+        ghcr_owner_choices(&input.buffer, owners)
+    }
+
+    /// Point the active GHCR profile at `owner` and start over beneath it.
+    ///
+    /// The change is in-memory only: the app never writes `config.toml`, and
+    /// rewriting a user's config on a keystroke would be surprising.
+    pub fn apply_ghcr_owner(&mut self, owner: String) {
+        self.profiles[self.active_profile_idx].owner = Some(owner);
+        self.reset_for_new_registry();
+        // Same reasoning as `start_ghcr_switch`: the pane fills from this same
+        // fetch, so it must not read as an empty result while it is in flight.
+        self.repo_load = LoadState::Loading;
+
+        let cached = self
+            .ghcr_package_cache
+            .get(&self.ghcr_cache_key())
+            .cloned()
+            .unwrap_or_default();
+        self.modal = Modal::GhcrPicker {
+            filter: InputState::default(),
+            packages: cached,
+            selected: 0,
+            loading: true,
+        };
     }
 
     /// The picker's package list filtered by its current filter buffer
@@ -2119,7 +2302,6 @@ mod tests {
         let mut app = make_ghcr_app();
         app.start_ghcr_switch(0);
         app.on_ghcr_packages(ghcr_packages(), false);
-        app.open_ghcr_picker_cached();
 
         app.on_ghcr_packages_error("503 Service Unavailable".to_owned());
 
@@ -2152,25 +2334,188 @@ mod tests {
         assert_eq!(app.repos_state.selected(), Some(2));
     }
 
-    /// Reopening mid-browse preselects the repo being viewed and does not
-    /// disturb repo/tag state — `Esc` returns to browsing exactly as it was.
+    // -----------------------------------------------------------------------
+    // GHCR owner picker
+    // -----------------------------------------------------------------------
+
+    fn owners() -> Vec<String> {
+        ["pgmac", "pgmac-net", "Homebrew"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The typed row is what makes an owner nobody can enumerate reachable —
+    /// an org the token can't see, or any account at all when browsing without
+    /// a PAT. It has to lead, so `Enter` on freshly typed text does the
+    /// obvious thing.
     #[test]
-    fn open_ghcr_picker_cached_preselects_the_current_repo() {
+    fn ghcr_owner_choices_offers_the_typed_owner_first() {
+        let rows = ghcr_owner_choices("rust-lang", &owners());
+        assert_eq!(rows[0], OwnerChoice::Typed("rust-lang".to_owned()));
+        assert_eq!(rows[0].label(), r#"Use "rust-lang""#);
+        assert_eq!(rows[0].owner(), "rust-lang");
+    }
+
+    /// ...but not when it already names a suggestion, or the picker would show
+    /// `Use "pgmac"` directly above `pgmac`.
+    #[test]
+    fn ghcr_owner_choices_suppresses_the_typed_row_on_an_exact_match() {
+        for typed in ["pgmac", "PGMAC", "  pgmac  "] {
+            let rows = ghcr_owner_choices(typed, &owners());
+            assert!(
+                rows.iter().all(|r| matches!(r, OwnerChoice::Listed(_))),
+                "{typed:?} names a known owner, so no typed row"
+            );
+        }
+    }
+
+    #[test]
+    fn ghcr_owner_choices_filters_suggestions_case_insensitively() {
+        let rows = ghcr_owner_choices("HOME", &owners());
+        assert_eq!(
+            rows,
+            vec![
+                OwnerChoice::Typed("HOME".to_owned()),
+                OwnerChoice::Listed("Homebrew".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ghcr_owner_choices_lists_everything_when_empty() {
+        let rows = ghcr_owner_choices("", &owners());
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| matches!(r, OwnerChoice::Listed(_))));
+    }
+
+    fn selected_owner(app: &App) -> &str {
+        let Modal::GhcrOwnerPicker {
+            owners, selected, ..
+        } = &app.modal
+        else {
+            panic!("expected Modal::GhcrOwnerPicker");
+        };
+        &owners[*selected]
+    }
+
+    #[test]
+    fn owner_picker_preselects_the_current_owner() {
         let mut app = make_ghcr_app();
-        app.start_ghcr_switch(0);
+        app.apply_ghcr_owner("pgmac-net".to_owned());
+        app.on_ghcr_owners(owners());
+        app.open_ghcr_owner_picker();
+
+        assert_eq!(selected_owner(&app), "pgmac-net");
+    }
+
+    /// The real ordering: the picker opens first and the suggestions land a
+    /// moment later. Before they do, the current owner is the *only* row, so
+    /// clamping the old index instead of re-deriving it dropped the highlight
+    /// onto row 0 exactly when the list became useful.
+    #[test]
+    fn owner_picker_keeps_the_current_owner_selected_when_suggestions_arrive() {
+        let mut app = make_ghcr_app();
+        app.apply_ghcr_owner("pgmac-net".to_owned());
+        app.open_ghcr_owner_picker();
+
+        app.on_ghcr_owners(owners());
+
+        assert_eq!(selected_owner(&app), "pgmac-net");
+    }
+
+    /// ...but not once the user has started typing: their input drives the
+    /// rows then, and row 0 is the typed owner.
+    #[test]
+    fn owner_picker_leaves_a_typed_selection_alone_when_suggestions_arrive() {
+        let mut app = make_ghcr_app();
+        app.apply_ghcr_owner("pgmac-net".to_owned());
+        app.open_ghcr_owner_picker();
+        if let Modal::GhcrOwnerPicker { input, .. } = &mut app.modal {
+            input.buffer = "rust-lang".to_owned();
+        }
+
+        app.on_ghcr_owners(owners());
+
+        assert_eq!(
+            app.ghcr_owner_rows().first(),
+            Some(&OwnerChoice::Typed("rust-lang".to_owned()))
+        );
+        let Modal::GhcrOwnerPicker { selected, .. } = &app.modal else {
+            panic!("expected Modal::GhcrOwnerPicker");
+        };
+        assert_eq!(*selected, 0);
+    }
+
+    /// A token scoped to just `read:packages` cannot call `/user/orgs`, so the
+    /// suggestion list is routinely empty. The current owner must still be
+    /// offered rather than having to be retyped.
+    #[test]
+    fn owner_picker_offers_the_current_owner_without_any_suggestions() {
+        let mut app = make_ghcr_app();
+        app.apply_ghcr_owner("Homebrew".to_owned());
+        app.open_ghcr_owner_picker();
+
+        assert_eq!(
+            app.ghcr_owner_rows(),
+            vec![OwnerChoice::Listed("Homebrew".to_owned())]
+        );
+    }
+
+    /// Suggestions are a convenience, not the input — a failed fetch stops the
+    /// spinner and nothing else, leaving the text box usable.
+    #[test]
+    fn owner_picker_survives_a_failed_suggestion_fetch() {
+        let mut app = make_ghcr_app();
+        app.open_ghcr_owner_picker();
+        app.on_ghcr_owners_error("403 Forbidden".to_owned());
+
+        assert!(matches!(
+            app.modal,
+            Modal::GhcrOwnerPicker { loading: false, .. }
+        ));
+    }
+
+    /// The package cache is keyed by owner as well as profile. Keyed by
+    /// profile alone, switching owner would serve the previous owner's
+    /// packages — a cache bug that would look like a GitHub API fault.
+    #[test]
+    fn changing_owner_does_not_serve_the_previous_owners_packages() {
+        let mut app = make_ghcr_app();
+        app.apply_ghcr_owner("Homebrew".to_owned());
+        app.on_ghcr_packages(ghcr_packages(), false);
+        assert_eq!(app.repos.len(), 3);
+
+        app.apply_ghcr_owner("pgmac-net".to_owned());
+
+        let Modal::GhcrPicker { packages, .. } = &app.modal else {
+            panic!("expected the package picker to reopen for the new owner");
+        };
+        assert!(packages.is_empty(), "no cache entry for the new owner yet");
+        assert!(app.repos.is_empty(), "Repos pane cleared for the new owner");
+        assert_eq!(app.ghcr_owner(), Some("pgmac-net"));
+
+        // Going back is served from cache rather than refetched.
+        app.apply_ghcr_owner("Homebrew".to_owned());
+        let Modal::GhcrPicker { packages, .. } = &app.modal else {
+            panic!("expected the package picker");
+        };
+        assert_eq!(packages.len(), 3);
+    }
+
+    /// Changing owner starts over beneath it: a repo/tag from the previous
+    /// owner must not linger.
+    #[test]
+    fn changing_owner_clears_repo_and_tag_state() {
+        let mut app = make_ghcr_app();
+        app.apply_ghcr_owner("Homebrew".to_owned());
         app.on_ghcr_packages(ghcr_packages(), false);
         app.start_tags_load("homebrew/core/git".to_owned());
 
-        app.open_ghcr_picker_cached();
+        app.apply_ghcr_owner("pgmac-net".to_owned());
 
-        let Modal::GhcrPicker {
-            packages, selected, ..
-        } = &app.modal
-        else {
-            panic!("expected Modal::GhcrPicker");
-        };
-        assert_eq!(packages.len(), 3, "served from cache, not refetched");
-        assert_eq!(*selected, 1);
-        assert_eq!(app.current_repo.as_deref(), Some("homebrew/core/git"));
+        assert!(app.current_repo.is_none());
+        assert!(app.tags.is_empty());
+        assert_eq!(app.repo_load, LoadState::Loading);
     }
 }

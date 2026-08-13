@@ -239,7 +239,7 @@ entire document. Search auto-expands any folds hiding a match.
 | Key | Action |
 |-----|--------|
 | `R` | Switch registry (in-app) |
-| `Backspace` / `u` | Back to the repo-key picker (Artifactory) or package picker (GHCR) |
+| `Backspace` / `u` | Up a level: the repo-key picker (Artifactory) or the owner picker (GHCR) |
 
 ### General
 

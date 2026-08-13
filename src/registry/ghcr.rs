@@ -44,6 +44,30 @@ struct PackageOwner {
     login: String,
 }
 
+/// A user or organisation, as returned by `/user` and `/user/orgs`.
+#[derive(Deserialize)]
+struct Account {
+    login: String,
+}
+
+/// The authenticated token holder.
+const SELF_URL: &str = "https://api.github.com/user";
+
+/// The organisations the token holder belongs to. Needs the `read:org` scope,
+/// which a `read:packages`-only PAT does not have — see [`list_owners`].
+const ORGS_URL: &str = "https://api.github.com/user/orgs?per_page=100";
+
+/// A GET against the GitHub API, carrying the headers it requires.
+///
+/// `User-Agent` is not optional: GitHub rejects requests without one.
+fn github_request(http: &reqwest::Client, url: &str, token: &str) -> reqwest::RequestBuilder {
+    http.get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", API_VERSION)
+        .bearer_auth(token)
+}
+
 /// The outcome of a package listing.
 pub struct PackageList {
     /// Repository names, in `owner/name` form, ready to use as a `/v2/` path.
@@ -99,12 +123,7 @@ pub async fn list_packages(owner: Option<&str>, token: &str) -> anyhow::Result<P
         }
         pages += 1;
 
-        let resp = http
-            .get(&url)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .bearer_auth(token)
+        let resp = github_request(&http, &url, token)
             .send()
             .await?
             .error_for_status()?;
@@ -124,6 +143,90 @@ pub async fn list_packages(owner: Option<&str>, token: &str) -> anyhow::Result<P
         repos,
         truncated: false,
     })
+}
+
+/// Owners worth offering in the owner picker: the token holder, then the
+/// organisations they belong to.
+///
+/// **Infallible on purpose.** These are suggestions, not the input — the picker
+/// always accepts a typed owner, so a short or empty list is a degraded
+/// convenience rather than a failure worth reporting. That matters because
+/// `/user/orgs` needs the `read:org` scope, which a PAT scoped to just
+/// `read:packages` (all GHCR browsing actually requires) does not have. Losing
+/// the org list must not cost the user their own login too, so the two calls
+/// contribute independently.
+///
+/// Logins keep GitHub's casing (`Homebrew`): its paths are case-insensitive,
+/// and the original reads better than a flattened one.
+pub async fn list_owners(token: &str) -> Vec<String> {
+    let http = reqwest::Client::new();
+    let mut owners = Vec::new();
+
+    if let Some(account) = fetch_json::<Account>(&http, SELF_URL, token).await {
+        owners.push(account.login);
+    }
+
+    // Paginated for correctness, though the cap is generous for the handful of
+    // orgs anyone belongs to.
+    let mut next = Some(ORGS_URL.to_owned());
+    let mut pages = 0usize;
+    while let Some(url) = next.take() {
+        if pages >= MAX_PAGES {
+            break;
+        }
+        pages += 1;
+
+        let Some(resp) = github_request(&http, &url, token)
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.error_for_status().ok())
+        else {
+            break;
+        };
+
+        next = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_next_link);
+
+        let Ok(orgs) = resp.json::<Vec<Account>>().await else {
+            break;
+        };
+        owners.extend(orgs.into_iter().map(|o| o.login));
+    }
+
+    dedupe_owners(owners)
+}
+
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Option<T> {
+    github_request(http, url, token)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<T>()
+        .await
+        .ok()
+}
+
+/// Drop repeats case-insensitively, keeping the first spelling seen.
+///
+/// An owner can legitimately arrive twice — the token holder's login also
+/// appears in the org list for a user who is a member of an org named after
+/// themselves — and a duplicate row in the picker is just noise.
+fn dedupe_owners(owners: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    owners
+        .into_iter()
+        .filter(|o| !o.is_empty() && seen.insert(o.to_lowercase()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +272,24 @@ mod tests {
             "homebrew/core/sqldiff"
         );
         assert_eq!(repo_name(&pkg("Homebrew", "brew")), "homebrew/brew");
+    }
+
+    #[test]
+    fn dedupe_owners_is_case_insensitive_and_keeps_first_spelling() {
+        assert_eq!(
+            dedupe_owners(vec![
+                "pgmac".to_owned(),
+                "Homebrew".to_owned(),
+                "PGMAC".to_owned(),
+                String::new(),
+                "pgmac-net".to_owned(),
+            ]),
+            vec![
+                "pgmac".to_owned(),
+                "Homebrew".to_owned(),
+                "pgmac-net".to_owned()
+            ]
+        );
     }
 
     #[test]
