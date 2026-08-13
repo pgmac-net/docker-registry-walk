@@ -10,7 +10,9 @@ use ratatui::{
 
 use crate::ops::diff::DiffStatus;
 
-use super::app::{App, Focus, InspectModal, LoadState, Modal, SPINNER};
+use super::app::{
+    App, Focus, InspectModal, LoadState, Modal, OwnerChoice, SPINNER, ghcr_owner_choices,
+};
 use super::detail;
 use super::input::{InputState, cursor_spans, input_scroll_skip};
 use super::jsonview::{RowMeta, close_bracket};
@@ -89,6 +91,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 *selected,
                 *loading,
                 ARTIFACTORY_PICKER_LABELS,
+                area,
+            );
+        }
+        Modal::GhcrOwnerPicker {
+            input,
+            owners,
+            selected,
+            loading,
+        } => {
+            // Rows come from the same helper the key handler selects with, so
+            // the row opened is always the row highlighted.
+            let rows: Vec<String> = ghcr_owner_choices(&input.buffer, owners)
+                .iter()
+                .map(OwnerChoice::label)
+                .collect();
+            draw_filter_picker_modal(
+                frame,
+                input,
+                &rows,
+                *selected,
+                *loading,
+                GHCR_OWNER_PICKER_LABELS,
                 area,
             );
         }
@@ -527,6 +551,12 @@ const ARTIFACTORY_PICKER_LABELS: PickerLabels = PickerLabels {
     title: " Artifactory Repositories ",
     list_title: " Repo-keys  [↑↓/jk] navigate  [Enter] open  [Esc] cancel ",
     empty: " No repositories found",
+};
+
+const GHCR_OWNER_PICKER_LABELS: PickerLabels = PickerLabels {
+    title: " GHCR Owner ",
+    list_title: " Owners  [↑↓] navigate  [Enter] browse  [Esc] cancel  — or type any owner ",
+    empty: " Type an owner to browse",
 };
 
 const GHCR_PICKER_LABELS: PickerLabels = PickerLabels {
@@ -1050,7 +1080,7 @@ fn draw_help_modal(frame: &mut Frame, scroll: usize, area: Rect) {
         Line::from(vec![
             key("Backspace / u"),
             sep(),
-            desc("Back to repo-key picker (Artifactory only)"),
+            desc("Up a level: repo-key picker (Artifactory) / owner picker (GHCR)"),
         ]),
         Line::from(vec![]),
         header("Docker Hub Search  (opens automatically on Docker Hub)"),
@@ -1192,6 +1222,46 @@ mod tests {
         );
     }
 
+    /// The renderer and the key handler both build rows from
+    /// `ghcr_owner_choices`, so what is drawn is what `Enter` opens. This pins
+    /// that the typed row reaches the screen.
+    #[test]
+    fn ghcr_owner_picker_renders_the_typed_owner_and_matching_suggestions() {
+        let mut app = make_app();
+        app.modal = Modal::GhcrOwnerPicker {
+            input: input_with("home"),
+            owners: vec!["pgmac".to_owned(), "Homebrew".to_owned()],
+            selected: 0,
+            loading: false,
+        };
+
+        let content = render_to_string(&mut app, 100, 20);
+        assert!(content.contains(r#"Use "home""#), "typed row must render");
+        assert!(content.contains("Homebrew"), "matching suggestion kept");
+        assert!(
+            !content.contains("pgmac"),
+            "non-matching suggestion filtered"
+        );
+    }
+
+    /// Without a `read:org` PAT the suggestion list is empty, and the picker is
+    /// then nothing but a text box — so its prompt has to be visible.
+    #[test]
+    fn ghcr_owner_picker_empty_state_prompts_for_typing() {
+        let mut app = make_app();
+        app.modal = Modal::GhcrOwnerPicker {
+            input: InputState::default(),
+            owners: Vec::new(),
+            selected: 0,
+            loading: false,
+        };
+
+        assert!(
+            render_to_string(&mut app, 100, 30).contains("Type an owner"),
+            "an empty owner list must still tell the user what to do"
+        );
+    }
+
     /// A GHCR listing can spend a minute paging the GitHub API, so the empty
     /// state is the whole screen for that time. It has to actually render: at
     /// the old height the message landed in a bordered box with zero interior
@@ -1324,6 +1394,12 @@ mod tests {
             Modal::GhcrPicker {
                 filter: InputState::default(),
                 packages: vec!["homebrew/core/git".to_owned()],
+                selected: 0,
+                loading: false,
+            },
+            Modal::GhcrOwnerPicker {
+                input: InputState::default(),
+                owners: vec!["Homebrew".to_owned()],
                 selected: 0,
                 loading: false,
             },

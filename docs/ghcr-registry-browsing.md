@@ -123,8 +123,7 @@ Consequences worth knowing:
 
 Switching to a GHCR profile opens a filterable package picker, the same shape
 as the Artifactory repo-key picker (they share a renderer,
-`draw_filter_picker_modal`). `Backspace` / `u` reopens it mid-browse, served
-from cache.
+`draw_filter_picker_modal`).
 
 One fetch fills **two** surfaces: the picker *and* the Repos pane. This differs
 from Artifactory on purpose. An Artifactory repo-key is a whole sub-registry,
@@ -137,6 +136,48 @@ Confirming a package therefore only moves the Repos pane's selection; the event
 loop reloads tags whenever the selected repo changes. Issuing a `BrowseRepo`
 as well would fetch the same tags twice, and `on_tags_page` appends — which
 showed up in testing as every tag appearing exactly twice.
+
+## Changing owner
+
+`Backspace` / `u` opens the **owner** picker. GHCR's hierarchy is owner →
+package → tag, so up-navigation lands on the owner, matching what `u` already
+does for Artifactory (up to the repo-key picker).
+
+It deliberately does not reopen the *package* picker. Because one fetch fills
+both surfaces, the Repos pane already holds the whole package list — so
+re-listing packages would add nothing, whereas the owner was otherwise only
+settable in `config.toml`, and only at startup.
+
+The picker is a text box over a suggestion list:
+
+- Suggestions are the token holder's login (`GET /user`) and their
+  organisations (`GET /user/orgs`), plus the owner currently being browsed.
+- **The typed value is always selectable**, offered as a `Use "…"` row whenever
+  it doesn't already name a suggestion. That is what keeps an owner nobody can
+  enumerate reachable — an org the token cannot see, or any account at all when
+  browsing without a PAT.
+- `/user/orgs` needs the **`read:org`** scope, which a PAT scoped to just
+  `read:packages` does not have. The suggestion list is then empty and the
+  picker is a plain text box; that is an ordinary outcome, not an error, which
+  is why a failed fetch only stops the spinner.
+
+Choosing an owner is **session-only** — it is not written back to
+`config.toml`. The app never writes config, and rewriting it on a keystroke
+would be surprising.
+
+Two things follow from the owner being switchable at runtime:
+
+- The package cache is keyed by profile **and owner**. Keyed by profile alone,
+  switching owner would serve the previous owner's packages — a cache bug that
+  would present as a GitHub API fault.
+- Changing owner resets repo, tag and detail state, exactly as switching
+  registry does. Nothing beneath the old owner survives.
+
+Note that every pick goes through `/users/{owner}/packages`, including your own
+login — there is no separate "your packages" entry. That endpoint is scoped to
+what the *requesting* user can access, so your own private packages should
+still appear; if they ever don't, the `owner = None` → `/user/packages` path is
+the fix.
 
 ## What works, and what doesn't
 

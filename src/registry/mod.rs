@@ -16,7 +16,7 @@ pub use auth::{
 };
 pub use client::{Credentials, NoCredentials, RegistryClient};
 pub use error::{RegistryError, Result};
-pub use ghcr::{PackageList, list_packages};
+pub use ghcr::{PackageList, list_owners, list_packages};
 pub use search::search_dockerhub;
 pub use types::{
     ArtifactoryRepo, BlobInfo, Catalog, ImageConfigBlob, ImageManifest, Manifest,
