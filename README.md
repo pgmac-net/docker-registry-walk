@@ -98,6 +98,23 @@ name = "ghcr"
 url = "https://ghcr.io"
 type = "ghcr"
 owner = "pgmac-net"
+
+# AWS ECR. An ECR registry is one AWS account in one region, and its hostname
+# (<account-id>.dkr.ecr.<region>.amazonaws.com) is derived at runtime — so
+# there is no `url` to write. Credentials come from the ordinary AWS chain,
+# never the keychain. Both `aws_profile` and `region` can be switched from
+# inside the TUI with `u` / Backspace.
+[[registry]]
+name = "ecr"
+type = "ecr"
+aws_profile = "default"
+region = "ap-southeast-2"
+
+# ECR Public. One global registry rather than one per region, so `region`
+# does not apply.
+[[registry]]
+name = "ecr-public"
+type = "ecr-public"
 ```
 
 Per-profile keys:
@@ -105,11 +122,13 @@ Per-profile keys:
 | Key | Description |
 |-----|-------------|
 | `name` | Profile name, shown in the title bar and used as the keychain key. Must not contain `#` |
-| `url` | Registry URL. For `type = "artifactory"`, the Artifactory server base rather than a `/v2/` root |
-| `username` | Optional. Not needed for `auth = "token"` |
-| `type` | `standard` (default), `dockerhub`, `artifactory`, or `ghcr` |
+| `url` | Registry URL. For `type = "artifactory"`, the Artifactory server base rather than a `/v2/` root. Optional — and normally omitted — for the ECR types, which derive it from AWS |
+| `username` | Optional. Not needed for `auth = "token"` or the ECR types |
+| `type` | `standard` (default), `dockerhub`, `artifactory`, `ghcr`, `ecr`, or `ecr-public` |
 | `auth` | `auto` (default), `basic`, `bearer`, or `token` |
 | `owner` | `ghcr` only. User or organisation whose packages to list. Omit for your own |
+| `aws_profile` | ECR only. AWS named profile to resolve credentials from. Omit to use the AWS chain (`$AWS_PROFILE`, then `default`) |
+| `region` | `ecr` only. AWS region whose registry to browse. Omit to use the chain (`$AWS_REGION`, then the profile's region) |
 
 ### Credentials / keyring
 
@@ -154,6 +173,8 @@ The environment wins so a token can be overridden for a single run without distu
 Those two sets never cross-read. A JFrog token exported in your shell can never change how you authenticate to Docker Hub or GHCR, and a `GITHUB_TOKEN` exported for `gh` — which is set on most developer machines — can never become an Artifactory credential.
 
 `auth = "token"` works for any registry type, though how the token is *presented* differs: Artifactory receives it directly as `Authorization: Bearer <token>`, whereas GHCR exchanges it for a repository-scoped token (see [docs/ghcr-registry-browsing.md](docs/ghcr-registry-browsing.md)).
+
+The ECR types are the exception to all of the above: they read no token environment variables and store nothing in the keychain, because their registry password is minted by AWS and expires in about twelve hours. `--token` and `--password` do not apply to them, and an ECR failure reports an AWS problem rather than prompting for a credential. See [docs/ecr-registry-browsing.md](docs/ecr-registry-browsing.md).
 
 Leaving `auth` unset (`auto`) preserves the previous behaviour exactly: an Artifactory profile with a username and a stored password still uses HTTP Basic, and only falls back to a token when there is no password. Set `auth = "token"` explicitly to prefer the token when both exist.
 

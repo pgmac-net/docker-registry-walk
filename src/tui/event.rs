@@ -12,11 +12,12 @@ use url::Url;
 
 use crate::config::{AuthKind, AuthMode, RegistryProfile};
 use crate::ops::diff::DiffLayer;
+use crate::registry::ecr::{self, EcrTarget};
 use crate::registry::{
     AccessTokenCredentials, ArtifactoryRepo, BasicCredentials, BearerCredentials, Credentials,
-    GhcrCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient, RegistryError,
-    Secret, TOKEN_ACCOUNT, list_owners, list_packages, resolve_access_token, sanitize_pasted_token,
-    search_dockerhub,
+    EcrCredentials, GhcrCredentials, ImageConfigBlob, KeyringStore, Manifest, RegistryClient,
+    RegistryError, Secret, TOKEN_ACCOUNT, list_owners, list_packages, resolve_access_token,
+    sanitize_pasted_token, search_dockerhub,
 };
 
 use super::app::{
@@ -143,6 +144,29 @@ pub enum AppEvent {
     GhcrOwnersError(String),
     /// User chose whose packages to browse.
     GhcrOwnerSelected(String),
+    /// An ECR registry resolved: its endpoint (which embeds the AWS account ID
+    /// and so is not known until AWS answers), the token minted on the way, and
+    /// the repositories it holds. All three come from one connect because the
+    /// client cannot be built without the first two.
+    EcrConnected {
+        registry_url: String,
+        authorization: Box<ecr::EcrAuthorization>,
+        repos: Vec<String>,
+    },
+    EcrError(String),
+    /// Up-navigation from an ECR repository list to the AWS profile picker
+    /// (`Backspace` / `u`).
+    OpenEcrProfilePicker,
+    /// AWS named profiles read from the user's AWS config files.
+    AwsProfiles(Vec<ecr::AwsProfile>),
+    /// User chose an AWS profile; for private ECR this opens the region picker
+    /// rather than applying immediately, since a registry needs both.
+    EcrProfileSelected(Option<String>),
+    /// User chose both halves of the AWS target.
+    EcrTargetSelected {
+        aws_profile: Option<String>,
+        region: Option<String>,
+    },
 }
 
 /// Spawn a blocking thread that forwards crossterm events to `tx`.
@@ -204,14 +228,32 @@ pub(super) async fn event_loop(
     terminal.draw(|f| ui::draw(f, &mut app))?;
 
     // Pre-build client for the initial profile.
+    //
+    // A private ECR profile with no configured URL is the exception: its
+    // endpoint is not known until AWS answers, so there is nothing to build a
+    // client from yet. `spawn_ecr_connect` resolves the endpoint and the client
+    // is built when `EcrConnected` arrives.
     let mut clients: HashMap<String, RegistryClient> = HashMap::new();
-    let init_client = make_client_for_profile(&profiles[initial_idx]).await;
-    clients.insert(profiles[initial_idx].name.clone(), init_client);
     let mut active_name = profiles[initial_idx].name.clone();
+    // Stand-in for the interval before an ECR endpoint resolves; see
+    // `not_connected_client`.
+    let not_connected = not_connected_client();
+    if let Some(client) = initial_client_for(&profiles[initial_idx]).await {
+        clients.insert(profiles[initial_idx].name.clone(), client);
+    }
 
     // Kick off initial catalog load — or, for an Artifactory profile, fetch
     // the repo-key list and let the user pick one first.
-    if profiles[initial_idx].is_artifactory() {
+    if profiles[initial_idx].is_any_ecr() {
+        app.start_ecr_switch(initial_idx);
+        // After the switch, which resets the title to the placeholder: ECR
+        // Public's endpoint is a constant, so there is no need to show
+        // "resolving" for a registry that is already known.
+        if profiles[initial_idx].is_ecr_public() {
+            app.registry_url = ecr::ECR_PUBLIC_REGISTRY_URL.to_owned();
+        }
+        spawn_ecr_connect(profiles[initial_idx].clone(), tx.clone());
+    } else if profiles[initial_idx].is_artifactory() {
         app.start_artifactory_switch(initial_idx);
         spawn_artifactory_repos_fetch(clients[&active_name].clone(), tx.clone());
     } else if profiles[initial_idx].is_ghcr() {
@@ -242,7 +284,12 @@ pub(super) async fn event_loop(
                         // Update app state *before* building the client, so the
                         // pre-build frame below shows the registry being
                         // switched to rather than the one being left.
-                        if profile.is_artifactory() {
+                        if profile.is_any_ecr() {
+                            app.start_ecr_switch(idx);
+                            if profile.is_ecr_public() {
+                                app.registry_url = ecr::ECR_PUBLIC_REGISTRY_URL.to_owned();
+                            }
+                        } else if profile.is_artifactory() {
                             app.start_artifactory_switch(idx);
                         } else if profile.is_ghcr() {
                             app.start_ghcr_switch(idx);
@@ -257,11 +304,16 @@ pub(super) async fn event_loop(
                             // cached switch draws no extra frame.
                             app.set_status(format!("Connecting to {name}…"));
                             terminal.draw(|f| ui::draw(f, &mut app))?;
-                            let client = make_client_for_profile(&profile).await;
-                            clients.insert(name.clone(), client);
+                            // `None` for a private ECR registry whose endpoint
+                            // is still unknown; the connect below supplies it.
+                            if let Some(client) = initial_client_for(&profile).await {
+                                clients.insert(name.clone(), client);
+                            }
                         }
 
-                        if profile.is_artifactory() {
+                        if profile.is_any_ecr() {
+                            spawn_ecr_connect(profile.clone(), tx.clone());
+                        } else if profile.is_artifactory() {
                             spawn_artifactory_repos_fetch(clients[&active_name].clone(), tx.clone());
                         } else if profile.is_ghcr() {
                             // Takes the profile, not the client: the packages
@@ -337,6 +389,60 @@ pub(super) async fn event_loop(
                     }
                     AppEvent::GhcrPackagesError(msg) => {
                         app.on_ghcr_packages_error(msg);
+                    }
+                    AppEvent::EcrConnected {
+                        registry_url,
+                        authorization,
+                        repos,
+                    } => {
+                        // The client is built here rather than in the spawned
+                        // task so the cache stays owned by the loop — and it is
+                        // handed the token already minted, so the first request
+                        // does not call GetAuthorizationToken again.
+                        let profile = app.profiles[app.active_profile_idx].clone();
+                        let client = make_client_for_profile_at(
+                            &profile,
+                            Some((registry_url.as_str(), Some(*authorization))),
+                        )
+                        .await;
+                        clients.insert(profile.name.clone(), client);
+                        active_name = profile.name.clone();
+                        app.on_ecr_connected(registry_url, repos);
+                    }
+                    AppEvent::EcrError(msg) => {
+                        app.on_ecr_error(msg);
+                    }
+                    AppEvent::OpenEcrProfilePicker => {
+                        let idx = app.active_profile_idx;
+                        if app.profiles[idx].is_any_ecr() {
+                            app.open_ecr_profile_picker();
+                            spawn_aws_profiles_read(tx.clone());
+                        }
+                    }
+                    AppEvent::AwsProfiles(profiles) => app.on_aws_profiles(profiles),
+                    AppEvent::EcrProfileSelected(aws_profile) => {
+                        // ECR Public has no region axis, so its target is
+                        // complete after one stage.
+                        if app.profiles[app.active_profile_idx].is_ecr_public() {
+                            app.apply_ecr_target(aws_profile, None);
+                            let profile = app.profiles[app.active_profile_idx].clone();
+                            clients.remove(&profile.name);
+                            spawn_ecr_connect(profile, tx.clone());
+                        } else {
+                            app.open_ecr_region_picker(aws_profile);
+                        }
+                    }
+                    AppEvent::EcrTargetSelected {
+                        aws_profile,
+                        region,
+                    } => {
+                        app.apply_ecr_target(aws_profile, region);
+                        let profile = app.profiles[app.active_profile_idx].clone();
+                        // The cached client points at the *previous* account's
+                        // endpoint and holds its credential, so it cannot be
+                        // reused across a target switch.
+                        clients.remove(&profile.name);
+                        spawn_ecr_connect(profile, tx.clone());
                     }
                     AppEvent::ReposError { msg, auth_failed } => {
                         // After a silent-reread or password-entry retry, a
@@ -435,7 +541,12 @@ pub(super) async fn event_loop(
                         }
                         app.set_status(format!("✗ Search: {msg}"));
                     }
-                    ev => handle_event(&mut app, ev, &clients[&active_name], &tx),
+                    ev => handle_event(
+                        &mut app,
+                        ev,
+                        clients.get(&active_name).unwrap_or(&not_connected),
+                        &tx,
+                    ),
                 }
             }
             _ = tick.tick() => {
@@ -453,7 +564,12 @@ pub(super) async fn event_loop(
             && let Some(repo) = new_repo
         {
             app.start_tags_load(repo.clone());
-            spawn_tags_fetch(clients[&active_name].clone(), repo, None, tx.clone());
+            spawn_tags_fetch(
+                active_client(&clients, &active_name, &not_connected),
+                repo,
+                None,
+                tx.clone(),
+            );
         }
 
         // Detect tag selection change → reload detail.
@@ -464,7 +580,7 @@ pub(super) async fn event_loop(
         {
             app.start_detail_load(tag.clone());
             spawn_detail_fetch(
-                clients[&active_name].clone(),
+                active_client(&clients, &active_name, &not_connected),
                 repo,
                 tag,
                 app.registry_url.clone(),
@@ -476,7 +592,7 @@ pub(super) async fn event_loop(
         if app.should_load_more_repos() {
             app.repo_load = LoadState::Loading;
             spawn_repos_fetch(
-                clients[&active_name].clone(),
+                active_client(&clients, &active_name, &not_connected),
                 app.repos_cursor.clone(),
                 tx.clone(),
             );
@@ -488,7 +604,7 @@ pub(super) async fn event_loop(
         {
             app.tag_load = LoadState::Loading;
             spawn_tags_fetch(
-                clients[&active_name].clone(),
+                active_client(&clients, &active_name, &not_connected),
                 repo,
                 app.tags_cursor.clone(),
                 tx.clone(),
@@ -529,7 +645,13 @@ fn handle_event(app: &mut App, ev: AppEvent, client: &RegistryClient, tx: &mpsc:
         | AppEvent::OpenGhcrOwnerPicker
         | AppEvent::GhcrOwners(_)
         | AppEvent::GhcrOwnersError(_)
-        | AppEvent::GhcrOwnerSelected(_) => {}
+        | AppEvent::GhcrOwnerSelected(_)
+        | AppEvent::EcrConnected { .. }
+        | AppEvent::EcrError(_)
+        | AppEvent::OpenEcrProfilePicker
+        | AppEvent::AwsProfiles(_)
+        | AppEvent::EcrProfileSelected(_)
+        | AppEvent::EcrTargetSelected { .. } => {}
         AppEvent::BrowseRepo(repo) => {
             app.start_tags_load(repo.clone());
             app.focus = Focus::Tags;
@@ -860,6 +982,115 @@ fn handle_key(
         return;
     }
 
+    if matches!(app.modal, Modal::EcrProfilePicker { .. }) {
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            KeyCode::Enter => {
+                let selected = if let Modal::EcrProfilePicker { selected, .. } = &app.modal {
+                    *selected
+                } else {
+                    0
+                };
+                // `ecr_profile_rows` is the same function the renderer uses, so
+                // the row picked here is the row that was highlighted.
+                if let Some(choice) = app.ecr_profile_rows().get(selected) {
+                    let picked = choice.owner().to_owned();
+                    // An empty pick means "whatever the AWS chain resolves",
+                    // which is a meaningfully different request from naming a
+                    // profile called "".
+                    let aws_profile = (!picked.is_empty()).then_some(picked);
+                    let _ = tx.try_send(AppEvent::EcrProfileSelected(aws_profile));
+                }
+            }
+            KeyCode::Up => {
+                if let Modal::EcrProfilePicker { selected, .. } = &mut app.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let n = app.ecr_profile_rows().len();
+                if let Modal::EcrProfilePicker { selected, .. } = &mut app.modal
+                    && n > 0
+                {
+                    *selected = (*selected + 1).min(n - 1);
+                }
+            }
+            KeyCode::Char('?') => open_help(app),
+            _ => {
+                if let Modal::EcrProfilePicker {
+                    input, selected, ..
+                } = &mut app.modal
+                    && apply_input_key(input, code, modifiers)
+                {
+                    *selected = 0;
+                }
+            }
+        }
+        return;
+    }
+
+    if matches!(app.modal, Modal::EcrRegionPicker { .. }) {
+        match code {
+            KeyCode::Esc => {
+                app.modal = Modal::None;
+                app.set_status("Cancelled");
+            }
+            // Back up a stage rather than out of the flow entirely: the region
+            // picker is the second half of one choice, so `Backspace` on an
+            // empty input returns to the profile it followed.
+            KeyCode::Backspace if matches!(&app.modal, Modal::EcrRegionPicker { input, .. } if input.buffer.is_empty()) =>
+            {
+                let _ = tx.try_send(AppEvent::OpenEcrProfilePicker);
+            }
+            KeyCode::Enter => {
+                let (selected, aws_profile) = if let Modal::EcrRegionPicker {
+                    selected,
+                    aws_profile,
+                    ..
+                } = &app.modal
+                {
+                    (*selected, aws_profile.clone())
+                } else {
+                    (0, None)
+                };
+                if let Some(choice) = app.ecr_region_rows().get(selected) {
+                    let picked = choice.owner().to_owned();
+                    let _ = tx.try_send(AppEvent::EcrTargetSelected {
+                        aws_profile,
+                        region: (!picked.is_empty()).then_some(picked),
+                    });
+                }
+            }
+            KeyCode::Up => {
+                if let Modal::EcrRegionPicker { selected, .. } = &mut app.modal {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let n = app.ecr_region_rows().len();
+                if let Modal::EcrRegionPicker { selected, .. } = &mut app.modal
+                    && n > 0
+                {
+                    *selected = (*selected + 1).min(n - 1);
+                }
+            }
+            KeyCode::Char('?') => open_help(app),
+            _ => {
+                if let Modal::EcrRegionPicker {
+                    input, selected, ..
+                } = &mut app.modal
+                    && apply_input_key(input, code, modifiers)
+                {
+                    *selected = 0;
+                }
+            }
+        }
+        return;
+    }
+
     if matches!(app.modal, Modal::Inspect(_)) {
         // `?` opens Help over the viewer. Only when not typing a search query
         // — there `?` is a literal character, same as any other picker's text
@@ -1033,7 +1264,15 @@ fn handle_key(
             // pane already holds the whole package list (one fetch fills both),
             // so re-listing packages would add nothing, whereas the owner is
             // otherwise only settable in config.
-            let event = if app.profiles[app.active_profile_idx].is_ghcr() {
+            // ECR's hierarchy is AWS profile → region → repo → tag, and for the
+            // same reason as GHCR this lands on the *account*, not a repo
+            // picker: the Repos pane already holds every repository the
+            // account has, while the account and region are otherwise only
+            // settable in config.
+            let profile = &app.profiles[app.active_profile_idx];
+            let event = if profile.is_any_ecr() {
+                AppEvent::OpenEcrProfilePicker
+            } else if profile.is_ghcr() {
                 AppEvent::OpenGhcrOwnerPicker
             } else {
                 AppEvent::OpenArtifactoryRepoPicker
@@ -1328,7 +1567,26 @@ async fn store_secret(profile_name: String, account: String, secret: String) {
 /// impure part (keyring and environment lookups, via [`resolve_secrets`]) and
 /// the construction.
 async fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
-    let url = match Url::parse(&profile.url) {
+    make_client_for_profile_at(profile, None).await
+}
+
+/// As [`make_client_for_profile`], but for a registry whose endpoint was
+/// discovered at runtime rather than configured.
+///
+/// `resolved_url` exists for ECR, whose hostname embeds an AWS account ID and
+/// so only becomes known once `GetAuthorizationToken` has answered. It
+/// overrides `profile.url`, which for such a profile is normally `None`.
+async fn make_client_for_profile_at(
+    profile: &RegistryProfile,
+    resolved: Option<(&str, Option<ecr::EcrAuthorization>)>,
+) -> RegistryClient {
+    let configured = resolved
+        .as_ref()
+        .map(|(url, _)| *url)
+        .or(profile.url.as_deref())
+        .unwrap_or_default();
+
+    let url = match Url::parse(configured) {
         Ok(u) => u,
         // Bad URL costs no keyring I/O — checked before resolving secrets.
         Err(_) => return RegistryClient::new(Url::parse("http://localhost:5000").unwrap()),
@@ -1346,6 +1604,15 @@ async fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
         // `token` stays an Option: GHCR's exchange works anonymously too, and
         // that is the only way to browse public packages without a PAT.
         AuthKind::Ghcr => Arc::new(GhcrCredentials::new(&url, token)),
+        // ECR sends its minted token as Basic on every request — the opposite
+        // of GHCR above, which must send nothing. The token already in hand
+        // from the connect that resolved this endpoint is handed over so the
+        // first request does not re-mint one.
+        AuthKind::Ecr => Arc::new(EcrCredentials::new(
+            EcrTarget::new(profile.aws_profile.clone(), profile.region.clone()),
+            profile.is_ecr_public(),
+            resolved.and_then(|(_, auth)| auth),
+        )),
         // Artifactory's Docker v2 endpoint and REST API both accept plain HTTP
         // Basic (username + API key / identity token); no Bearer challenge is
         // issued, and `BearerCredentials` sends no header at all without one.
@@ -1361,6 +1628,78 @@ async fn make_client_for_profile(profile: &RegistryProfile) -> RegistryClient {
     };
 
     RegistryClient::new(url).with_credentials(creds)
+}
+
+/// An ECR profile's endpoint, when it is knowable without asking AWS.
+///
+/// Two cases: an explicitly configured `url`, and ECR Public — whose registry
+/// is the fixed `public.ecr.aws`, with no account ID to discover. Only a
+/// private ECR registry with no configured URL has to wait for
+/// `GetAuthorizationToken`.
+///
+/// This is what makes anonymous ECR Public browsing work at all. Its repository
+/// *listing* needs AWS credentials, but pulling a public image needs none — so
+/// a credential failure must not also cost the client, or the browse-by-name
+/// fallback offered alongside that failure would have nowhere to send a
+/// request.
+/// The client to start a profile with, if one can be built before any network
+/// call resolves the endpoint.
+///
+/// `None` only for a private ECR profile with no configured URL — the one case
+/// where the registry's hostname is not yet known. Everything else, including
+/// ECR Public, gets a client immediately.
+async fn initial_client_for(profile: &RegistryProfile) -> Option<RegistryClient> {
+    if !profile.is_any_ecr() {
+        return Some(make_client_for_profile(profile).await);
+    }
+
+    let endpoint = known_ecr_endpoint(profile)?;
+    Some(make_client_for_profile_at(profile, Some((&endpoint, None))).await)
+}
+
+fn known_ecr_endpoint(profile: &RegistryProfile) -> Option<String> {
+    if let Some(url) = &profile.url {
+        return Some(url.clone());
+    }
+    profile
+        .is_ecr_public()
+        .then(|| ecr::ECR_PUBLIC_REGISTRY_URL.to_owned())
+}
+
+/// Host used by the stand-in client for a registry that has not resolved yet.
+///
+/// `.invalid` is reserved by RFC 2606 and can never resolve, so a request that
+/// somehow escapes through the stand-in fails immediately with a DNS error
+/// naming this host — which is self-explanatory in the status bar — rather than
+/// reaching some real service.
+const NOT_CONNECTED_HOST: &str = "http://not-connected.invalid/";
+
+/// A client for the window in which an ECR profile has no endpoint yet.
+///
+/// Every other registry type has its URL from config, so a client exists before
+/// the first frame. ECR's is minted along with its credential, which means
+/// there is a real interval — and, if AWS refuses, a permanent state — with no
+/// client for the active profile. The event loop needs *something* to hand the
+/// key handler regardless, and indexing the map is what panicked (issue #67):
+/// a keystroke arriving before AWS answered took the whole TUI down.
+///
+/// Nothing should actually request through this: repositories arrive with the
+/// connect rather than being fetched, and every action that needs a client
+/// needs a repo or tag selected first. It is a guard against the crash, not a
+/// working fallback.
+fn not_connected_client() -> RegistryClient {
+    RegistryClient::new(Url::parse(NOT_CONNECTED_HOST).expect("constant URL parses"))
+}
+
+/// The active profile's client, or the not-connected stand-in.
+///
+/// Cloned rather than borrowed because every caller hands it to a spawned task.
+fn active_client(
+    clients: &HashMap<String, RegistryClient>,
+    active_name: &str,
+    not_connected: &RegistryClient,
+) -> RegistryClient {
+    clients.get(active_name).unwrap_or(not_connected).clone()
 }
 
 /// Whether `key` is this profile's client-cache key, either the root entry or
@@ -1470,6 +1809,13 @@ enum AuthPrompt {
 /// username-gated check treated as "nothing to ask" — so they got no prompt at
 /// all.
 fn auth_prompt_for(profile: &RegistryProfile) -> Option<AuthPrompt> {
+    // ECR has no credential a user could type: the registry password is minted
+    // by AWS and expires in hours, so prompting for one would collect a secret
+    // with nowhere to go and no effect on the failure. An ECR auth problem is
+    // an AWS problem, reported as such by `ecr::describe_failure`.
+    if profile.is_any_ecr() {
+        return None;
+    }
     if profile.wants_access_token() && profile.username.is_none() {
         return Some(AuthPrompt::Token);
     }
@@ -1836,6 +2182,69 @@ fn spawn_ghcr_packages_fetch(profile: RegistryProfile, tx: mpsc::Sender<AppEvent
     });
 }
 
+/// Resolve an ECR registry and list its repositories.
+///
+/// Takes the profile rather than a `RegistryClient` for the same reason
+/// `spawn_ghcr_packages_fetch` does — the AWS API is a different origin from
+/// the registry — and additionally because there *is* no client yet: an ECR
+/// endpoint embeds the account ID and is only learned from this call.
+///
+/// Deliberately spawned rather than awaited inline in the event loop. The AWS
+/// chain can block on an SSO token refresh or IMDS probe, and the loop is what
+/// redraws the screen; awaiting here would freeze the "Connecting…" frame it
+/// just drew.
+fn spawn_ecr_connect(profile: RegistryProfile, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let target = EcrTarget::new(profile.aws_profile.clone(), profile.region.clone());
+
+        let result = if profile.is_ecr_public() {
+            ecr::connect_public(&target).await
+        } else {
+            ecr::connect(&target).await
+        };
+
+        let event = match result {
+            Ok(connection) => AppEvent::EcrConnected {
+                registry_url: connection.authorization.registry_url.clone(),
+                authorization: Box::new(connection.authorization),
+                repos: connection.repos,
+            },
+            // `describe_failure` turns the SDK's opaque credential errors into
+            // the command that fixes the common one.
+            Err(e) => AppEvent::EcrError(ecr::describe_failure(
+                &format!("{e:#}"),
+                profile.aws_profile.as_deref(),
+            )),
+        };
+
+        let _ = tx.send(event).await;
+    });
+}
+
+/// Read the AWS named profiles from the user's config files.
+///
+/// `spawn_blocking` for the same reason the keyring lookup uses it: this is
+/// filesystem I/O on the runtime, small but not free, and it happens while a
+/// picker is already on screen.
+fn spawn_aws_profiles_read(tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        let profiles = tokio::task::spawn_blocking(|| {
+            let home = dirs::home_dir().unwrap_or_default();
+            let read = |name: &str| std::fs::read_to_string(home.join(".aws").join(name));
+            // A missing file is the ordinary case for anyone using only
+            // environment variables or an instance role.
+            ecr::parse_aws_profiles(
+                &read("config").unwrap_or_default(),
+                &read("credentials").unwrap_or_default(),
+            )
+        })
+        .await
+        .unwrap_or_default();
+
+        let _ = tx.send(AppEvent::AwsProfiles(profiles)).await;
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1870,11 +2279,13 @@ mod tests {
     fn anon_profile(name: &str, url: &str, kind: RegistryType) -> RegistryProfile {
         RegistryProfile {
             name: name.to_owned(),
-            url: url.to_owned(),
+            url: Some(url.to_owned()),
             username: None,
             registry_type: kind,
             auth: AuthMode::Auto,
             owner: None,
+            aws_profile: None,
+            region: None,
         }
     }
 

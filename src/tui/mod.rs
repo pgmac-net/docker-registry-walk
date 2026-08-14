@@ -21,7 +21,7 @@ pub async fn run(mut profiles: Vec<RegistryProfile>, initial_idx: usize) -> anyh
     if profiles.is_empty() {
         profiles.push(RegistryProfile {
             name: "local".to_owned(),
-            url: "http://localhost:5000".to_owned(),
+            url: Some("http://localhost:5000".to_owned()),
             username: None,
             registry_type: Default::default(),
             ..Default::default()

@@ -3,6 +3,7 @@
 
 mod auth;
 mod client;
+pub mod ecr;
 mod error;
 mod ghcr;
 mod pagination;
@@ -10,9 +11,9 @@ mod search;
 mod types;
 
 pub use auth::{
-    AccessTokenCredentials, BasicCredentials, BearerCredentials, GhcrCredentials, KeyringStore,
-    Secret, TOKEN_ACCOUNT, prompt_password, prompt_secret, resolve_access_token, resolve_secret,
-    sanitize_pasted_token,
+    AccessTokenCredentials, BasicCredentials, BearerCredentials, EcrCredentials, GhcrCredentials,
+    KeyringStore, Secret, TOKEN_ACCOUNT, prompt_password, prompt_secret, resolve_access_token,
+    resolve_secret, sanitize_pasted_token,
 };
 pub use client::{Credentials, NoCredentials, RegistryClient};
 pub use error::{RegistryError, Result};
