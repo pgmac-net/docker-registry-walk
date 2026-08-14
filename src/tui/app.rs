@@ -7,6 +7,7 @@ use crate::clipboard;
 use crate::config::RegistryProfile;
 use crate::ops::diff::DiffLayer;
 use crate::registry::ArtifactoryRepo;
+use crate::registry::ecr::{AWS_REGIONS, AwsProfile};
 
 use super::detail::ImageDetail;
 use super::input::InputState;
@@ -312,9 +313,11 @@ pub enum HelpContext {
     SearchPicker,
     /// Artifactory repo-keys or GHCR packages: fetched once, filtered locally.
     FilterPicker,
-    /// GHCR owner picker: like `FilterPicker`, but any typed value is also
-    /// selectable, which is worth calling out on its own.
-    OwnerPicker,
+    /// A picker where any typed value is also selectable, not just the
+    /// suggestions — the GHCR owner picker and both ECR pickers. Worth its own
+    /// context because "type something that isn't listed" is the one binding a
+    /// `FilterPicker` does not have.
+    ChoicePicker,
     RegistrySelect,
     LayerDiff,
 }
@@ -329,7 +332,9 @@ pub fn help_context_for(modal: &Modal, focus: Focus) -> HelpContext {
         Modal::Inspect(_) => HelpContext::Inspect,
         Modal::SearchPicker { .. } => HelpContext::SearchPicker,
         Modal::ArtifactoryPicker { .. } | Modal::GhcrPicker { .. } => HelpContext::FilterPicker,
-        Modal::GhcrOwnerPicker { .. } => HelpContext::OwnerPicker,
+        Modal::GhcrOwnerPicker { .. }
+        | Modal::EcrProfilePicker { .. }
+        | Modal::EcrRegionPicker { .. } => HelpContext::ChoicePicker,
         Modal::RegistrySelect { .. } => HelpContext::RegistrySelect,
         Modal::LayerDiff(_) => HelpContext::LayerDiff,
         // Confirm, Input and Help itself have no keybinding context of their
@@ -394,25 +399,50 @@ pub enum Modal {
     /// `owners` is only ever a suggestion list; the typed input is always
     /// offered as a choice too, so an owner nobody could enumerate (an org the
     /// token cannot see, or any account at all when browsing anonymously)
-    /// stays reachable. See [`ghcr_owner_choices`].
+    /// stays reachable. See [`picker_choices`].
     GhcrOwnerPicker {
         input: InputState,
         owners: Vec<String>,
         selected: usize,
         loading: bool,
     },
+    /// Pick which AWS named profile an ECR registry is browsed as — the first
+    /// of ECR's two switchable axes, and the one that decides the account.
+    ///
+    /// Suggestions are parsed from the user's AWS config files; as with
+    /// [`Modal::GhcrOwnerPicker`], the typed value is always selectable too, so
+    /// a profile defined somewhere this does not look at (or supplied purely
+    /// through the environment) stays reachable.
+    EcrProfilePicker {
+        input: InputState,
+        profiles: Vec<String>,
+        selected: usize,
+    },
+    /// Pick which region's registry to browse — the second axis, opened once a
+    /// profile has been chosen.
+    ///
+    /// `aws_profile` is the pick being carried over from
+    /// [`Modal::EcrProfilePicker`]: an ECR registry is an account *and* a
+    /// region, so neither is applied until both are known. Not shown at all for
+    /// ECR Public, which is a single global registry.
+    EcrRegionPicker {
+        input: InputState,
+        regions: Vec<String>,
+        selected: usize,
+        aws_profile: Option<String>,
+    },
 }
 
 /// One row of the GHCR owner picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OwnerChoice {
+pub enum PickerChoice {
     /// The text the user typed, offered because it matches no known owner.
     Typed(String),
     /// A suggestion fetched from the GitHub API, or one seen earlier.
     Listed(String),
 }
 
-impl OwnerChoice {
+impl PickerChoice {
     /// What the row shows. The typed row is labelled rather than shown bare so
     /// it reads as an action instead of looking like another suggestion.
     pub fn label(&self) -> String {
@@ -430,32 +460,67 @@ impl OwnerChoice {
     }
 }
 
-/// The owner picker's rows for a given input and suggestion list.
+/// A choice picker's rows for a given input and suggestion list — the GHCR
+/// owner picker and both ECR pickers.
 ///
 /// Pure, and the single source of truth for both rendering and selection —
 /// computing the rows twice is how a picker ends up opening the row above the
 /// one that was highlighted.
 ///
 /// The typed value leads the list whenever it is non-empty and doesn't already
-/// name a suggestion, so `Enter` on a freshly typed owner does the obvious
+/// name a suggestion, so `Enter` on a freshly typed value does the obvious
 /// thing. Suppressing it on an exact (case-insensitive) match avoids offering
-/// `Use "pgmac"` directly above `pgmac`.
-pub fn ghcr_owner_choices(input: &str, owners: &[String]) -> Vec<OwnerChoice> {
+/// `Use "pgmac"` directly above `pgmac` — and in that case the exact match is
+/// hoisted to the top instead, because the filter is a *substring* match and
+/// would otherwise rank a longer name first: typing the full name `pgmac` and
+/// pressing Enter would select `aerofit-pgmac`, which merely contains it.
+pub fn picker_choices(input: &str, owners: &[String]) -> Vec<PickerChoice> {
     let typed = input.trim();
     let needle = typed.to_lowercase();
 
+    let exact = owners.iter().find(|o| o.to_lowercase() == needle);
+
     let mut rows = Vec::new();
-    if !typed.is_empty() && !owners.iter().any(|o| o.to_lowercase() == needle) {
-        rows.push(OwnerChoice::Typed(typed.to_owned()));
+    match exact {
+        Some(matched) if !typed.is_empty() => rows.push(PickerChoice::Listed(matched.clone())),
+        _ if !typed.is_empty() => rows.push(PickerChoice::Typed(typed.to_owned())),
+        _ => {}
     }
     rows.extend(
         owners
             .iter()
             .filter(|o| needle.is_empty() || o.to_lowercase().contains(&needle))
+            .filter(|o| exact.is_none_or(|matched| *o != matched))
             .cloned()
-            .map(OwnerChoice::Listed),
+            .map(PickerChoice::Listed),
     );
     rows
+}
+
+/// Region suggestions for the ECR region picker.
+///
+/// The two regions that are actually likely lead the list — the one already in
+/// use, then the chosen AWS profile's configured default — followed by the
+/// static [`AWS_REGIONS`] catalogue with those two removed so neither appears
+/// twice. Pure, so the ordering is testable without a picker.
+pub fn ecr_region_suggestions(profile_region: Option<&str>, current: Option<&str>) -> Vec<String> {
+    let mut regions: Vec<String> = Vec::new();
+
+    for preferred in [current, profile_region].into_iter().flatten() {
+        if !preferred.is_empty() && !regions.iter().any(|r| r == preferred) {
+            regions.push(preferred.to_owned());
+        }
+    }
+
+    let preferred = regions.clone();
+    regions.extend(
+        AWS_REGIONS
+            .iter()
+            .filter(|r| !preferred.iter().any(|seen| seen == *r))
+            .map(|r| (*r).to_owned()),
+    );
+
+    regions
 }
 
 #[derive(Debug, Clone)]
@@ -586,6 +651,19 @@ pub struct App {
     ghcr_package_cache: HashMap<(String, Option<String>), Vec<String>>,
     /// Last-fetched owner suggestions per GHCR profile (by profile name).
     ghcr_owner_cache: HashMap<String, Vec<String>>,
+    /// Last-fetched repository list per ECR profile **and AWS target**.
+    ///
+    /// Keyed `(profile, aws_profile, region)` for the same reason
+    /// `ghcr_package_cache` is keyed by owner: both axes are switchable at
+    /// runtime, so a cache keyed by profile name alone would serve the previous
+    /// account's repositories after a switch — which presents as an AWS or
+    /// permissions fault rather than as the cache bug it is. A tuple, not a
+    /// `#`-joined string, to stay clear of the client-cache separator.
+    ecr_repo_cache: HashMap<(String, Option<String>, Option<String>), Vec<String>>,
+    /// AWS named profiles parsed from the user's config files, cached for the
+    /// life of the session — they are read from disk, not fetched, and do not
+    /// change under a running TUI often enough to be worth re-reading.
+    aws_profile_cache: Vec<AwsProfile>,
 }
 
 impl App {
@@ -597,7 +675,10 @@ impl App {
             .get(idx)
             .map(|p| p.name.clone())
             .unwrap_or_default();
-        let registry_url = profiles.get(idx).map(|p| p.url.clone()).unwrap_or_default();
+        let registry_url = profiles
+            .get(idx)
+            .map(|p| p.display_url())
+            .unwrap_or_default();
         Self {
             focus: Focus::Repos,
             filter_mode: None,
@@ -635,6 +716,8 @@ impl App {
             current_artifactory_repo_key: None,
             ghcr_package_cache: HashMap::new(),
             ghcr_owner_cache: HashMap::new(),
+            ecr_repo_cache: HashMap::new(),
+            aws_profile_cache: Vec::new(),
         }
     }
 
@@ -772,7 +855,7 @@ impl App {
         self.active_profile_idx = idx;
         let profile = &self.profiles[idx];
         self.registry_name = profile.name.clone();
-        self.registry_url = profile.url.clone();
+        self.registry_url = profile.display_url();
         self.reset_for_new_registry();
         self.repo_load = LoadState::Loading;
     }
@@ -823,7 +906,7 @@ impl App {
         self.active_profile_idx = idx;
         let profile = &self.profiles[idx];
         self.registry_name = profile.name.clone();
-        self.registry_url = profile.url.clone();
+        self.registry_url = profile.display_url();
         self.reset_for_new_registry();
         self.repo_load = LoadState::Idle;
         self.modal = Modal::ArtifactoryPicker {
@@ -911,7 +994,7 @@ impl App {
         self.active_profile_idx = idx;
         let profile = &self.profiles[idx];
         self.registry_name = profile.name.clone();
-        self.registry_url = profile.url.clone();
+        self.registry_url = profile.display_url();
         self.reset_for_new_registry();
         // Loading, not Idle: the same fetch fills the Repos pane behind the
         // picker, so the pane must not read as an empty result until it lands.
@@ -1084,11 +1167,11 @@ impl App {
     }
 
     /// The owner picker's rows for its current input.
-    pub fn ghcr_owner_rows(&self) -> Vec<OwnerChoice> {
+    pub fn ghcr_owner_rows(&self) -> Vec<PickerChoice> {
         let Modal::GhcrOwnerPicker { input, owners, .. } = &self.modal else {
             return Vec::new();
         };
-        ghcr_owner_choices(&input.buffer, owners)
+        picker_choices(&input.buffer, owners)
     }
 
     /// Point the active GHCR profile at `owner` and start over beneath it.
@@ -1113,6 +1196,201 @@ impl App {
             selected: 0,
             loading: true,
         };
+    }
+
+    // ------------------------------------------------------------------
+    // AWS ECR
+    // ------------------------------------------------------------------
+
+    /// Cache key for the active profile's repository list: the profile, plus
+    /// both halves of the AWS target it is currently pointed at.
+    fn ecr_cache_key(&self) -> (String, Option<String>, Option<String>) {
+        let profile = &self.profiles[self.active_profile_idx];
+        (
+            profile.name.clone(),
+            profile.aws_profile.clone(),
+            profile.region.clone(),
+        )
+    }
+
+    /// Switch to an ECR profile.
+    ///
+    /// Unlike GHCR, no picker opens: an ECR repository list is an ordinary flat
+    /// catalog, just fetched from AWS rather than `/v2/_catalog`, so it belongs
+    /// in the Repos pane and nowhere else. Any cached list is shown immediately
+    /// so a re-switch is not a blank pane behind a spinner.
+    pub fn start_ecr_switch(&mut self, idx: usize) {
+        self.active_profile_idx = idx;
+        let profile = &self.profiles[idx];
+        self.registry_name = profile.name.clone();
+        self.registry_url = profile.display_url();
+        self.reset_for_new_registry();
+        self.repo_load = LoadState::Loading;
+
+        let cached = self
+            .ecr_repo_cache
+            .get(&self.ecr_cache_key())
+            .cloned()
+            .unwrap_or_default();
+        if !cached.is_empty() {
+            self.on_repos_page(cached, false);
+            self.repo_load = LoadState::Loading;
+        }
+    }
+
+    /// Fill in the registry endpoint and repository list once AWS answers.
+    ///
+    /// `registry_url` arrives with the repositories because both come from the
+    /// same connect: an ECR hostname embeds the account ID, so until
+    /// `GetAuthorizationToken` returns there is nothing truthful to show in the
+    /// title bar.
+    pub fn on_ecr_connected(&mut self, registry_url: String, repos: Vec<String>) {
+        self.registry_url = registry_url;
+        self.ecr_repo_cache
+            .insert(self.ecr_cache_key(), repos.clone());
+        // `has_more = false`: the SDK paginator is drained inside the fetch, so
+        // there is no cursor for the Repos pane to continue from.
+        self.on_repos_page(repos, false);
+    }
+
+    /// Report a failed ECR connect.
+    ///
+    /// Hands over to the same browse-by-name fallback a missing catalog uses.
+    /// That is not merely a graceful failure: `ecr:DescribeRepositories` and
+    /// `ecr:GetAuthorizationToken` are separate permissions, so an identity
+    /// that can pull images but not enumerate them lands here with browsing
+    /// still perfectly possible by typing a name.
+    pub fn on_ecr_error(&mut self, msg: String) {
+        self.modal = Modal::None;
+        self.on_repos_error(msg, true);
+    }
+
+    /// Open the AWS profile picker, the first stage of an ECR target switch.
+    ///
+    /// Leaves repo/tag/detail state alone: nothing changes until both stages
+    /// are confirmed, so `Esc` returns to browsing exactly as it was.
+    pub fn open_ecr_profile_picker(&mut self) {
+        let suggestions = self.aws_profile_names();
+        let current = self.profiles[self.active_profile_idx].aws_profile.clone();
+        let selected = current
+            .as_deref()
+            .and_then(|c| suggestions.iter().position(|p| p == c))
+            .unwrap_or(0);
+
+        self.modal = Modal::EcrProfilePicker {
+            input: InputState::default(),
+            profiles: suggestions,
+            selected,
+        };
+    }
+
+    /// Suggestions for the profile picker: the parsed AWS config, plus the
+    /// profile currently in use if it was not among them.
+    fn aws_profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .aws_profile_cache
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        if let Some(current) = &self.profiles[self.active_profile_idx].aws_profile
+            && !names.iter().any(|n| n == current)
+        {
+            names.insert(0, current.clone());
+        }
+        names
+    }
+
+    /// Record the AWS profiles read from disk.
+    pub fn on_aws_profiles(&mut self, profiles: Vec<AwsProfile>) {
+        self.aws_profile_cache = profiles;
+
+        // Refresh an already-open picker in place: the read is fast enough that
+        // the picker usually opens first.
+        if let Modal::EcrProfilePicker {
+            profiles: p,
+            selected,
+            ..
+        } = &mut self.modal
+        {
+            *p = self
+                .aws_profile_cache
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect();
+            let len = p.len();
+            *selected = if len == 0 {
+                0
+            } else {
+                (*selected).min(len - 1)
+            };
+        }
+    }
+
+    /// The profile picker's rows for its current input.
+    pub fn ecr_profile_rows(&self) -> Vec<PickerChoice> {
+        let Modal::EcrProfilePicker {
+            input, profiles, ..
+        } = &self.modal
+        else {
+            return Vec::new();
+        };
+        picker_choices(&input.buffer, profiles)
+    }
+
+    /// Open the region picker, carrying the AWS profile just chosen.
+    ///
+    /// The chosen profile's own configured region leads the suggestions, since
+    /// it is overwhelmingly the one wanted; the rest of the static region list
+    /// follows, and any region can still be typed.
+    pub fn open_ecr_region_picker(&mut self, aws_profile: Option<String>) {
+        let profile_region = aws_profile.as_deref().and_then(|name| {
+            self.aws_profile_cache
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| p.region.clone())
+        });
+        let current = self.profiles[self.active_profile_idx].region.clone();
+
+        let regions = ecr_region_suggestions(profile_region.as_deref(), current.as_deref());
+        let selected = current
+            .as_deref()
+            .or(profile_region.as_deref())
+            .and_then(|r| regions.iter().position(|candidate| candidate == r))
+            .unwrap_or(0);
+
+        self.modal = Modal::EcrRegionPicker {
+            input: InputState::default(),
+            regions,
+            selected,
+            aws_profile,
+        };
+    }
+
+    /// The region picker's rows for its current input.
+    pub fn ecr_region_rows(&self) -> Vec<PickerChoice> {
+        let Modal::EcrRegionPicker { input, regions, .. } = &self.modal else {
+            return Vec::new();
+        };
+        picker_choices(&input.buffer, regions)
+    }
+
+    /// Point the active ECR profile at a new account and region, and start over
+    /// beneath it.
+    ///
+    /// In-memory only, like [`Self::apply_ghcr_owner`] — the app never writes
+    /// `config.toml`.
+    pub fn apply_ecr_target(&mut self, aws_profile: Option<String>, region: Option<String>) {
+        {
+            let profile = &mut self.profiles[self.active_profile_idx];
+            profile.aws_profile = aws_profile;
+            profile.region = region;
+            // The endpoint belonged to the *previous* account, so it must not
+            // outlive the switch in the title bar.
+            profile.url = None;
+        }
+        self.modal = Modal::None;
+        let idx = self.active_profile_idx;
+        self.start_ecr_switch(idx);
     }
 
     /// The picker's package list filtered by its current filter buffer
@@ -1566,7 +1844,7 @@ mod tests {
     fn make_app() -> App {
         let profile = RegistryProfile {
             name: "test".to_owned(),
-            url: "http://localhost:5000".to_owned(),
+            url: Some("http://localhost:5000".to_owned()),
             username: None,
             registry_type: RegistryType::Standard,
             ..Default::default()
@@ -1684,14 +1962,14 @@ mod tests {
     fn start_registry_switch_resets_all() {
         let profile_a = RegistryProfile {
             name: "a".to_owned(),
-            url: "http://a:5000".to_owned(),
+            url: Some("http://a:5000".to_owned()),
             username: None,
             registry_type: RegistryType::Standard,
             ..Default::default()
         };
         let profile_b = RegistryProfile {
             name: "b".to_owned(),
-            url: "http://b:5000".to_owned(),
+            url: Some("http://b:5000".to_owned()),
             username: None,
             registry_type: RegistryType::Standard,
             ..Default::default()
@@ -1724,7 +2002,7 @@ mod tests {
     fn start_artifactory_switch_opens_loading_picker() {
         let profile = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: None,
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -1742,7 +2020,7 @@ mod tests {
     fn on_artifactory_repos_fills_picker_and_clears_loading() {
         let profile = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: None,
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -1763,7 +2041,7 @@ mod tests {
     fn artifactory_filtered_repos_matches_substring_case_insensitive() {
         let profile = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: None,
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -1789,7 +2067,7 @@ mod tests {
     fn enter_artifactory_repo_closes_modal_and_resets_state() {
         let profile = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: None,
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -1813,7 +2091,7 @@ mod tests {
     fn restart_catalog_load_preserves_artifactory_repo_key() {
         let profile = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: None,
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -1853,7 +2131,7 @@ mod tests {
     fn app_inside_artifactory_repo() -> App {
         let profile = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: None,
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -1922,7 +2200,7 @@ mod tests {
     fn open_artifactory_picker_cached_empty_cache_opens_loading() {
         let profile = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: None,
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -2180,7 +2458,7 @@ mod tests {
     fn catalog_attempt_defaults_to_initial() {
         let profile = RegistryProfile {
             name: "local".to_owned(),
-            url: "http://localhost:5000".to_owned(),
+            url: Some("http://localhost:5000".to_owned()),
             username: None,
             registry_type: RegistryType::Standard,
             ..Default::default()
@@ -2197,14 +2475,14 @@ mod tests {
         let profiles = vec![
             RegistryProfile {
                 name: "a".to_owned(),
-                url: "http://a.example.com".to_owned(),
+                url: Some("http://a.example.com".to_owned()),
                 username: None,
                 registry_type: RegistryType::Standard,
                 ..Default::default()
             },
             RegistryProfile {
                 name: "b".to_owned(),
-                url: "http://b.example.com".to_owned(),
+                url: Some("http://b.example.com".to_owned()),
                 username: None,
                 registry_type: RegistryType::Standard,
                 ..Default::default()
@@ -2246,10 +2524,194 @@ mod tests {
     // GHCR package picker
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // AWS ECR
+    // -----------------------------------------------------------------------
+
+    fn make_ecr_app() -> App {
+        let profile = RegistryProfile {
+            name: "ecr".to_owned(),
+            registry_type: RegistryType::Ecr,
+            aws_profile: Some("pgmac".to_owned()),
+            region: Some("ap-southeast-2".to_owned()),
+            ..Default::default()
+        };
+        App::new(vec![profile], 0)
+    }
+
+    /// The registry endpoint is not known until AWS answers, so the title bar
+    /// must say what is being resolved rather than show a blank.
+    #[test]
+    fn an_ecr_switch_shows_the_aws_target_until_the_endpoint_resolves() {
+        let mut app = make_ecr_app();
+        app.start_ecr_switch(0);
+
+        assert_eq!(app.registry_url, "ecr (pgmac / ap-southeast-2)");
+        assert!(matches!(app.repo_load, LoadState::Loading));
+
+        app.on_ecr_connected(
+            "https://1.dkr.ecr.ap-southeast-2.amazonaws.com".to_owned(),
+            vec!["team/api".to_owned()],
+        );
+
+        assert_eq!(
+            app.registry_url,
+            "https://1.dkr.ecr.ap-southeast-2.amazonaws.com"
+        );
+        assert_eq!(app.repos, vec!["team/api".to_owned()]);
+        assert!(matches!(app.repo_load, LoadState::Idle));
+    }
+
+    /// The cache-key test: keyed by profile name alone, a target switch would
+    /// serve the previous account's repositories, which reads as an AWS fault
+    /// rather than a cache bug.
+    #[test]
+    fn changing_the_aws_target_does_not_serve_the_previous_accounts_repos() {
+        let mut app = make_ecr_app();
+        app.start_ecr_switch(0);
+        app.on_ecr_connected(
+            "https://1.dkr.ecr.ap-southeast-2.amazonaws.com".to_owned(),
+            vec!["account-one/app".to_owned()],
+        );
+
+        app.apply_ecr_target(Some("other".to_owned()), Some("us-east-1".to_owned()));
+
+        assert!(
+            app.repos.is_empty(),
+            "expected no repos for the new target, got {:?}",
+            app.repos
+        );
+        assert!(matches!(app.repo_load, LoadState::Loading));
+
+        // Returning to the first target serves its cached list again.
+        app.apply_ecr_target(Some("pgmac".to_owned()), Some("ap-southeast-2".to_owned()));
+        assert_eq!(app.repos, vec!["account-one/app".to_owned()]);
+    }
+
+    /// A stale endpoint outliving a target switch would show the old account's
+    /// hostname in the title bar while browsing the new one.
+    #[test]
+    fn switching_target_clears_the_resolved_endpoint() {
+        let mut app = make_ecr_app();
+        app.on_ecr_connected(
+            "https://1.dkr.ecr.ap-southeast-2.amazonaws.com".to_owned(),
+            Vec::new(),
+        );
+        app.profiles[0].url = Some("https://1.dkr.ecr.ap-southeast-2.amazonaws.com".to_owned());
+
+        app.apply_ecr_target(Some("other".to_owned()), Some("us-east-1".to_owned()));
+
+        assert!(app.profiles[0].url.is_none());
+        assert_eq!(app.registry_url, "ecr (other / us-east-1)");
+    }
+
+    /// `DescribeRepositories` and `GetAuthorizationToken` are separate
+    /// permissions, so an identity that can pull but not enumerate must still
+    /// be able to browse by typing a name.
+    #[test]
+    fn an_ecr_failure_offers_browse_by_name_and_never_a_credential_prompt() {
+        let mut app = make_ecr_app();
+        app.start_ecr_switch(0);
+
+        app.on_ecr_error("AccessDeniedException: ecr:DescribeRepositories".to_owned());
+
+        match &app.modal {
+            Modal::Input { prompt, .. } => assert!(prompt.contains("repo name"), "{prompt}"),
+            other => panic!("expected the browse-by-name input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_profile_picker_offers_the_typed_value_and_the_parsed_suggestions() {
+        let mut app = make_ecr_app();
+        app.on_aws_profiles(vec![
+            AwsProfile {
+                name: "default".to_owned(),
+                region: Some("ap-southeast-2".to_owned()),
+            },
+            AwsProfile {
+                name: "pgmac".to_owned(),
+                region: Some("us-east-1".to_owned()),
+            },
+        ]);
+        app.open_ecr_profile_picker();
+
+        // No input yet: suggestions only, with the profile in use highlighted.
+        assert_eq!(
+            app.ecr_profile_rows(),
+            vec![
+                PickerChoice::Listed("default".to_owned()),
+                PickerChoice::Listed("pgmac".to_owned()),
+            ]
+        );
+        let Modal::EcrProfilePicker { selected, .. } = &app.modal else {
+            panic!("expected Modal::EcrProfilePicker");
+        };
+        assert_eq!(*selected, 1, "the profile in use should be highlighted");
+
+        if let Modal::EcrProfilePicker { input, .. } = &mut app.modal {
+            input.buffer = "sandbox".to_owned();
+        }
+        assert_eq!(
+            app.ecr_profile_rows().first(),
+            Some(&PickerChoice::Typed("sandbox".to_owned())),
+            "a profile that is not in ~/.aws/config must still be reachable"
+        );
+    }
+
+    /// The region picker is the second half of one choice, so it has to carry
+    /// the profile forward — applying the region alone would point the registry
+    /// at a new region of the *old* account.
+    #[test]
+    fn the_region_picker_carries_the_chosen_profile() {
+        let mut app = make_ecr_app();
+        app.on_aws_profiles(vec![AwsProfile {
+            name: "sandbox".to_owned(),
+            region: Some("eu-west-1".to_owned()),
+        }]);
+
+        app.open_ecr_region_picker(Some("sandbox".to_owned()));
+
+        let Modal::EcrRegionPicker {
+            aws_profile,
+            regions,
+            ..
+        } = &app.modal
+        else {
+            panic!("expected Modal::EcrRegionPicker");
+        };
+        assert_eq!(aws_profile.as_deref(), Some("sandbox"));
+        // The region in use leads, then the chosen profile's own default.
+        assert_eq!(regions[0], "ap-southeast-2");
+        assert_eq!(regions[1], "eu-west-1");
+    }
+
+    #[test]
+    fn region_suggestions_put_the_likely_ones_first_without_duplicating_them() {
+        let regions = ecr_region_suggestions(Some("eu-west-1"), Some("us-east-1"));
+
+        assert_eq!(regions[0], "us-east-1");
+        assert_eq!(regions[1], "eu-west-1");
+        assert_eq!(
+            regions.iter().filter(|r| *r == "us-east-1").count(),
+            1,
+            "a preferred region must not also appear in the static list"
+        );
+        assert!(regions.contains(&"ap-southeast-2".to_owned()));
+    }
+
+    #[test]
+    fn region_suggestions_fall_back_to_the_static_list() {
+        let regions = ecr_region_suggestions(None, None);
+
+        assert_eq!(regions.len(), AWS_REGIONS.len());
+        assert_eq!(regions[0], AWS_REGIONS[0]);
+    }
+
     fn make_ghcr_app() -> App {
         let profile = RegistryProfile {
             name: "ghcr".to_owned(),
-            url: "https://ghcr.io".to_owned(),
+            url: Some("https://ghcr.io".to_owned()),
             registry_type: RegistryType::Ghcr,
             ..Default::default()
         };
@@ -2399,8 +2861,8 @@ mod tests {
     /// obvious thing.
     #[test]
     fn ghcr_owner_choices_offers_the_typed_owner_first() {
-        let rows = ghcr_owner_choices("rust-lang", &owners());
-        assert_eq!(rows[0], OwnerChoice::Typed("rust-lang".to_owned()));
+        let rows = picker_choices("rust-lang", &owners());
+        assert_eq!(rows[0], PickerChoice::Typed("rust-lang".to_owned()));
         assert_eq!(rows[0].label(), r#"Use "rust-lang""#);
         assert_eq!(rows[0].owner(), "rust-lang");
     }
@@ -2410,31 +2872,54 @@ mod tests {
     #[test]
     fn ghcr_owner_choices_suppresses_the_typed_row_on_an_exact_match() {
         for typed in ["pgmac", "PGMAC", "  pgmac  "] {
-            let rows = ghcr_owner_choices(typed, &owners());
+            let rows = picker_choices(typed, &owners());
             assert!(
-                rows.iter().all(|r| matches!(r, OwnerChoice::Listed(_))),
+                rows.iter().all(|r| matches!(r, PickerChoice::Listed(_))),
                 "{typed:?} names a known owner, so no typed row"
             );
         }
     }
 
+    /// The filter is a substring match, so a longer name containing the typed
+    /// one would otherwise be ranked above it — typing a full name and pressing
+    /// Enter would then open a different entry entirely.
+    #[test]
+    fn an_exact_match_outranks_a_longer_name_that_merely_contains_it() {
+        let suggestions = vec![
+            "aerofit-pgmac".to_owned(),
+            "pgmac".to_owned(),
+            "pgmac-net".to_owned(),
+        ];
+
+        let rows = picker_choices("pgmac", &suggestions);
+
+        assert_eq!(rows[0], PickerChoice::Listed("pgmac".to_owned()));
+        // The others stay available, just below.
+        assert!(rows.contains(&PickerChoice::Listed("aerofit-pgmac".to_owned())));
+        assert_eq!(
+            rows.iter().filter(|r| r.owner() == "pgmac").count(),
+            1,
+            "the hoisted match must not also appear in the filtered tail"
+        );
+    }
+
     #[test]
     fn ghcr_owner_choices_filters_suggestions_case_insensitively() {
-        let rows = ghcr_owner_choices("HOME", &owners());
+        let rows = picker_choices("HOME", &owners());
         assert_eq!(
             rows,
             vec![
-                OwnerChoice::Typed("HOME".to_owned()),
-                OwnerChoice::Listed("Homebrew".to_owned()),
+                PickerChoice::Typed("HOME".to_owned()),
+                PickerChoice::Listed("Homebrew".to_owned()),
             ]
         );
     }
 
     #[test]
     fn ghcr_owner_choices_lists_everything_when_empty() {
-        let rows = ghcr_owner_choices("", &owners());
+        let rows = picker_choices("", &owners());
         assert_eq!(rows.len(), 3);
-        assert!(rows.iter().all(|r| matches!(r, OwnerChoice::Listed(_))));
+        assert!(rows.iter().all(|r| matches!(r, PickerChoice::Listed(_))));
     }
 
     fn selected_owner(app: &App) -> &str {
@@ -2487,7 +2972,7 @@ mod tests {
 
         assert_eq!(
             app.ghcr_owner_rows().first(),
-            Some(&OwnerChoice::Typed("rust-lang".to_owned()))
+            Some(&PickerChoice::Typed("rust-lang".to_owned()))
         );
         let Modal::GhcrOwnerPicker { selected, .. } = &app.modal else {
             panic!("expected Modal::GhcrOwnerPicker");
@@ -2506,7 +2991,7 @@ mod tests {
 
         assert_eq!(
             app.ghcr_owner_rows(),
-            vec![OwnerChoice::Listed("Homebrew".to_owned())]
+            vec![PickerChoice::Listed("Homebrew".to_owned())]
         );
     }
 
@@ -2663,8 +3148,32 @@ mod tests {
                 },
                 Focus::Repos
             ),
-            HelpContext::OwnerPicker,
+            HelpContext::ChoicePicker,
             "the owner picker gets its own context, not FilterPicker's"
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::EcrProfilePicker {
+                    input: InputState::default(),
+                    profiles: Vec::new(),
+                    selected: 0,
+                },
+                Focus::Repos
+            ),
+            HelpContext::ChoicePicker,
+            "both ECR pickers share the owner picker's context — same bindings"
+        );
+        assert_eq!(
+            help_context_for(
+                &Modal::EcrRegionPicker {
+                    input: InputState::default(),
+                    regions: Vec::new(),
+                    selected: 0,
+                    aws_profile: None,
+                },
+                Focus::Repos
+            ),
+            HelpContext::ChoicePicker
         );
         assert_eq!(
             help_context_for(&Modal::RegistrySelect { selected_idx: 0 }, Focus::Repos),

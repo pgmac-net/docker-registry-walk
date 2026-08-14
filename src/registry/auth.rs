@@ -554,6 +554,124 @@ impl Credentials for GhcrCredentials {
 }
 
 // ---------------------------------------------------------------------------
+// AWS ECR
+// ---------------------------------------------------------------------------
+
+/// AWS Elastic Container Registry credentials.
+///
+/// **This is the exact opposite of [`GhcrCredentials`], and the contrast is
+/// deliberate.** GHCR must send nothing up front because a raw credential
+/// earns a terminal 403; ECR accepts HTTP Basic on `/v2/` directly, so the
+/// credential is sent on every request and no challenge round trip is needed.
+/// Do not "unify" the two — each is shaped by how its registry answers an
+/// unsolicited credential.
+///
+/// What is unusual here is not *how* the credential is sent but where it comes
+/// from: `ecr:GetAuthorizationToken` mints it from the AWS credential chain,
+/// and it expires in about twelve hours. So unlike [`BasicCredentials`], which
+/// is a precomputed constant, this type owns a refresh: the cached token is
+/// re-minted once it is inside [`EXPIRY_SKEW`] of expiring. That cache is
+/// global rather than per-scope — legitimately, because an ECR authorization
+/// token is *registry*-wide, not repository-scoped, so there is no Docker Hub
+/// style scope cascade to reproduce.
+///
+/// The AWS SDK does its own credential resolution, retry and caching beneath
+/// this, which is why a failure here is reported rather than retried.
+pub struct EcrCredentials {
+    target: crate::registry::ecr::EcrTarget,
+    public: bool,
+    cached: Mutex<Option<crate::registry::ecr::EcrAuthorization>>,
+}
+
+impl EcrCredentials {
+    /// `authorization` is the token already minted while resolving the
+    /// registry's endpoint — the connect path has one in hand, and reusing it
+    /// saves a redundant `GetAuthorizationToken` on the first request.
+    pub fn new(
+        target: crate::registry::ecr::EcrTarget,
+        public: bool,
+        authorization: Option<crate::registry::ecr::EcrAuthorization>,
+    ) -> Self {
+        Self {
+            target,
+            public,
+            cached: Mutex::new(authorization),
+        }
+    }
+}
+
+#[async_trait]
+impl Credentials for EcrCredentials {
+    async fn get_authorization(&self, _http: &Client) -> Option<String> {
+        let mut cached = self.cached.lock().await;
+
+        if let Some(auth) = cached.as_ref()
+            && auth.is_valid_at(std::time::SystemTime::now())
+        {
+            return Some(auth.header_value());
+        }
+
+        let minted = if self.public {
+            crate::registry::ecr::authorize_public(&self.target).await
+        } else {
+            crate::registry::ecr::authorize(&self.target).await
+        };
+
+        // A failed refresh degrades to an anonymous request rather than an
+        // error: for ECR Public that is a working anonymous pull, and for a
+        // private registry it produces the 401 the TUI already knows how to
+        // report.
+        let minted = minted.ok()?;
+        let header = minted.header_value();
+        *cached = Some(minted);
+        Some(header)
+    }
+
+    /// Anonymous token exchange, for ECR Public only.
+    ///
+    /// Private ECR never needs this — it accepts Basic on `/v2/`, so a 401
+    /// there means the AWS credential itself was refused and no realm exchange
+    /// can rescue it. ECR Public is different: pulling a public image needs no
+    /// AWS account at all, and that path runs entirely through the registry's
+    /// own token service. Without this, a user with no AWS credentials could
+    /// not open `public.ecr.aws/<namespace>/<image>` by name — the very thing
+    /// the empty repository list is supposed to leave possible.
+    ///
+    /// Anonymous rather than presenting the minted token: the token, when there
+    /// is one, already went out as Basic above. Same-origin guarded like
+    /// [`GhcrCredentials`], and likewise uncached, since the minted token is
+    /// scoped to one repository.
+    async fn get_authorization_for_challenge(
+        &self,
+        http: &Client,
+        www_auth: &str,
+    ) -> Option<String> {
+        if !self.public {
+            return None;
+        }
+
+        let challenge = parse_bearer_challenge(www_auth)?;
+        let token_url = Url::parse(&challenge.realm).ok()?;
+        let registry = Url::parse(crate::registry::ecr::ECR_PUBLIC_REGISTRY_URL).ok()?;
+
+        if !is_same_origin_realm(&token_url, &registry) {
+            return None;
+        }
+
+        let (minted, _ttl) = exchange_with_scope_fallback(
+            http,
+            &token_url,
+            challenge.service.as_deref(),
+            challenge.scope.as_deref(),
+            RealmAuth::Anonymous,
+        )
+        .await?;
+
+        Some(bearer_header(&minted))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WWW-Authenticate parser
 // ---------------------------------------------------------------------------
 
@@ -1290,6 +1408,32 @@ mod tests {
 
         let anonymous = GhcrCredentials::new(&u("https://ghcr.io/"), None);
         assert_eq!(rt.block_on(anonymous.get_authorization(&http)), None);
+    }
+
+    /// The counterpart to the GHCR test above, and the reason the two types are
+    /// not merged: ECR accepts Basic on `/v2/` directly, so a token already in
+    /// hand is sent eagerly rather than withheld for a challenge.
+    #[test]
+    fn ecr_credentials_send_the_minted_token_as_basic() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let http = Client::new();
+
+        let creds = EcrCredentials::new(
+            crate::registry::ecr::EcrTarget::new(Some("pgmac".to_owned()), None),
+            false,
+            Some(crate::registry::ecr::EcrAuthorization {
+                registry_url: "https://1.dkr.ecr.ap-southeast-2.amazonaws.com".to_owned(),
+                authorization_token: "QVdTOnB3".to_owned(),
+                // Far enough out that the skew window cannot expire it.
+                expires_at: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+            }),
+        );
+
+        assert_eq!(
+            rt.block_on(creds.get_authorization(&http)),
+            Some("Basic QVdTOnB3".to_owned()),
+            "an unexpired ECR token must be presented without a challenge"
+        );
     }
 
     /// A GitHub PAT is an account-wide credential, so it must not be offered

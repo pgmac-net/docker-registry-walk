@@ -11,8 +11,7 @@ use ratatui::{
 use crate::ops::diff::DiffStatus;
 
 use super::app::{
-    App, Focus, HelpContext, InspectModal, LoadState, Modal, OwnerChoice, SPINNER,
-    ghcr_owner_choices,
+    App, Focus, HelpContext, InspectModal, LoadState, Modal, PickerChoice, SPINNER, picker_choices,
 };
 use super::detail;
 use super::input::{InputState, cursor_spans, input_scroll_skip};
@@ -103,9 +102,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } => {
             // Rows come from the same helper the key handler selects with, so
             // the row opened is always the row highlighted.
-            let rows: Vec<String> = ghcr_owner_choices(&input.buffer, owners)
+            let rows: Vec<String> = picker_choices(&input.buffer, owners)
                 .iter()
-                .map(OwnerChoice::label)
+                .map(PickerChoice::label)
                 .collect();
             draw_filter_picker_modal(
                 frame,
@@ -136,6 +135,45 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 *selected,
                 *loading,
                 GHCR_PICKER_LABELS,
+                area,
+            );
+        }
+        Modal::EcrProfilePicker {
+            input,
+            profiles,
+            selected,
+        } => {
+            let rows: Vec<String> = picker_choices(&input.buffer, profiles)
+                .iter()
+                .map(PickerChoice::label)
+                .collect();
+            draw_filter_picker_modal(
+                frame,
+                input,
+                &rows,
+                *selected,
+                false,
+                ECR_PROFILE_PICKER_LABELS,
+                area,
+            );
+        }
+        Modal::EcrRegionPicker {
+            input,
+            regions,
+            selected,
+            ..
+        } => {
+            let rows: Vec<String> = picker_choices(&input.buffer, regions)
+                .iter()
+                .map(PickerChoice::label)
+                .collect();
+            draw_filter_picker_modal(
+                frame,
+                input,
+                &rows,
+                *selected,
+                false,
+                ECR_REGION_PICKER_LABELS,
                 area,
             );
         }
@@ -565,6 +603,18 @@ const GHCR_OWNER_PICKER_LABELS: PickerLabels = PickerLabels {
     empty: " Type an owner to browse",
 };
 
+const ECR_PROFILE_PICKER_LABELS: PickerLabels = PickerLabels {
+    title: " AWS Profile ",
+    list_title: " Profiles  [↑↓] navigate  [Enter] next  [Esc] cancel  — or type any profile ",
+    empty: " Type an AWS profile, or Enter for the default chain",
+};
+
+const ECR_REGION_PICKER_LABELS: PickerLabels = PickerLabels {
+    title: " AWS Region ",
+    list_title: " Regions  [↑↓] navigate  [Enter] browse  [⌫] back  [Esc] cancel  — or type any region ",
+    empty: " Type an AWS region",
+};
+
 const GHCR_PICKER_LABELS: PickerLabels = PickerLabels {
     title: " GHCR Packages ",
     // See the note on `ARTIFACTORY_PICKER_LABELS` — same key handler shape,
@@ -691,7 +741,7 @@ fn draw_registry_select_modal(frame: &mut Frame, app: &App, selected_idx: usize,
             } else {
                 "  "
             };
-            ListItem::new(format!("{active}[{}]  {}", p.name, p.url))
+            ListItem::new(format!("{active}[{}]  {}", p.name, p.display_url()))
         })
         .collect();
 
@@ -1136,19 +1186,26 @@ fn help_lines_filter_picker() -> Vec<Line<'static>> {
     ]
 }
 
+/// Help for the pickers where the typed value is itself a choice — GHCR's
+/// owner picker and both ECR pickers. One pane, because they share every
+/// binding; the `Use "…"` row is the thing worth explaining in all three.
 fn help_lines_owner_picker() -> Vec<Line<'static>> {
     vec![
-        help_header("GHCR Owner Picker"),
-        help_kv("type", "Filter suggestions, or enter any owner"),
+        help_header("Choice Picker"),
+        help_kv("type", "Filter suggestions, or enter any value"),
         help_kv("↑ / ↓", "Navigate"),
-        help_kv("Enter", "Browse the highlighted owner"),
+        help_kv("Enter", "Select the highlighted row"),
+        help_kv("⌫", "Region picker: back to the AWS profile picker"),
         help_kv("Esc", "Cancel"),
         help_kv("?", "This help"),
         help_blank(),
         help_kv(
             "Use \"…\"",
-            "Row offered for any owner not in the suggestion list",
+            "Row offered for any value not in the suggestion list",
         ),
+        help_blank(),
+        help_kv("GHCR", "Owner — a user or organisation"),
+        help_kv("ECR", "AWS profile, then region"),
         help_blank(),
         help_version_line(),
     ]
@@ -1190,7 +1247,7 @@ fn help_lines(context: HelpContext) -> Vec<Line<'static>> {
         HelpContext::Inspect => help_lines_inspect(),
         HelpContext::SearchPicker => help_lines_search_picker(),
         HelpContext::FilterPicker => help_lines_filter_picker(),
-        HelpContext::OwnerPicker => help_lines_owner_picker(),
+        HelpContext::ChoicePicker => help_lines_owner_picker(),
         HelpContext::RegistrySelect => help_lines_registry_select(),
         HelpContext::LayerDiff => help_lines_layer_diff(),
     }
@@ -1257,7 +1314,7 @@ mod tests {
     fn make_app() -> App {
         let profile = RegistryProfile {
             name: "test".to_owned(),
-            url: "http://localhost:5000".to_owned(),
+            url: Some("http://localhost:5000".to_owned()),
             username: None,
             registry_type: RegistryType::Standard,
             ..Default::default()
@@ -1346,7 +1403,7 @@ mod tests {
     }
 
     /// The renderer and the key handler both build rows from
-    /// `ghcr_owner_choices`, so what is drawn is what `Enter` opens. This pins
+    /// `picker_choices`, so what is drawn is what `Enter` opens. This pins
     /// that the typed row reaches the screen.
     #[test]
     fn ghcr_owner_picker_renders_the_typed_owner_and_matching_suggestions() {
@@ -1365,6 +1422,43 @@ mod tests {
             !content.contains("pgmac"),
             "non-matching suggestion filtered"
         );
+    }
+
+    #[test]
+    fn ecr_profile_picker_renders_the_typed_profile_and_matching_suggestions() {
+        let mut app = make_app();
+        app.modal = Modal::EcrProfilePicker {
+            input: input_with("pg"),
+            profiles: vec!["default".to_owned(), "pgmac".to_owned()],
+            selected: 0,
+        };
+
+        let content = render_to_string(&mut app, 100, 20);
+        assert!(content.contains("AWS Profile"), "picker title must render");
+        assert!(content.contains(r#"Use "pg""#), "typed row must render");
+        assert!(content.contains("pgmac"), "matching suggestion kept");
+        assert!(
+            !content.contains("default"),
+            "non-matching suggestion filtered"
+        );
+    }
+
+    /// The region picker's `⌫` binding steps back to the profile picker rather
+    /// than out of the flow, which is only discoverable if it is on screen.
+    #[test]
+    fn ecr_region_picker_renders_its_back_binding() {
+        let mut app = make_app();
+        app.modal = Modal::EcrRegionPicker {
+            input: InputState::default(),
+            regions: vec!["ap-southeast-2".to_owned(), "us-east-1".to_owned()],
+            selected: 0,
+            aws_profile: Some("pgmac".to_owned()),
+        };
+
+        let content = render_to_string(&mut app, 110, 20);
+        assert!(content.contains("AWS Region"), "picker title must render");
+        assert!(content.contains("ap-southeast-2"));
+        assert!(content.contains("[⌫] back"), "back binding must be shown");
     }
 
     /// Without a `read:org` PAT the suggestion list is empty, and the picker is
@@ -1539,7 +1633,7 @@ mod tests {
             },
             Modal::Help {
                 scroll: 0,
-                context: HelpContext::OwnerPicker,
+                context: HelpContext::ChoicePicker,
             },
             Modal::Help {
                 scroll: 0,
@@ -1612,7 +1706,7 @@ mod tests {
     /// promise the same escape hatch on a picker that doesn't have one.
     #[test]
     fn only_the_owner_picker_mentions_the_typed_owner_row() {
-        let owner_content = render_to_string(&mut help_app(HelpContext::OwnerPicker), 100, 30);
+        let owner_content = render_to_string(&mut help_app(HelpContext::ChoicePicker), 100, 30);
         assert!(owner_content.contains("Use \""));
 
         let package_content = render_to_string(&mut help_app(HelpContext::FilterPicker), 100, 30);

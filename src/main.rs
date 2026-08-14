@@ -44,6 +44,16 @@ struct Cli {
     #[arg(long)]
     owner: Option<String>,
 
+    /// ECR only: AWS named profile to resolve credentials from. Omit to use
+    /// the ordinary AWS chain ($AWS_PROFILE, then `default`).
+    #[arg(long)]
+    aws_profile: Option<String>,
+
+    /// ECR only: AWS region whose registry to browse. Omit to use the chain
+    /// ($AWS_REGION, then the named profile's configured region).
+    #[arg(long)]
+    region: Option<String>,
+
     /// Prompt for the registry password (masked) and store it in the OS
     /// keyring. Takes no value — pass just `--password`, never
     /// `--password=<secret>`, so the secret never lands in shell history.
@@ -90,16 +100,25 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // An ECR registry's hostname is derived from AWS, so `--type ecr` is on its
+    // own enough to describe one — unlike every other type, which needs --url.
+    let adhoc_ecr = matches!(
+        cli.registry_type,
+        Some(RegistryType::Ecr | RegistryType::EcrPublic)
+    );
+
     // Determine active profile index.
-    let initial_idx = if let Some(url) = cli.url {
+    let initial_idx = if cli.url.is_some() || adhoc_ecr {
         // Ad-hoc profile from CLI — prepend so idx 0 is always the active one.
         let profile = RegistryProfile {
             name: "cli".to_owned(),
-            url,
+            url: cli.url.clone(),
             username: cli.username.clone(),
             registry_type: cli.registry_type.unwrap_or_default(),
             auth: cli.auth.unwrap_or_default(),
             owner: cli.owner.clone(),
+            aws_profile: cli.aws_profile.clone(),
+            region: cli.region.clone(),
         };
         config.registry.insert(0, profile);
         0

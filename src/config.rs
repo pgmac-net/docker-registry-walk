@@ -53,6 +53,32 @@ url = "http://localhost:5000"
 # url = "https://ghcr.io"
 # type = "ghcr"
 # owner = "pgmac-net"
+
+# AWS Elastic Container Registry. An ECR registry is one AWS account in one
+# region, and its hostname (<account-id>.dkr.ecr.<region>.amazonaws.com) is
+# derived at runtime — so `url` is omitted here rather than hand-typed.
+#
+# Credentials come from the ordinary AWS chain (SSO, assume-role, static keys),
+# never the keyring: the registry password is a 12-hour token minted by
+# ecr:GetAuthorizationToken. `aws_profile` and `region` are both optional and
+# fall back to $AWS_PROFILE / $AWS_REGION; both can be switched from inside the
+# TUI with Backspace, without editing this file.
+#
+# Needs ecr:GetAuthorizationToken and ecr:DescribeRepositories.
+# [[registry]]
+# name = "ecr"
+# type = "ecr"
+# aws_profile = "default"
+# region = "ap-southeast-2"
+
+# ECR Public (public.ecr.aws). One global registry rather than one per region,
+# so `region` does not apply. The repository list is the set *you* publish,
+# which needs AWS credentials; pulling anyone else's public image works
+# anonymously, so a known repository can always be opened by name.
+# [[registry]]
+# name = "ecr-public"
+# type = "ecr-public"
+# aws_profile = "default"
 "#;
 
 /// Environment variables consulted for a JFrog access token, in order.
@@ -100,6 +126,31 @@ pub enum RegistryType {
     /// carrying that endpoint's real scope, which the existing challenge
     /// re-exchange in `RegistryClient::send` already handles.
     Ghcr,
+    /// AWS Elastic Container Registry (`<account>.dkr.ecr.<region>.amazonaws.com`).
+    ///
+    /// Two things make ECR unlike every type above. First, there is no
+    /// `/v2/_catalog`: repositories are listed with `ecr:DescribeRepositories`,
+    /// an AWS API on a different host from the registry. Second, there is no
+    /// static credential — the registry password is a ~12-hour token minted by
+    /// `ecr:GetAuthorizationToken` from whatever the AWS credential chain
+    /// resolves, so nothing is ever stored in the keyring.
+    ///
+    /// A consequence of the first point: the registry hostname embeds the
+    /// account ID, which the user should not have to look up. `url` is
+    /// therefore optional for this type and derived from the `proxyEndpoint`
+    /// that `GetAuthorizationToken` returns.
+    Ecr,
+    /// ECR Public (`public.ecr.aws`).
+    ///
+    /// A separate AWS service (`ecr-public`) from [`RegistryType::Ecr`], not a
+    /// mode of it: one global registry rather than one per region, a fixed
+    /// hostname with no account ID in it, and an API that only answers in
+    /// `us-east-1`. Kept as its own variant so neither type's rules have to be
+    /// read through an `if public` branch.
+    // `ecr-public`, not the `rename_all = "lowercase"` default `ecrpublic`.
+    #[serde(rename = "ecr-public")]
+    #[value(name = "ecr-public")]
+    EcrPublic,
 }
 
 /// How to authenticate to a registry, as configured.
@@ -154,12 +205,23 @@ pub enum AuthKind {
     /// `registry::GhcrCredentials` — sends no global header and exchanges the
     /// PAT (or nothing, anonymously) for a scope-bound token on each 401.
     Ghcr,
+    /// `registry::EcrCredentials` — mints and refreshes an AWS authorization
+    /// token, sent as HTTP Basic.
+    Ecr,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegistryProfile {
     pub name: String,
-    pub url: String,
+    /// Registry base URL.
+    ///
+    /// `None` only for the ECR types, whose hostname embeds an AWS account ID
+    /// and is resolved at runtime from `GetAuthorizationToken`'s
+    /// `proxyEndpoint`. [`Config::validate`] rejects a missing URL for every
+    /// other type, so the option is not a general "maybe configured" — it is
+    /// specifically "derived, not written".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Registry flavour.  Controls how the UI interacts with it
@@ -177,9 +239,34 @@ pub struct RegistryProfile {
     /// server-side catalog and so needs no namespace to be named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// ECR only: which AWS named profile to resolve credentials from.
+    ///
+    /// `None` defers entirely to the AWS credential chain (`$AWS_PROFILE`, then
+    /// `default`). Switchable at runtime from the TUI, which is why it is not
+    /// simply read from the environment at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_profile: Option<String>,
+    /// ECR only: which AWS region's registry to browse.
+    ///
+    /// `None` defers to the chain (`$AWS_REGION`, then the named profile's
+    /// configured region). Not meaningful for [`RegistryType::EcrPublic`],
+    /// which is a single global registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
 }
 
 impl RegistryProfile {
+    /// The configured URL's host, if there is a parseable URL at all.
+    ///
+    /// Shared by the URL-sniffing predicates below so each one states only its
+    /// own hostname rule, and so a profile with no URL (ECR, before its
+    /// registry is resolved) is uniformly "not detected as anything".
+    fn url_host(&self) -> Option<String> {
+        let url = self.url.as_deref()?;
+        let parsed = url::Url::parse(url).ok()?;
+        parsed.host_str().map(str::to_owned)
+    }
+
     /// Returns `true` when the registry is Docker Hub (either explicitly
     /// configured or detected from the URL).
     pub fn is_dockerhub(&self) -> bool {
@@ -187,18 +274,17 @@ impl RegistryProfile {
             RegistryType::DockerHub => true,
             RegistryType::Standard => {
                 // Fall back to URL-based detection for backward compatibility.
-                let Ok(u) = url::Url::parse(&self.url) else {
-                    return false;
-                };
-                let Some(host) = u.host_str() else {
-                    return false;
-                };
-                matches!(
-                    host,
-                    "registry-1.docker.io" | "docker.io" | "index.docker.io"
-                )
+                self.url_host().is_some_and(|host| {
+                    matches!(
+                        host.as_str(),
+                        "registry-1.docker.io" | "docker.io" | "index.docker.io"
+                    )
+                })
             }
-            RegistryType::Artifactory | RegistryType::Ghcr => false,
+            RegistryType::Artifactory
+            | RegistryType::Ghcr
+            | RegistryType::Ecr
+            | RegistryType::EcrPublic => false,
         }
     }
 
@@ -213,11 +299,75 @@ impl RegistryProfile {
     pub fn is_ghcr(&self) -> bool {
         match self.registry_type {
             RegistryType::Ghcr => true,
-            RegistryType::Standard => url::Url::parse(&self.url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h == "ghcr.io"))
-                .unwrap_or(false),
-            RegistryType::DockerHub | RegistryType::Artifactory => false,
+            RegistryType::Standard => self.url_host().is_some_and(|h| h == "ghcr.io"),
+            RegistryType::DockerHub
+            | RegistryType::Artifactory
+            | RegistryType::Ecr
+            | RegistryType::EcrPublic => false,
+        }
+    }
+
+    /// Returns `true` when the registry is a private AWS ECR registry.
+    ///
+    /// URL sniffing follows the same reasoning as [`Self::is_ghcr`]: the
+    /// hostname shape `<account>.dkr.ecr.<region>.amazonaws.com` is owned by
+    /// AWS and conclusive, so a profile already pointed at one as
+    /// `type = "standard"` — which today dead-ends at the catalog 401 — gets
+    /// the ECR flow with no config change. Deliberately narrower than "ends
+    /// with amazonaws.com": that domain hosts every AWS service.
+    pub fn is_ecr(&self) -> bool {
+        match self.registry_type {
+            RegistryType::Ecr => true,
+            RegistryType::Standard => self
+                .url_host()
+                .is_some_and(|h| h.contains(".dkr.ecr.") && h.ends_with(".amazonaws.com")),
+            RegistryType::DockerHub
+            | RegistryType::Artifactory
+            | RegistryType::Ghcr
+            | RegistryType::EcrPublic => false,
+        }
+    }
+
+    /// Returns `true` when the registry is ECR Public (`public.ecr.aws`).
+    pub fn is_ecr_public(&self) -> bool {
+        match self.registry_type {
+            RegistryType::EcrPublic => true,
+            RegistryType::Standard => self.url_host().is_some_and(|h| h == "public.ecr.aws"),
+            RegistryType::DockerHub
+            | RegistryType::Artifactory
+            | RegistryType::Ghcr
+            | RegistryType::Ecr => false,
+        }
+    }
+
+    /// Returns `true` for either ECR flavour.
+    ///
+    /// The two differ in how they discover repositories and whether a region
+    /// applies, but they share every rule about *credentials* — AWS chain only,
+    /// no keyring, no interactive prompt — so the guards that enforce those
+    /// rules ask this rather than both predicates.
+    pub fn is_any_ecr(&self) -> bool {
+        self.is_ecr() || self.is_ecr_public()
+    }
+
+    /// What to show wherever the registry's URL is displayed.
+    ///
+    /// An ECR profile has nothing to show until AWS answers, and a blank line
+    /// in the header would read as a bug — so it names the account and region
+    /// being resolved instead. Replaced by the real endpoint once
+    /// `GetAuthorizationToken` returns it.
+    pub fn display_url(&self) -> String {
+        if let Some(url) = &self.url {
+            return url.clone();
+        }
+        if !self.is_any_ecr() {
+            return String::new();
+        }
+        let aws_profile = self.aws_profile.as_deref().unwrap_or("default");
+        match (&self.region, self.is_ecr_public()) {
+            (_, true) => format!("ecr-public ({aws_profile})"),
+            (Some(region), false) => format!("ecr ({aws_profile} / {region})"),
+            (None, false) => format!("ecr ({aws_profile})"),
         }
     }
 
@@ -238,7 +388,13 @@ impl RegistryProfile {
     /// must not change how anyone authenticates to docker.io — and, now that
     /// GHCR reads `GITHUB_TOKEN`, the same has to hold in reverse for a
     /// variable that is exported on most developer machines.
+    /// ECR is excluded even under `auth = "token"`: its credential is minted by
+    /// the AWS SDK, never supplied by the user, so resolving one would mean
+    /// prompting for a secret that has nowhere to go.
     pub fn wants_access_token(&self) -> bool {
+        if self.is_any_ecr() {
+            return false;
+        }
         self.auth.is_token()
             || (self.auth == AuthMode::Auto && (self.is_artifactory() || self.is_ghcr()))
     }
@@ -253,8 +409,15 @@ impl RegistryProfile {
     ///
     /// Pure, and paired with [`Self::auth_kind`]: the decision lives here, the
     /// `std::env` lookup stays in `registry::auth`.
+    /// ECR reads *neither* list. Its credential comes from the AWS chain, which
+    /// has its own environment vocabulary (`AWS_PROFILE`, `AWS_REGION`,
+    /// `AWS_ACCESS_KEY_ID`, …) that the SDK reads for itself. An empty slice
+    /// here is what keeps a `GITHUB_TOKEN` or `JFROG_ACCESS_TOKEN` exported for
+    /// something else from being offered to AWS.
     pub fn token_env_vars(&self) -> &'static [&'static str] {
-        if self.is_ghcr() {
+        if self.is_any_ecr() {
+            &[]
+        } else if self.is_ghcr() {
             &GHCR_TOKEN_ENV_VARS
         } else {
             &ARTIFACTORY_TOKEN_ENV_VARS
@@ -281,6 +444,11 @@ impl RegistryProfile {
             // exchange also works with no token at all — so `token` mode stays
             // useful (as anonymous access) even when none was resolved.
             AuthMode::Token if self.is_ghcr() => AuthKind::Ghcr,
+            // ECR has no user-supplied token to send, so `token` mode means
+            // the same thing `auto` does: mint one from the AWS chain. It is
+            // accepted rather than rejected so `--type ecr --auth token` is
+            // merely redundant instead of an error.
+            AuthMode::Token if self.is_any_ecr() => AuthKind::Ecr,
             AuthMode::Token => {
                 if has_token {
                     AuthKind::AccessToken
@@ -302,6 +470,11 @@ impl RegistryProfile {
                     AuthKind::None
                 }
             }
+            // ECR: the AWS chain is the only credential source. Note this is
+            // reached only under `auto` and `token` — an explicit `basic` or
+            // `bearer` above still wins, which is the escape hatch for an
+            // authenticating proxy sitting in front of an ECR endpoint.
+            AuthMode::Auto if self.is_any_ecr() => AuthKind::Ecr,
             // Artifactory's Docker v2 endpoint and REST API both accept HTTP
             // Basic, so a username + password keeps working unchanged; a token
             // fills in when there is no password to send.
@@ -394,13 +567,23 @@ impl Config {
     /// Validate that all URLs are parseable and registry names are unique.
     pub fn validate(&self) -> anyhow::Result<()> {
         for profile in &self.registry {
-            Url::parse(&profile.url).map_err(|e| {
-                anyhow::anyhow!(
-                    "Registry '{}' has invalid URL '{}': {e}",
-                    profile.name,
-                    profile.url
-                )
-            })?;
+            // ECR derives its hostname from AWS at runtime, so a missing URL is
+            // the normal case there and an error everywhere else. An explicitly
+            // written URL is still validated for every type.
+            match profile.url.as_deref() {
+                Some(url) => {
+                    Url::parse(url).map_err(|e| {
+                        anyhow::anyhow!("Registry '{}' has invalid URL '{url}': {e}", profile.name)
+                    })?;
+                }
+                None if profile.is_any_ecr() => {}
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Registry '{}' has no url. Only ECR registries may omit it.",
+                        profile.name
+                    ));
+                }
+            }
 
             // `#` separates the profile name from the repo-key in the TUI's
             // client-cache keys (`<profile>#<repo-key>`), so allowing it in a
@@ -480,7 +663,7 @@ mod tests {
     fn profile(name: &str, url: &str) -> RegistryProfile {
         RegistryProfile {
             name: name.to_owned(),
-            url: url.to_owned(),
+            url: Some(url.to_owned()),
             username: None,
             registry_type: RegistryType::Standard,
             ..Default::default()
@@ -504,7 +687,7 @@ mod tests {
                 profile("local", "http://localhost:5000"),
                 RegistryProfile {
                     name: "prod".to_owned(),
-                    url: "https://registry.example.com".to_owned(),
+                    url: Some("https://registry.example.com".to_owned()),
                     username: Some("admin".to_owned()),
                     registry_type: RegistryType::Standard,
                     ..Default::default()
@@ -594,7 +777,7 @@ mod tests {
     fn artifactory_type_round_trips_and_is_detected() {
         let profile = RegistryProfile {
             name: "artifactory".to_owned(),
-            url: "https://artifactory.example.com/artifactory".to_owned(),
+            url: Some("https://artifactory.example.com/artifactory".to_owned()),
             username: Some("ci".to_owned()),
             registry_type: RegistryType::Artifactory,
             ..Default::default()
@@ -611,7 +794,7 @@ mod tests {
         assert!(!profile("local", "http://localhost:5000").is_artifactory());
         let dockerhub = RegistryProfile {
             name: "hub".to_owned(),
-            url: "https://registry-1.docker.io".to_owned(),
+            url: Some("https://registry-1.docker.io".to_owned()),
             username: None,
             registry_type: RegistryType::Standard,
             ..Default::default()
@@ -657,7 +840,7 @@ mod tests {
         ] {
             let p = RegistryProfile {
                 name: "r".to_owned(),
-                url: "https://r.example.com".to_owned(),
+                url: Some("https://r.example.com".to_owned()),
                 username: Some("u".to_owned()),
                 auth: mode,
                 ..Default::default()
@@ -676,11 +859,13 @@ mod tests {
     fn auth_profile(kind: RegistryType, mode: AuthMode, username: Option<&str>) -> RegistryProfile {
         RegistryProfile {
             name: "r".to_owned(),
-            url: "https://r.example.com".to_owned(),
+            url: Some("https://r.example.com".to_owned()),
             username: username.map(str::to_owned),
             registry_type: kind,
             auth: mode,
             owner: None,
+            aws_profile: None,
+            region: None,
         }
     }
 
@@ -852,7 +1037,7 @@ mod tests {
     fn ghcr_type_round_trips_and_is_detected() {
         let profile = RegistryProfile {
             name: "ghcr".to_owned(),
-            url: "https://ghcr.io".to_owned(),
+            url: Some("https://ghcr.io".to_owned()),
             registry_type: RegistryType::Ghcr,
             owner: Some("pgmac-net".to_owned()),
             ..Default::default()
@@ -875,7 +1060,7 @@ mod tests {
     fn absent_owner_stays_absent_through_a_round_trip() {
         let profile = RegistryProfile {
             name: "ghcr".to_owned(),
-            url: "https://ghcr.io".to_owned(),
+            url: Some("https://ghcr.io".to_owned()),
             registry_type: RegistryType::Ghcr,
             ..Default::default()
         };
@@ -905,7 +1090,7 @@ mod tests {
         // type must never be overridden by URL sniffing.
         let artifactory = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://ghcr.io".to_owned(),
+            url: Some("https://ghcr.io".to_owned()),
             registry_type: RegistryType::Artifactory,
             ..Default::default()
         };
@@ -920,7 +1105,7 @@ mod tests {
         let ghcr = profile("gh", "https://ghcr.io");
         let artifactory = RegistryProfile {
             name: "art".to_owned(),
-            url: "https://art.example.com/artifactory".to_owned(),
+            url: Some("https://art.example.com/artifactory".to_owned()),
             registry_type: RegistryType::Artifactory,
             ..Default::default()
         };
@@ -959,5 +1144,174 @@ mod tests {
         // token; GHCR joins Artifactory there.
         assert!(profile("gh", "https://ghcr.io").wants_access_token());
         assert!(!profile("local", "http://localhost:5000").wants_access_token());
+    }
+
+    // -----------------------------------------------------------------------
+    // AWS ECR
+    // -----------------------------------------------------------------------
+
+    fn ecr_profile(kind: RegistryType) -> RegistryProfile {
+        RegistryProfile {
+            name: "ecr".to_owned(),
+            registry_type: kind,
+            aws_profile: Some("pgmac".to_owned()),
+            region: Some("ap-southeast-2".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ecr_types_round_trip_and_are_detected() {
+        let text = toml::to_string_pretty(&ecr_profile(RegistryType::Ecr)).unwrap();
+        assert!(text.contains(r#"type = "ecr""#), "{text}");
+        assert!(text.contains(r#"aws_profile = "pgmac""#), "{text}");
+        assert!(text.contains(r#"region = "ap-southeast-2""#), "{text}");
+        // No URL was set, and none may be invented on the way out.
+        assert!(!text.contains("url"), "{text}");
+
+        let loaded: RegistryProfile = toml::from_str(&text).unwrap();
+        assert!(loaded.is_ecr());
+        assert!(loaded.is_any_ecr());
+        assert!(!loaded.is_ecr_public());
+        assert!(!loaded.is_ghcr());
+        assert!(!loaded.is_dockerhub());
+        assert!(!loaded.is_artifactory());
+    }
+
+    /// `rename_all = "lowercase"` would spell this `ecrpublic`; the explicit
+    /// rename is what keeps the config and CLI vocabularies readable.
+    #[test]
+    fn ecr_public_is_spelled_with_a_hyphen() {
+        let text = toml::to_string_pretty(&ecr_profile(RegistryType::EcrPublic)).unwrap();
+        assert!(text.contains(r#"type = "ecr-public""#), "{text}");
+
+        let loaded: RegistryProfile = toml::from_str(&text).unwrap();
+        assert!(loaded.is_ecr_public());
+        assert!(loaded.is_any_ecr());
+        assert!(!loaded.is_ecr());
+    }
+
+    #[test]
+    fn ecr_is_detected_from_a_registry_url_when_type_is_unset() {
+        assert!(profile("e", "https://012345678910.dkr.ecr.us-east-1.amazonaws.com").is_ecr());
+        assert!(profile("p", "https://public.ecr.aws").is_ecr_public());
+    }
+
+    /// `amazonaws.com` hosts every AWS service, so the sniff must key on the
+    /// registry-specific `.dkr.ecr.` infix rather than the domain alone.
+    #[test]
+    fn other_amazonaws_hosts_are_not_ecr() {
+        assert!(!profile("s3", "https://s3.ap-southeast-2.amazonaws.com").is_ecr());
+        assert!(!profile("api", "https://api.ecr.us-east-1.amazonaws.com").is_ecr());
+        assert!(!profile("local", "http://localhost:5000").is_any_ecr());
+    }
+
+    /// The load-bearing half of the token-vocabulary partition for ECR: its
+    /// credential comes from the AWS chain, so neither the JFrog nor the GitHub
+    /// variables may be offered to it.
+    #[test]
+    fn ecr_reads_no_token_environment_variables() {
+        for kind in [RegistryType::Ecr, RegistryType::EcrPublic] {
+            let profile = ecr_profile(kind);
+            assert!(
+                profile.token_env_vars().is_empty(),
+                "{kind:?} must read no token env vars, got {:?}",
+                profile.token_env_vars()
+            );
+            assert!(!profile.wants_access_token());
+        }
+    }
+
+    /// Even `auth = "token"`, which for every other type means "resolve a
+    /// token", must not send ECR looking for one to prompt for.
+    #[test]
+    fn ecr_never_wants_a_resolved_token_even_in_token_mode() {
+        let mut profile = ecr_profile(RegistryType::Ecr);
+        profile.auth = AuthMode::Token;
+
+        assert!(!profile.wants_access_token());
+        assert_eq!(profile.auth_kind(false, false), AuthKind::Ecr);
+    }
+
+    #[test]
+    fn ecr_auth_kind_ignores_username_and_password_under_auto() {
+        let mut profile = ecr_profile(RegistryType::Ecr);
+        profile.username = Some("someone".to_owned());
+
+        assert_eq!(profile.auth_kind(true, true), AuthKind::Ecr);
+        assert_eq!(profile.auth_kind(false, false), AuthKind::Ecr);
+    }
+
+    /// The escape hatch: an explicit `basic`/`bearer` still wins, for an
+    /// authenticating proxy in front of an ECR endpoint.
+    #[test]
+    fn an_explicit_mode_overrides_the_ecr_default() {
+        let mut profile = ecr_profile(RegistryType::Ecr);
+        profile.username = Some("someone".to_owned());
+        profile.auth = AuthMode::Basic;
+
+        assert_eq!(profile.auth_kind(false, true), AuthKind::Basic);
+    }
+
+    #[test]
+    fn only_ecr_may_omit_the_url() {
+        let ok = Config {
+            default_registry: None,
+            registry: vec![ecr_profile(RegistryType::Ecr)],
+        };
+        assert!(ok.validate().is_ok());
+
+        let bad = Config {
+            default_registry: None,
+            registry: vec![RegistryProfile {
+                name: "standard".to_owned(),
+                ..Default::default()
+            }],
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("has no url"), "{err}");
+    }
+
+    /// An ECR profile that *does* carry a URL is still validated like any
+    /// other — omitting the field is a licence to derive it, not to skip the
+    /// check when it is present.
+    #[test]
+    fn an_explicit_ecr_url_is_still_validated() {
+        let mut profile = ecr_profile(RegistryType::Ecr);
+        profile.url = Some("not-a-url".to_owned());
+        let config = Config {
+            default_registry: None,
+            registry: vec![profile],
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_derived_url_displays_the_aws_target_instead_of_nothing() {
+        assert_eq!(
+            ecr_profile(RegistryType::Ecr).display_url(),
+            "ecr (pgmac / ap-southeast-2)"
+        );
+        assert_eq!(
+            ecr_profile(RegistryType::EcrPublic).display_url(),
+            "ecr-public (pgmac)"
+        );
+
+        let mut chain = ecr_profile(RegistryType::Ecr);
+        chain.aws_profile = None;
+        chain.region = None;
+        assert_eq!(chain.display_url(), "ecr (default)");
+    }
+
+    #[test]
+    fn a_resolved_url_displaces_the_placeholder() {
+        let mut profile = ecr_profile(RegistryType::Ecr);
+        profile.url = Some("https://1.dkr.ecr.ap-southeast-2.amazonaws.com".to_owned());
+
+        assert_eq!(
+            profile.display_url(),
+            "https://1.dkr.ecr.ap-southeast-2.amazonaws.com"
+        );
     }
 }
