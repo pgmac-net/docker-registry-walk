@@ -230,9 +230,7 @@ impl InspectModal {
     }
 
     pub fn expand_all(&mut self) {
-        for c in &mut self.collapsed {
-            *c = false;
-        }
+        self.collapsed.fill(false);
         self.rebuild_visible();
     }
 
