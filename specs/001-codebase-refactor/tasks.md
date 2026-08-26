@@ -140,7 +140,7 @@ tests. Final gate validation.
 - [X] T036 Remove `#![allow(dead_code)]` from `src/tui/event.rs`
 - [X] T037 Fix any warnings revealed by suppressor removal (unused imports, unreachable variants) in `src/tui/app.rs` and `src/tui/event.rs`
 - [X] T038 [P] Run full gate validation per `specs/001-codebase-refactor/quickstart.md`: `cargo build && cargo clippy -- -D warnings && cargo test && cargo fmt --check`
-- [ ] T039 [P] Manual smoke test per `specs/001-codebase-refactor/quickstart.md` — exercise all 13 key flows listed there
+- [X] T039 [P] Manual smoke test per `specs/001-codebase-refactor/quickstart.md` — exercise all 13 key flows listed there
 
 **Checkpoint**: All four commands pass. Manual test shows no functional regressions.
 
