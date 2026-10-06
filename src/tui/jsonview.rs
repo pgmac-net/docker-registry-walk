@@ -116,6 +116,54 @@ pub fn opener_at(rows: &[RowMeta], line: usize) -> Option<usize> {
     best
 }
 
+/// The innermost opener strictly enclosing `line`, or `None` at top level.
+///
+/// Unlike [`opener_at`], an opener line resolves to its *parent*, never
+/// itself — this is the node `←` steps out to. A closing-bracket line counts
+/// as inside its own block, so it resolves to that block's opener.
+pub fn parent_of(rows: &[RowMeta], line: usize) -> Option<usize> {
+    let mut best = None;
+    for (o, r) in rows.iter().enumerate() {
+        if o >= line {
+            break;
+        }
+        if r.opener && line <= r.close_idx {
+            best = Some(o); // later opener == innermost enclosing
+        }
+    }
+    best
+}
+
+/// Direct children of the block opened at `opener`: each nested block is
+/// represented by its opener line only, its interior and closer skipped.
+fn children(rows: &[RowMeta], opener: usize) -> impl Iterator<Item = usize> + '_ {
+    let close = rows[opener].close_idx;
+    let mut i = opener + 1;
+    std::iter::from_fn(move || {
+        if i >= close {
+            return None;
+        }
+        let cur = i;
+        i = if rows[cur].opener {
+            rows[cur].close_idx + 1
+        } else {
+            cur + 1
+        };
+        Some(cur)
+    })
+}
+
+/// First direct child line of the block at `opener`, if it has any.
+pub fn first_child(rows: &[RowMeta], opener: usize) -> Option<usize> {
+    children(rows, opener).next()
+}
+
+/// Last direct child line of the block at `opener`. A nested block child
+/// is reported as its opener line, not its closing bracket.
+pub fn last_child(rows: &[RowMeta], opener: usize) -> Option<usize> {
+    children(rows, opener).last()
+}
+
 /// Expand every collapsed opener that encloses `target`, so a jump to a
 /// hidden line (e.g. a search hit) reveals it.
 pub fn expand_ancestors(rows: &[RowMeta], collapsed: &mut [bool], target: usize) {
@@ -239,6 +287,40 @@ mod tests {
         assert_eq!(opener_at(&rows, 3), Some(2)); // inside config
         assert_eq!(opener_at(&rows, 8), Some(7)); // innermost, not layers/root
         assert_eq!(opener_at(&rows, 1), Some(0)); // top-level leaf → root
+    }
+
+    #[test]
+    fn parent_of_resolves_the_enclosing_block_never_self() {
+        let ls = lines(SAMPLE);
+        let rows = build_rows(&ls);
+        assert_eq!(parent_of(&rows, 0), None); // document root
+        assert_eq!(parent_of(&rows, 1), Some(0)); // top-level leaf
+        assert_eq!(parent_of(&rows, 2), Some(0)); // opener → its parent, not itself
+        assert_eq!(parent_of(&rows, 3), Some(2)); // leaf in config
+        assert_eq!(parent_of(&rows, 5), Some(2)); // config's closer
+        assert_eq!(parent_of(&rows, 7), Some(6)); // object in layers
+        assert_eq!(parent_of(&rows, 8), Some(7)); // innermost, not layers
+        assert_eq!(parent_of(&rows, 10), Some(6)); // closer sits inside its own block
+    }
+
+    #[test]
+    fn first_and_last_child_skip_nested_interiors() {
+        let ls = lines(SAMPLE);
+        let rows = build_rows(&ls);
+        assert_eq!(first_child(&rows, 0), Some(1));
+        assert_eq!(last_child(&rows, 0), Some(6)); // layers opener, not its `]`
+        assert_eq!(first_child(&rows, 2), Some(3));
+        assert_eq!(last_child(&rows, 2), Some(4));
+        assert_eq!(first_child(&rows, 6), Some(7));
+        assert_eq!(last_child(&rows, 6), Some(7));
+        assert_eq!(first_child(&rows, 7), Some(8));
+    }
+
+    #[test]
+    fn empty_block_has_no_children() {
+        let rows = build_rows(&lines("{\n}"));
+        assert_eq!(first_child(&rows, 0), None);
+        assert_eq!(last_child(&rows, 0), None);
     }
 
     #[test]

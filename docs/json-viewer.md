@@ -128,3 +128,9 @@ implementation proceeded on Opus (the recorded fallback) — noted on the
 work-started comment. No functional deviation from the plan.
 
 PR: https://github.com/pgmac-net/docker-registry-walk/pull/76
+
+## Update: tree navigation (issue #130)
+
+`←`/`→` now walk the tree (child → parent, open → collapse, and the mirror
+for `→`), and `[`/`]` jump to the first/last item of the current element. See
+[`inspect-tree-navigation.md`](inspect-tree-navigation.md).

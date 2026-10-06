@@ -239,11 +239,12 @@ Full details of every context: [docs/keybindings.md](docs/keybindings.md).
 |-----|--------|
 | `↑` / `↓` / `k` / `j` | Move cursor |
 | `PgUp` / `PgDn` | Page up / down |
-| `Home` / `g` | Jump to top |
-| `End` / `G` | Jump to bottom |
+| `Home` / `g` | Jump to top of the whole document |
+| `End` / `G` | Jump to bottom of the whole document |
 | `Space` / `Enter` | Fold / unfold the node at the cursor |
-| `←` / `h` | Collapse the node at the cursor |
-| `→` / `l` | Expand the node at the cursor |
+| `←` / `h` | Collapse an open node; on a child line or a collapsed node, move to the parent (which stays open) |
+| `→` / `l` | Expand a collapsed node; on an open node, move to its first child |
+| `[` / `]` | Jump to the first / last item in the current element |
 | `H` / `L` | Collapse all / expand all |
 | `/` | Search JSON text (`Enter` to run, `Esc` to cancel) |
 | `n` / `N` | Jump to next / previous match |

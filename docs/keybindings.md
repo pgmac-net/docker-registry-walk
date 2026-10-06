@@ -91,3 +91,7 @@ small terminal, or `Normal`, which stayed the longest of the set), the title
 shows a position indicator (`12-30/34`) and a scroll hint; otherwise the title
 is just the close hint, since an indicator that's always present would be
 noise once most contexts don't need one.
+
+- Inspect viewer: `←`/`→` now step out of / into the tree, and `[`/`]` were added
+  (first/last item in the current element) — see
+  [`inspect-tree-navigation.md`](inspect-tree-navigation.md).

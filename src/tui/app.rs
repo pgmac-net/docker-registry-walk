@@ -206,17 +206,49 @@ impl InspectModal {
         }
     }
 
-    /// Collapse (`true`) or expand (`false`) the node at the cursor.
-    pub fn set_fold(&mut self, collapse: bool) {
-        if let Some(o) = jsonview::opener_at(&self.rows, self.cursor_line())
-            && self.collapsed[o] != collapse
-        {
-            self.collapsed[o] = collapse;
+    /// `←`: step one level out. An open opener collapses; any other line
+    /// (a leaf, a closing bracket, or an already-collapsed opener) moves the
+    /// cursor to its parent, which stays open. No-op at top level.
+    pub fn step_out(&mut self) {
+        let line = self.cursor_line();
+        if self.rows[line].opener && !self.collapsed[line] {
+            self.collapsed[line] = true;
             self.rebuild_visible();
-            if let Some(pos) = self.visible.iter().position(|&l| l == o) {
-                self.cursor = pos;
-                self.ensure_visible();
-            }
+        } else if let Some(parent) = jsonview::parent_of(&self.rows, line) {
+            self.jump_to(parent);
+        }
+    }
+
+    /// `→`: step one level in. A collapsed opener expands; an open opener
+    /// moves the cursor to its first child. No-op on a leaf.
+    pub fn step_in(&mut self) {
+        let line = self.cursor_line();
+        if !self.rows[line].opener {
+            return;
+        }
+        if self.collapsed[line] {
+            self.collapsed[line] = false;
+            self.rebuild_visible();
+        } else if let Some(child) = jsonview::first_child(&self.rows, line) {
+            self.jump_to(child);
+        }
+    }
+
+    /// `[`: jump to the first item of the element containing the cursor.
+    pub fn jump_first_sibling(&mut self) {
+        if let Some(parent) = jsonview::parent_of(&self.rows, self.cursor_line())
+            && let Some(first) = jsonview::first_child(&self.rows, parent)
+        {
+            self.jump_to(first);
+        }
+    }
+
+    /// `]`: jump to the last item of the element containing the cursor.
+    pub fn jump_last_sibling(&mut self) {
+        if let Some(parent) = jsonview::parent_of(&self.rows, self.cursor_line())
+            && let Some(last) = jsonview::last_child(&self.rows, parent)
+        {
+            self.jump_to(last);
         }
     }
 
@@ -2372,6 +2404,106 @@ mod tests {
         m.toggle_fold(); // unfold restores interior, cursor unchanged
         assert_eq!(m.cursor_line(), 2);
         assert!(m.visible.contains(&3));
+    }
+
+    /// Put the cursor on an absolute line (all folds open in the fixture).
+    fn at(m: &mut InspectModal, line: usize) {
+        m.jump_to(line);
+        assert_eq!(m.cursor_line(), line);
+    }
+
+    #[test]
+    fn step_out_from_child_goes_to_parent_and_leaves_it_open() {
+        let mut m = inspect_modal();
+        at(&mut m, 3); // "digest" inside config
+        m.step_out();
+        assert_eq!(m.cursor_line(), 2);
+        assert!(!m.collapsed[2]); // parent stays open
+        assert!(m.visible.contains(&3));
+    }
+
+    #[test]
+    fn step_out_ladder_collapses_then_climbs() {
+        let mut m = inspect_modal();
+        at(&mut m, 8); // leaf in the object inside layers
+        m.step_out(); // → object (7), open
+        assert_eq!(m.cursor_line(), 7);
+        m.step_out(); // open opener → collapse
+        assert_eq!(m.cursor_line(), 7);
+        assert!(m.collapsed[7]);
+        m.step_out(); // collapsed opener → parent (layers)
+        assert_eq!(m.cursor_line(), 6);
+        assert!(!m.collapsed[6]);
+        m.step_out(); // collapse layers
+        assert!(m.collapsed[6]);
+        m.step_out(); // → root
+        assert_eq!(m.cursor_line(), 0);
+        m.step_out(); // collapse root
+        assert!(m.collapsed[0]);
+        m.step_out(); // collapsed root: no parent, no-op
+        assert_eq!(m.cursor_line(), 0);
+        assert!(m.collapsed[0]);
+    }
+
+    #[test]
+    fn step_out_from_closing_bracket_goes_to_its_opener() {
+        let mut m = inspect_modal();
+        at(&mut m, 5); // `},` closing config
+        m.step_out();
+        assert_eq!(m.cursor_line(), 2);
+        assert!(!m.collapsed[2]);
+    }
+
+    #[test]
+    fn step_in_expands_then_enters_first_child() {
+        let mut m = inspect_modal();
+        at(&mut m, 2);
+        m.toggle_fold(); // collapse config
+        assert!(m.collapsed[2]);
+        m.step_in(); // collapsed → expand, cursor stays
+        assert!(!m.collapsed[2]);
+        assert_eq!(m.cursor_line(), 2);
+        m.step_in(); // open → first child
+        assert_eq!(m.cursor_line(), 3);
+        m.step_in(); // leaf: no-op
+        assert_eq!(m.cursor_line(), 3);
+    }
+
+    #[test]
+    fn jump_siblings_stay_within_the_current_element() {
+        let mut m = inspect_modal();
+        at(&mut m, 4); // "size" in config
+        m.jump_first_sibling();
+        assert_eq!(m.cursor_line(), 3);
+        m.jump_last_sibling();
+        assert_eq!(m.cursor_line(), 4);
+        // On an opener line the element is its parent: siblings, not children.
+        at(&mut m, 2);
+        m.jump_first_sibling();
+        assert_eq!(m.cursor_line(), 1);
+        m.jump_last_sibling();
+        assert_eq!(m.cursor_line(), 6); // layers opener, not its `]`
+    }
+
+    #[test]
+    fn jump_siblings_are_noops_at_top_level() {
+        let mut m = inspect_modal();
+        at(&mut m, 0);
+        m.jump_first_sibling();
+        m.jump_last_sibling();
+        assert_eq!(m.cursor_line(), 0);
+        assert!(m.collapsed.iter().all(|c| !c)); // never changes folds
+    }
+
+    #[test]
+    fn nav_keys_are_noops_without_openers() {
+        let lines = "not json\njust text".lines().map(str::to_owned).collect();
+        let mut m = InspectModal::new("x".to_owned(), lines);
+        m.step_out();
+        m.step_in();
+        m.jump_first_sibling();
+        m.jump_last_sibling();
+        assert_eq!(m.cursor_line(), 0);
     }
 
     #[test]
