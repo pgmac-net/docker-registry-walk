@@ -261,6 +261,30 @@ impl InspectModal {
         self.rebuild_visible();
     }
 
+    /// `c`: collapse every block inside the element containing the cursor,
+    /// leaving the element itself (and its ancestors) open. At top level,
+    /// where nothing contains the cursor, an open opener under the cursor
+    /// is the element; anything else is a no-op. The cursor is always a
+    /// direct child of the element (or its bracket), so it stays on its line.
+    pub fn collapse_children(&mut self) {
+        let line = self.cursor_line();
+        let element = jsonview::parent_of(&self.rows, line)
+            .or_else(|| (self.rows[line].opener && !self.collapsed[line]).then_some(line));
+        let Some(element) = element else {
+            return;
+        };
+        for i in element + 1..self.rows[element].close_idx {
+            if self.rows[i].opener {
+                self.collapsed[i] = true;
+            }
+        }
+        self.visible = jsonview::visible_lines(&self.rows, &self.collapsed);
+        if let Some(pos) = self.visible.iter().position(|&l| l == line) {
+            self.cursor = pos;
+        }
+        self.ensure_visible();
+    }
+
     pub fn expand_all(&mut self) {
         self.collapsed.fill(false);
         self.rebuild_visible();
@@ -2504,6 +2528,77 @@ mod tests {
         m.jump_first_sibling();
         m.jump_last_sibling();
         assert_eq!(m.cursor_line(), 0);
+    }
+
+    #[test]
+    fn collapse_children_folds_nested_blocks_and_keeps_the_element_open() {
+        let mut m = inspect_modal();
+        at(&mut m, 1); // direct leaf of the root element
+        m.collapse_children();
+        assert!(!m.collapsed[0]); // element stays open
+        assert!(m.collapsed[2] && m.collapsed[6] && m.collapsed[7]); // all descendants
+        assert_eq!(m.cursor_line(), 1); // cursor keeps its line
+        assert_eq!(m.visible, vec![0, 1, 2, 6, 11]); // config/layers folded, `}` shown
+    }
+
+    #[test]
+    fn collapse_children_is_scoped_to_the_containing_block() {
+        let mut m = inspect_modal();
+        at(&mut m, 7); // object inside layers: element is `layers`
+        m.collapse_children();
+        assert!(m.collapsed[7]); // nested block inside layers folded
+        assert!(!m.collapsed[6]); // layers itself open
+        assert!(!m.collapsed[2]); // sibling section untouched
+        assert_eq!(m.cursor_line(), 7);
+    }
+
+    #[test]
+    fn collapse_children_is_idempotent_and_keeps_existing_folds() {
+        let mut m = inspect_modal();
+        at(&mut m, 2);
+        m.toggle_fold(); // config already folded
+        at(&mut m, 1);
+        m.collapse_children();
+        let after_first = (m.collapsed.clone(), m.visible.clone(), m.cursor);
+        m.collapse_children();
+        assert_eq!(
+            (m.collapsed.clone(), m.visible.clone(), m.cursor),
+            after_first
+        );
+        assert!(m.collapsed[2]);
+    }
+
+    #[test]
+    fn collapse_children_on_a_block_without_nested_blocks_is_a_noop() {
+        let mut m = inspect_modal();
+        at(&mut m, 3); // element is `config`, which has only leaves
+        m.collapse_children();
+        assert!(m.collapsed.iter().all(|c| !c));
+        assert_eq!(m.cursor_line(), 3);
+    }
+
+    #[test]
+    fn collapse_children_on_the_root_opener_uses_it_as_the_element() {
+        let mut m = inspect_modal();
+        at(&mut m, 0);
+        m.collapse_children();
+        assert!(!m.collapsed[0]);
+        assert!(m.collapsed[2] && m.collapsed[6]);
+        assert_eq!(m.cursor_line(), 0);
+        // A collapsed top-level opener has no element: no-op.
+        m.toggle_fold();
+        assert!(m.collapsed[0]);
+        m.collapse_children();
+        assert_eq!(m.cursor_line(), 0);
+    }
+
+    #[test]
+    fn collapse_children_without_openers_is_a_noop() {
+        let lines = "not json\njust text".lines().map(str::to_owned).collect();
+        let mut m = InspectModal::new("x".to_owned(), lines);
+        m.collapse_children();
+        assert_eq!(m.cursor_line(), 0);
+        assert_eq!(m.visible.len(), 2);
     }
 
     #[test]

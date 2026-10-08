@@ -95,3 +95,5 @@ noise once most contexts don't need one.
 - Inspect viewer: `←`/`→` now step out of / into the tree, and `[`/`]` were added
   (first/last item in the current element) — see
   [`inspect-tree-navigation.md`](inspect-tree-navigation.md).
+- Inspect viewer: `c` collapses everything inside the current element (issue #134);
+  see [`inspect-tree-navigation.md`](inspect-tree-navigation.md).
