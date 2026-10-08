@@ -1,4 +1,4 @@
-# Inspect viewer: tree navigation (issues #130, #134)
+# Inspect viewer: tree navigation (issues #130, #134, #136)
 
 ## The problem
 
@@ -84,3 +84,18 @@ that element, and all its ancestors, open.
 Deviation from plan: the plan proposed a helper to place the cursor on the
 folded child hiding it. Implementing showed the cursor can never be hidden by
 `c`, so the helper and its placement logic were dropped.
+
+## Open children (`o`, issue #136)
+
+`o` is the opposite of `c`: it expands every block inside the element
+containing the cursor (all descendants), leaving the element and its ancestors
+as they were. It is the scoped counterpart to `L` (expand the whole document),
+as `c` is to `H`.
+
+- Same element rule as `c`, `[` and `]`, including the top-level case: an open
+  top-level opener is its own element; a *collapsed* top-level opener, the blank
+  line and the separator are a no-op (use `→`/`Space` to open a collapsed root).
+- Cursor never moves; idempotent; `c` then `o` restores the original view.
+- Implementation: `c` and `o` share `InspectModal::set_children_collapsed`
+  (`src/tui/app.rs`); `o` is bound in `src/tui/event.rs` with a Help row in
+  `src/tui/ui.rs`.
