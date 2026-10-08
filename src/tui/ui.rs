@@ -1150,6 +1150,7 @@ fn help_lines_inspect() -> Vec<Line<'static>> {
         ),
         help_kv("→ / l", "Expand node; on an open node, go to first child"),
         help_kv("[ / ]", "First / last item in current element"),
+        help_kv("c", "Collapse everything inside the current element"),
         help_kv("H / L", "Collapse all / expand all"),
         help_kv("/", "Search JSON text"),
         help_kv("n / N", "Next / previous match"),
@@ -1750,6 +1751,7 @@ mod tests {
         assert!(content.contains("Collapse node"));
         assert!(content.contains("Expand node"));
         assert!(content.contains("First / last item"));
+        assert!(content.contains("Collapse everything inside"));
     }
 
     /// Most contexts are now short enough to need no scroll indicator at all

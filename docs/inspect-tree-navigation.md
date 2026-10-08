@@ -1,4 +1,4 @@
-# Inspect viewer: tree navigation (issue #130)
+# Inspect viewer: tree navigation (issues #130, #134)
 
 ## The problem
 
@@ -61,3 +61,26 @@ live registry (no registry or interactive terminal in this environment).
 Picked up via `pgmac-workflows:pickup-ticket`. Plan posted and approved on the
 ticket; rated STANDARD and implemented on Sonnet 5.5 as planned (planning ran
 on Opus 5.5, the Fable 5 fallback). No deviations.
+
+## Close children (`c`, issue #134)
+
+`H` collapses the whole document, root included. `c` is the scoped variant:
+it collapses every block *inside* the element containing the cursor and leaves
+that element, and all its ancestors, open.
+
+- **Element** = the block containing the cursor line (same rule as `[`/`]`).
+  On a top-level opener with no parent (the manifest or config root) that open
+  opener is the element; on the blank line, the `── config ──` separator, or a
+  collapsed top-level opener it is a no-op.
+- **Depth** = all descendants, not just direct children. Re-expanding a folded
+  child therefore shows its own children folded too.
+- **Cursor** never moves off its line: it is always a direct child (or bracket)
+  of the element, so it cannot end up inside a newly folded block.
+- Idempotent; already-folded blocks stay folded; no-op on input without blocks.
+- Implementation: `InspectModal::collapse_children` (`src/tui/app.rs`), reusing
+  `jsonview::parent_of`; bound to `c` in the Inspect arm of `src/tui/event.rs`,
+  with a Help row in `src/tui/ui.rs`.
+
+Deviation from plan: the plan proposed a helper to place the cursor on the
+folded child hiding it. Implementing showed the cursor can never be hidden by
+`c`, so the helper and its placement logic were dropped.

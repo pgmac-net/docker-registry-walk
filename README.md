@@ -245,6 +245,7 @@ Full details of every context: [docs/keybindings.md](docs/keybindings.md).
 | `←` / `h` | Collapse an open node; on a child line or a collapsed node, move to the parent (which stays open) |
 | `→` / `l` | Expand a collapsed node; on an open node, move to its first child |
 | `[` / `]` | Jump to the first / last item in the current element |
+| `c` | Collapse everything inside the current element (the element stays open) |
 | `H` / `L` | Collapse all / expand all |
 | `/` | Search JSON text (`Enter` to run, `Esc` to cancel) |
 | `n` / `N` | Jump to next / previous match |
