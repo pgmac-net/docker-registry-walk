@@ -262,11 +262,23 @@ impl InspectModal {
     }
 
     /// `c`: collapse every block inside the element containing the cursor,
-    /// leaving the element itself (and its ancestors) open. At top level,
-    /// where nothing contains the cursor, an open opener under the cursor
-    /// is the element; anything else is a no-op. The cursor is always a
-    /// direct child of the element (or its bracket), so it stays on its line.
+    /// leaving the element itself (and its ancestors) open.
     pub fn collapse_children(&mut self) {
+        self.set_children_collapsed(true);
+    }
+
+    /// `o`: the opposite of `c` — expand every block inside the element
+    /// containing the cursor.
+    pub fn expand_children(&mut self) {
+        self.set_children_collapsed(false);
+    }
+
+    /// Fold (`true`) or unfold (`false`) every block strictly inside the
+    /// element containing the cursor. At top level, where nothing contains
+    /// the cursor, an open opener under the cursor is the element; anything
+    /// else is a no-op. The cursor is always a direct child of the element
+    /// (or its bracket), so it is never hidden and stays on its line.
+    fn set_children_collapsed(&mut self, collapse: bool) {
         let line = self.cursor_line();
         let element = jsonview::parent_of(&self.rows, line)
             .or_else(|| (self.rows[line].opener && !self.collapsed[line]).then_some(line));
@@ -275,7 +287,7 @@ impl InspectModal {
         };
         for i in element + 1..self.rows[element].close_idx {
             if self.rows[i].opener {
-                self.collapsed[i] = true;
+                self.collapsed[i] = collapse;
             }
         }
         self.visible = jsonview::visible_lines(&self.rows, &self.collapsed);
@@ -2597,6 +2609,72 @@ mod tests {
         let lines = "not json\njust text".lines().map(str::to_owned).collect();
         let mut m = InspectModal::new("x".to_owned(), lines);
         m.collapse_children();
+        assert_eq!(m.cursor_line(), 0);
+        assert_eq!(m.visible.len(), 2);
+    }
+
+    #[test]
+    fn expand_children_unfolds_all_descendants_and_keeps_the_element_open() {
+        let mut m = inspect_modal();
+        m.collapse_all(); // root folded too
+        m.expand_children(); // cursor on the root opener: it is closed → no-op
+        assert!(m.collapsed[0]);
+        m.toggle_fold(); // open root; children stay folded
+        assert!(m.collapsed[2] && m.collapsed[6] && m.collapsed[7]);
+        m.expand_children();
+        assert!(m.collapsed.iter().all(|c| !c));
+        assert_eq!(m.cursor_line(), 0);
+        assert_eq!(m.visible.len(), m.lines.len());
+    }
+
+    #[test]
+    fn expand_children_is_scoped_to_the_containing_block() {
+        let mut m = inspect_modal();
+        m.collapse_all();
+        at(&mut m, 0);
+        m.toggle_fold(); // reopen root only
+        at(&mut m, 6); // `layers` opener: element is the root
+        m.toggle_fold(); // open layers; its object (7) stays folded
+        at(&mut m, 7); // element is `layers`
+        m.expand_children();
+        assert!(!m.collapsed[7]); // inside layers: unfolded
+        assert!(m.collapsed[2]); // sibling section untouched
+        assert!(!m.collapsed[6]); // layers stays open
+        assert_eq!(m.cursor_line(), 7);
+    }
+
+    #[test]
+    fn expand_children_is_idempotent_and_a_noop_without_nested_blocks() {
+        let mut m = inspect_modal();
+        at(&mut m, 3); // element `config` has only leaves
+        m.expand_children();
+        assert!(m.collapsed.iter().all(|c| !c));
+        assert_eq!(m.cursor_line(), 3);
+        at(&mut m, 1);
+        m.collapse_children();
+        m.expand_children();
+        let once = (m.collapsed.clone(), m.visible.clone(), m.cursor);
+        m.expand_children();
+        assert_eq!((m.collapsed.clone(), m.visible.clone(), m.cursor), once);
+    }
+
+    #[test]
+    fn collapse_then_expand_children_round_trips() {
+        let mut m = inspect_modal();
+        let before = (m.visible.clone(), m.cursor);
+        at(&mut m, 1);
+        m.collapse_children();
+        assert!(m.visible.len() < before.0.len());
+        m.expand_children();
+        assert_eq!(m.visible, before.0);
+        assert_eq!(m.cursor_line(), 1);
+    }
+
+    #[test]
+    fn expand_children_without_openers_is_a_noop() {
+        let lines = "not json\njust text".lines().map(str::to_owned).collect();
+        let mut m = InspectModal::new("x".to_owned(), lines);
+        m.expand_children();
         assert_eq!(m.cursor_line(), 0);
         assert_eq!(m.visible.len(), 2);
     }

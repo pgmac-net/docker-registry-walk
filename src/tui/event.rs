@@ -1133,6 +1133,7 @@ fn handle_key(
             KeyCode::Char(']') => m.jump_last_sibling(),
             KeyCode::Char(' ') | KeyCode::Enter => m.toggle_fold(),
             KeyCode::Char('c') => m.collapse_children(),
+            KeyCode::Char('o') => m.expand_children(),
             KeyCode::Char('H') => m.collapse_all(),
             KeyCode::Char('L') => m.expand_all(),
             KeyCode::Char('/') => m.start_search(),
