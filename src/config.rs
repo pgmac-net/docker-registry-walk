@@ -20,6 +20,7 @@ name = "local"
 url = "http://localhost:5000"
 # username = "admin"
 # type = "standard"
+# A url with no scheme defaults to https://; write http:// for plain HTTP.
 
 # Artifactory instances host many Docker repo-keys under one server; `url`
 # is the Artifactory base (not a /v2/ root) and the TUI lets you pick which
@@ -546,8 +547,18 @@ impl Config {
             return Ok(Self::default());
         }
 
-        let text = std::fs::read_to_string(&path)?;
-        let config: Self = toml::from_str(&text)?;
+        Self::parse(&std::fs::read_to_string(&path)?)
+    }
+
+    /// Parse config TOML, defaulting scheme-less registry URLs to `https://`,
+    /// then validate.
+    fn parse(text: &str) -> anyhow::Result<Self> {
+        let mut config: Self = toml::from_str(text)?;
+        for profile in &mut config.registry {
+            if let Some(url) = &mut profile.url {
+                *url = normalize_registry_url(url);
+            }
+        }
         config.validate()?;
         Ok(config)
     }
@@ -652,6 +663,30 @@ impl Config {
     }
 }
 
+/// Default a registry URL to `https://` when it names no scheme.
+///
+/// Matches the docker CLI's convention that a bare `host[:port]` is a TLS
+/// registry. Without this, `registry.example.com` fails URL parsing, and
+/// `myhost:5000` parses as scheme `myhost:` — neither is what was meant. Plain
+/// HTTP has to be asked for with an explicit `http://`.
+pub fn normalize_registry_url(url: &str) -> String {
+    let url = url.trim();
+    if url.contains("://") {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
+    }
+}
+
+/// [`normalize_registry_url`], then confirm the result parses.
+///
+/// For URLs that do not pass through [`Config::validate`], such as `--url`.
+pub fn checked_registry_url(url: &str) -> anyhow::Result<String> {
+    let normalized = normalize_registry_url(url);
+    Url::parse(&normalized).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+    Ok(normalized)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -668,6 +703,61 @@ mod tests {
             registry_type: RegistryType::Standard,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn normalize_adds_https_when_scheme_missing() {
+        assert_eq!(
+            normalize_registry_url("registry.example.com"),
+            "https://registry.example.com"
+        );
+        assert_eq!(
+            normalize_registry_url("10.0.0.5:5000"),
+            "https://10.0.0.5:5000"
+        );
+        assert_eq!(normalize_registry_url("myhost:5000"), "https://myhost:5000");
+    }
+
+    #[test]
+    fn normalize_keeps_existing_scheme_and_trims() {
+        assert_eq!(
+            normalize_registry_url("http://localhost:5000"),
+            "http://localhost:5000"
+        );
+        assert_eq!(
+            normalize_registry_url("https://r.example.com"),
+            "https://r.example.com"
+        );
+        assert_eq!(
+            normalize_registry_url("  r.example.com \n"),
+            "https://r.example.com"
+        );
+    }
+
+    #[test]
+    fn checked_url_normalises_and_rejects_garbage() {
+        assert_eq!(
+            checked_registry_url("registry.example.com:5000").unwrap(),
+            "https://registry.example.com:5000"
+        );
+        assert!(checked_registry_url("https://bad host").is_err());
+        assert!(checked_registry_url("").is_err());
+    }
+
+    #[test]
+    fn parse_normalises_schemeless_config_urls() {
+        let config = Config::parse(
+            r#"
+[[registry]]
+name = "bare"
+url = "registry.example.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.registry[0].url.as_deref(),
+            Some("https://registry.example.com")
+        );
     }
 
     #[test]

@@ -1593,7 +1593,10 @@ async fn make_client_for_profile_at(
     let url = match Url::parse(configured) {
         Ok(u) => u,
         // Bad URL costs no keyring I/O — checked before resolving secrets.
-        Err(_) => return RegistryClient::new(Url::parse("http://localhost:5000").unwrap()),
+        // Configured and `--url` URLs are validated at startup, so this is
+        // unreachable in practice; fail visibly rather than reach for some
+        // unrelated registry on localhost.
+        Err(_) => return not_connected_client(),
     };
 
     let ResolvedSecrets { token, password } = resolve_secrets(profile).await;
@@ -2306,12 +2309,12 @@ mod tests {
     }
 
     #[test]
-    fn make_client_for_profile_falls_back_on_unparseable_url() {
+    fn make_client_for_profile_never_falls_back_to_localhost_on_unparseable_url() {
         let profile = anon_profile("broken", "not-a-url", RegistryType::Standard);
         let client = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(make_client_for_profile(&profile));
-        assert_eq!(client.base_url().as_str(), "http://localhost:5000/");
+        assert_eq!(client.base_url().as_str(), NOT_CONNECTED_HOST);
     }
 
     // -----------------------------------------------------------------------
