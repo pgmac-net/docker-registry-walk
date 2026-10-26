@@ -185,7 +185,7 @@ See [docs/artifactory-authentication.md](docs/artifactory-authentication.md) for
 | Flag | Description |
 |------|-------------|
 | `--registry <name>` | Open this named profile from the config on startup |
-| `--url <url>` | Ad-hoc registry URL (creates a temporary "cli" profile) |
+| `--url <url>` | Ad-hoc registry URL (creates a temporary "cli" profile). A URL with no scheme defaults to `https://`; give `http://` explicitly for plain HTTP. An unparseable URL exits with an error. |
 | `--username <user>` | Username for the ad-hoc registry |
 | `--type <type>` | Registry flavour for the ad-hoc registry: `standard`, `dockerhub`, `artifactory`, `ghcr` |
 | `--auth <mode>` | Auth mode for the ad-hoc registry: `auto`, `basic`, `bearer`, `token` |

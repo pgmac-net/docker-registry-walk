@@ -110,9 +110,17 @@ async fn main() -> anyhow::Result<()> {
     // Determine active profile index.
     let initial_idx = if cli.url.is_some() || adhoc_ecr {
         // Ad-hoc profile from CLI — prepend so idx 0 is always the active one.
+        // Not covered by `Config::validate`, so check it here: a bad URL must
+        // stop startup rather than be papered over downstream.
+        let url = cli
+            .url
+            .as_deref()
+            .map(config::checked_registry_url)
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("--url: {e}"))?;
         let profile = RegistryProfile {
             name: "cli".to_owned(),
-            url: cli.url.clone(),
+            url,
             username: cli.username.clone(),
             registry_type: cli.registry_type.unwrap_or_default(),
             auth: cli.auth.unwrap_or_default(),
